@@ -2,6 +2,8 @@
 
 A Go-based gateway application that communicates with Drexel&Weiss Aerosmart M ventilation/heatpump devices via USB serial and integrates with Home Assistant via MQTT.
 
+> **⚠️ Disclaimer:** This software is provided "as is", without warranty of any kind. Use at your own risk. The authors accept no liability for any damages, data loss, or device malfunctions resulting from the use of this software. This project is not affiliated with or endorsed by Drexel und Weiss.
+
 ## Features
 
 - **Serial Communication**: Reads and writes to Aerosmart M device via Modbus RTU over USB serial
