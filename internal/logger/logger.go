@@ -113,10 +113,10 @@ func (l *Logger) Debug(format string, args ...interface{}) {
 	if l.level <= DEBUG {
 		msg := fmt.Sprintf("[%s] "+format, append([]interface{}{time.Now().Format("2006-01-02 15:04:05")}, args...)...)
 		if l.consoleLogging && l.consoleLogger != nil {
-			l.consoleLogger.Output(2, msg)
+			_ = l.consoleLogger.Output(2, msg)
 		}
 		if l.fileLogging && l.fileLogger != nil {
-			l.fileLogger.Output(2, msg)
+			_ = l.fileLogger.Output(2, msg)
 		}
 	}
 }
@@ -126,10 +126,10 @@ func (l *Logger) DebugWithTiming(operation string, duration time.Duration, forma
 	if l.level <= DEBUG {
 		msg := fmt.Sprintf("[%s] %s (took %v): "+format, append([]interface{}{time.Now().Format("2006-01-02 15:04:05"), operation, duration}, args...)...)
 		if l.consoleLogging && l.consoleLogger != nil {
-			l.consoleLogger.Output(2, msg)
+			_ = l.consoleLogger.Output(2, msg)
 		}
 		if l.fileLogging && l.fileLogger != nil {
-			l.fileLogger.Output(2, msg)
+			_ = l.fileLogger.Output(2, msg)
 		}
 	}
 }
@@ -139,10 +139,10 @@ func (l *Logger) Info(format string, args ...interface{}) {
 	if l.level <= INFO {
 		msg := fmt.Sprintf("[%s] "+format, append([]interface{}{time.Now().Format("2006-01-02 15:04:05")}, args...)...)
 		if l.consoleLogging && l.consoleLogger != nil {
-			l.consoleLogger.Output(2, msg)
+			_ = l.consoleLogger.Output(2, msg)
 		}
 		if l.fileLogging && l.fileLogger != nil {
-			l.fileLogger.Output(2, msg)
+			_ = l.fileLogger.Output(2, msg)
 		}
 	}
 }
@@ -152,10 +152,10 @@ func (l *Logger) Warn(format string, args ...interface{}) {
 	if l.level <= WARN {
 		msg := fmt.Sprintf("[%s] WARNING: "+format, append([]interface{}{time.Now().Format("2006-01-02 15:04:05")}, args...)...)
 		if l.consoleLogging && l.consoleLogger != nil {
-			l.consoleLogger.Output(2, msg)
+			_ = l.consoleLogger.Output(2, msg)
 		}
 		if l.fileLogging && l.fileLogger != nil {
-			l.fileLogger.Output(2, msg)
+			_ = l.fileLogger.Output(2, msg)
 		}
 	}
 }
@@ -165,10 +165,10 @@ func (l *Logger) Error(format string, args ...interface{}) {
 	if l.level <= ERROR {
 		msg := fmt.Sprintf("[%s] ERROR: "+format, append([]interface{}{time.Now().Format("2006-01-02 15:04:05")}, args...)...)
 		if l.consoleLogging && l.consoleLogger != nil {
-			l.consoleLogger.Output(2, msg)
+			_ = l.consoleLogger.Output(2, msg)
 		}
 		if l.fileLogging && l.fileLogger != nil {
-			l.fileLogger.Output(2, msg)
+			_ = l.fileLogger.Output(2, msg)
 		}
 	}
 }
@@ -177,10 +177,10 @@ func (l *Logger) Error(format string, args ...interface{}) {
 func (l *Logger) Fatal(format string, args ...interface{}) {
 	msg := fmt.Sprintf("[%s] FATAL: "+format, append([]interface{}{time.Now().Format("2006-01-02 15:04:05")}, args...)...)
 	if l.consoleLogging && l.consoleLogger != nil {
-		l.consoleLogger.Output(2, msg)
+		_ = l.consoleLogger.Output(2, msg)
 	}
 	if l.fileLogging && l.fileLogger != nil {
-		l.fileLogger.Output(2, msg)
+		_ = l.fileLogger.Output(2, msg)
 	}
 	os.Exit(1)
 }
@@ -202,10 +202,10 @@ func (l *Logger) SerialOperation(operation string, command string, response stri
 				time.Now().Format("2006-01-02 15:04:05"), operation, duration, command, response)
 		}
 		if l.consoleLogging && l.consoleLogger != nil {
-			l.consoleLogger.Output(2, msg)
+			_ = l.consoleLogger.Output(2, msg)
 		}
 		if l.fileLogging && l.fileLogger != nil {
-			l.fileLogger.Output(2, msg)
+			_ = l.fileLogger.Output(2, msg)
 		}
 	}
 }
@@ -221,10 +221,10 @@ func (l *Logger) SerialConnection(action string, port string, baudRate int, err 
 			time.Now().Format("2006-01-02 15:04:05"), action, port, baudRate)
 	}
 	if l.consoleLogging && l.consoleLogger != nil {
-		l.consoleLogger.Output(2, msg)
+		_ = l.consoleLogger.Output(2, msg)
 	}
 	if l.fileLogging && l.fileLogger != nil {
-		l.fileLogger.Output(2, msg)
+		_ = l.fileLogger.Output(2, msg)
 	}
 }
 
@@ -249,10 +249,10 @@ func (l *Logger) MQTTOperation(operation string, topic string, payload string, q
 				time.Now().Format("2006-01-02 15:04:05"), operation, topic, payload, qos, retain)
 		}
 		if l.consoleLogging && l.consoleLogger != nil {
-			l.consoleLogger.Output(2, msg)
+			_ = l.consoleLogger.Output(2, msg)
 		}
 		if l.fileLogging && l.fileLogger != nil {
-			l.fileLogger.Output(2, msg)
+			_ = l.fileLogger.Output(2, msg)
 		}
 	}
 }
@@ -268,10 +268,10 @@ func (l *Logger) MQTTConnection(action string, broker string, port int, err erro
 			time.Now().Format("2006-01-02 15:04:05"), action, broker, port)
 	}
 	if l.consoleLogging && l.consoleLogger != nil {
-		l.consoleLogger.Output(2, msg)
+		_ = l.consoleLogger.Output(2, msg)
 	}
 	if l.fileLogging && l.fileLogger != nil {
-		l.fileLogger.Output(2, msg)
+		_ = l.fileLogger.Output(2, msg)
 	}
 }
 
@@ -281,19 +281,19 @@ func (l *Logger) RegisterOperation(operation string, register string, command st
 		msg := fmt.Sprintf("[%s] REGISTER %s FAILED: register=%s cmd=%q error=%v",
 			time.Now().Format("2006-01-02 15:04:05"), operation, register, command, err)
 		if l.consoleLogging && l.consoleLogger != nil {
-			l.consoleLogger.Output(2, msg)
+			_ = l.consoleLogger.Output(2, msg)
 		}
 		if l.fileLogging && l.fileLogger != nil {
-			l.fileLogger.Output(2, msg)
+			_ = l.fileLogger.Output(2, msg)
 		}
 	} else if l.level <= DEBUG {
 		msg := fmt.Sprintf("[%s] REGISTER %s: register=%s cmd=%q value=%q valid=%t",
 			time.Now().Format("2006-01-02 15:04:05"), operation, register, command, value, valid)
 		if l.consoleLogging && l.consoleLogger != nil {
-			l.consoleLogger.Output(2, msg)
+			_ = l.consoleLogger.Output(2, msg)
 		}
 		if l.fileLogging && l.fileLogger != nil {
-			l.fileLogger.Output(2, msg)
+			_ = l.fileLogger.Output(2, msg)
 		}
 	}
 }
@@ -302,9 +302,9 @@ func (l *Logger) RegisterOperation(operation string, register string, command st
 func (l *Logger) SignalReceived(sig os.Signal) {
 	msg := fmt.Sprintf("Received signal %v, initiating immediate shutdown...", sig)
 	if l.consoleLogging && l.consoleLogger != nil {
-		l.consoleLogger.Output(2, msg)
+		_ = l.consoleLogger.Output(2, msg)
 	}
 	if l.fileLogging && l.fileLogger != nil {
-		l.fileLogger.Output(2, msg)
+		_ = l.fileLogger.Output(2, msg)
 	}
 }

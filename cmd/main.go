@@ -147,7 +147,7 @@ func main() {
 	log.Info("Connecting to MQTT broker %s:%d...", appConfig.MQTT.Broker, appConfig.MQTT.Port)
 	if err := connectMQTTWithRetry(ctx, mqttClient, log, 10, appConfig.MQTT.ConnectRetryInitialDelayMs, appConfig.MQTT.ConnectRetryMaxDelayMs, appConfig.MQTT.ConnectRetryJitterPercent); err != nil {
 		log.Error("Failed to connect to MQTT broker: %v", err)
-		serialPort.Close()
+		_ = serialPort.Close()
 		os.Exit(1)
 	}
 	log.Info("MQTT broker connected")
@@ -197,7 +197,7 @@ func main() {
 		defer ticker.Stop()
 
 		// Initial read using Writer
-		writer.TriggerFullReadout()
+		_ = writer.TriggerFullReadout()
 
 		for {
 			select {

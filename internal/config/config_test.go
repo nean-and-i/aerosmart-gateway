@@ -39,7 +39,9 @@ ha_discovery:
 `
 	tmpDir := t.TempDir()
 	configPath := filepath.Join(tmpDir, "config.yaml")
-	os.WriteFile(configPath, []byte(content), 0644)
+	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
+		t.Fatalf("Failed to write config file: %v", err)
+	}
 
 	// Test loading
 	cfg, err := LoadAppConfig(configPath)
@@ -106,7 +108,9 @@ device_id: "my-device"
 `
 	tmpDir := t.TempDir()
 	configPath := filepath.Join(tmpDir, "config.yaml")
-	os.WriteFile(configPath, []byte(content), 0644)
+	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
+		t.Fatalf("Failed to write config file: %v", err)
+	}
 
 	// Test loading with defaults
 	cfg, err := LoadAppConfig(configPath)
@@ -169,7 +173,9 @@ derived_registers:
 `
 	tmpDir := t.TempDir()
 	configPath := filepath.Join(tmpDir, "registers.yaml")
-	os.WriteFile(configPath, []byte(content), 0644)
+	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
+		t.Fatalf("Failed to write config file: %v", err)
+	}
 
 	// Test loading
 	cfg, err := LoadRegistersConfig(configPath)

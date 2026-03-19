@@ -17,11 +17,11 @@ func TestLogger_Debug(t *testing.T) {
 	l := New("debug")
 	l.Debug("test message %s", "hello")
 
-	w.Close()
+	_ = w.Close()
 	os.Stdout = oldStdout
 
 	var buf bytes.Buffer
-	buf.ReadFrom(r)
+	_, _ = buf.ReadFrom(r)
 	output := buf.String()
 
 	if !strings.Contains(output, "test message hello") {
@@ -37,11 +37,11 @@ func TestLogger_Info(t *testing.T) {
 	l := New("info")
 	l.Info("info message %d", 123)
 
-	w.Close()
+	_ = w.Close()
 	os.Stdout = oldStdout
 
 	var buf bytes.Buffer
-	buf.ReadFrom(r)
+	_, _ = buf.ReadFrom(r)
 	output := buf.String()
 
 	if !strings.Contains(output, "info message 123") {
@@ -57,11 +57,11 @@ func TestLogger_Warn(t *testing.T) {
 	l := New("warn")
 	l.Warn("warning message")
 
-	w.Close()
+	_ = w.Close()
 	os.Stdout = oldStdout
 
 	var buf bytes.Buffer
-	buf.ReadFrom(r)
+	_, _ = buf.ReadFrom(r)
 	output := buf.String()
 
 	if !strings.Contains(output, "WARNING:") {
@@ -80,11 +80,11 @@ func TestLogger_Error(t *testing.T) {
 	l := New("error")
 	l.Error("error message")
 
-	w.Close()
+	_ = w.Close()
 	os.Stdout = oldStdout
 
 	var buf bytes.Buffer
-	buf.ReadFrom(r)
+	_, _ = buf.ReadFrom(r)
 	output := buf.String()
 
 	if !strings.Contains(output, "ERROR:") {
@@ -151,9 +151,7 @@ func TestLogger_Fatal(t *testing.T) {
 	// We can't easily test fatal without exiting, so just verify it doesn't panic
 	func() {
 		defer func() {
-			if r := recover(); r != nil {
-				// Expected to panic due to os.Exit
-			}
+			_ = recover() // Expected to panic due to os.Exit
 		}()
 		// This would call os.Exit(1)
 		// l := New("error")
@@ -161,19 +159,6 @@ func TestLogger_Fatal(t *testing.T) {
 	}()
 
 	log.SetFlags(oldFlag)
-}
-
-// Helper to suppress output during tests
-func suppressOutput(f func()) {
-	oldStdout := os.Stdout
-	oldStderr := os.Stderr
-	os.Stdout = nil
-	os.Stderr = nil
-	defer func() {
-		os.Stdout = oldStdout
-		os.Stderr = oldStderr
-	}()
-	f()
 }
 
 func BenchmarkLogger_Debug(b *testing.B) {
@@ -188,18 +173,6 @@ func BenchmarkLogger_Info(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		l.Info("test message %d", i)
 	}
-}
-
-func suppressOutputForBenchmark(f func()) {
-	oldStdout := os.Stdout
-	oldStderr := os.Stderr
-	os.Stdout = nil
-	os.Stderr = nil
-	defer func() {
-		os.Stdout = oldStdout
-		os.Stderr = oldStderr
-	}()
-	f()
 }
 
 func ExampleLogger_Debug() {

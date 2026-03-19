@@ -179,7 +179,7 @@ func (s *SerialPort) Reopen() error {
 
 	// Close existing port
 	if s.port != nil {
-		s.port.Close()
+		_ = s.port.Close()
 		s.port = nil
 	}
 	s.open = false
@@ -223,12 +223,7 @@ func (s *SerialPort) FlushInput() error {
 	// Since SetReadDeadline may not be available, we'll read with timeout
 	buf := make([]byte, 1024)
 	flushed := 0
-	for {
-		// Check if we've exceeded deadline
-		if time.Now().After(deadline) {
-			break
-		}
-
+	for time.Now().Before(deadline) {
 		// Try to read - this is a best-effort flush
 		// The tarm/serial library doesn't support SetReadDeadline,
 		// so we rely on the ReadTimeout in the config
@@ -459,7 +454,7 @@ func (s *SerialPort) ForceReopen() error {
 
 	// Close existing port
 	if s.port != nil {
-		s.port.Close()
+		_ = s.port.Close()
 		s.port = nil
 	}
 	s.open = false

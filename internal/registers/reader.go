@@ -321,7 +321,6 @@ type Writer struct {
 
 	// Write priority mechanism
 	writePriorityChan chan struct{} // Channel to signal write priority request
-	mu                sync.Mutex
 }
 
 // NewWriter creates a new register writer
