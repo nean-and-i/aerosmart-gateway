@@ -94,6 +94,7 @@ jobs:
           cache: true
 
       - name: Build
+        id: build
         env:
           GOOS: linux
           GOARCH: ${{ matrix.goarch }}
@@ -106,6 +107,7 @@ jobs:
           fi
           FILENAME="aerosmart-gateway-${TAG}-linux-${SUFFIX}"
           go build -ldflags "-s -w -X main.version=${TAG}" -o "$FILENAME" ./cmd/main.go
+          echo "filename=${FILENAME}" >> "$GITHUB_OUTPUT"
 
       - name: Upload release asset
         uses: actions/upload-release-asset@v1
@@ -113,7 +115,8 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           upload_url: ${{ needs.create-release.outputs.upload_url }}
-          asset_path: aerosmart-gateway-*
+          asset_path: ${{ steps.build.outputs.filename }}
+          asset_name: ${{ steps.build.outputs.filename }}
           asset_content_type: application/octet-stream
 
   docker:
