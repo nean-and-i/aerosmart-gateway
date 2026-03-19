@@ -207,6 +207,10 @@ When `ha_discovery.enabled` is set to `true`, the gateway automatically publishe
 
 The devices will appear in Home Assistant with the name "Aerosmart Gateway".
 
+Example of Home Assistant dashboard:
+![Home Assistant Dashboard](docs/aerosmart-ha.png)
+
+
 ## Application Flow
 
 ### Initialization
