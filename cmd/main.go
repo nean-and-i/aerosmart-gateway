@@ -22,6 +22,7 @@ var (
 	configPath    string
 	registersPath string
 	showVersion   bool
+	version       = "1.0.0"
 )
 
 func init() {
@@ -34,7 +35,7 @@ func main() {
 	flag.Parse()
 
 	if showVersion {
-		fmt.Println("aerosmart-gateway version 1.0.0")
+		fmt.Printf("aerosmart-gateway version %s\n", version)
 		os.Exit(0)
 	}
 
