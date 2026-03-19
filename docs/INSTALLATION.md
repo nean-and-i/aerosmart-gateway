@@ -27,7 +27,7 @@ This document provides detailed instructions for setting up and running the Aero
 
 ### Software Requirements
 
-- **Go 1.21 or later**: For building from source
+- **Go 1.25 or later**: For building from source
 - **MQTT Broker**: Any MQTT broker (Mosquitto, Home Assistant MQTT, etc.)
 - **Serial Port Access**: The user running the application needs access to the serial port
 
@@ -574,7 +574,7 @@ journalctl -u aerosmart -f
 ### Development Setup
 
 ```bash
-# Install Go 1.21 or later
+# Install Go 1.25 or later
 # https://go.dev/doc/install
 
 # Clone the repository

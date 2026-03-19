@@ -60,7 +60,7 @@ The application follows a layered architecture with the following main component
 
 ### Prerequisites
 
-- Go 1.21 or later
+- Go 1.25 or later
 - A serial device connected to your Aerosmart M ventilation system
 - MQTT broker (e.g., Mosquitto)
 
@@ -287,7 +287,7 @@ go test ./...
 ### Building with Docker
 
 ```dockerfile
-FROM golang:1.21-alpine AS builder
+FROM golang:1.25-alpine AS builder
 WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download

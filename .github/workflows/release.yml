@@ -24,9 +24,9 @@ jobs:
           cache: true
 
       - name: Run golangci-lint
-        uses: golangci/golangci-lint-action@v6
+        uses: golangci/golangci-lint-action@v8
         with:
-          version: v1.64.8
+          version: latest
           args: --timeout=5m
 
   test:
@@ -52,25 +52,12 @@ jobs:
     strategy:
       matrix:
         include:
-          - goos: linux
-            goarch: amd64
-            ext: ''
-          - goos: linux
-            goarch: arm64
-            ext: ''
-          - goos: linux
-            goarch: arm
-            ext: ''
+          - goarch: amd64
+          - goarch: arm64
+          - goarch: arm
             goarm: '6'
-          - goos: darwin
-            goarch: amd64
-            ext: ''
-          - goos: darwin
-            goarch: arm64
-            ext: ''
-          - goos: windows
-            goarch: amd64
-            ext: '.exe'
+          - goarch: arm
+            goarm: '7'
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -83,13 +70,16 @@ jobs:
 
       - name: Build
         env:
-          GOOS: ${{ matrix.goos }}
+          GOOS: linux
           GOARCH: ${{ matrix.goarch }}
           GOARM: ${{ matrix.goarm }}
         run: |
           TAG=$(echo ${{ github.ref_name }} | sed 's/v//')
-          EXT="${{ matrix.ext }}"
-          FILENAME="aerosmart-gateway-${TAG}-${GOOS}-${GOARCH}${EXT}"
+          SUFFIX="${GOARCH}"
+          if [ -n "$GOARM" ]; then
+            SUFFIX="${GOARCH}v${GOARM}"
+          fi
+          FILENAME="aerosmart-gateway-${TAG}-linux-${SUFFIX}"
           go build -ldflags "-s -w -X main.version=${TAG}" -o "$FILENAME" ./cmd/main.go
 
       - name: Upload release asset
