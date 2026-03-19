@@ -1,6 +1,6 @@
 # Aerosmart Gateway
 
-A Go-based gateway application that communicates with Aerosmart M ventilation devices via USB serial and integrates with Home Assistant via MQTT.
+A Go-based gateway application that communicates with Drexel&Weiss Aerosmart M ventilation/heatpump devices via USB serial and integrates with Home Assistant via MQTT.
 
 ## Features
 
