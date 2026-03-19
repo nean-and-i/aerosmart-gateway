@@ -1,0 +1,64 @@
+# Aerosmart Gateway Configuration
+
+serial:
+  port: "/dev/ttyUSB0"
+  baudrate: 115200
+  bytesize: 8
+  parity: "N"
+  stopbits: 1
+  timeout: 0
+  xonxoff: true
+  dsrdtr: false
+  write_timeout: 10
+  read_timeout: 1          # Read timeout in seconds (default: 1)
+  max_reopens: 10           # Maximum number of port reopen attempts (default: 10)
+  deadline_timeout: 150    # Flush input deadline timeout in milliseconds (default: 150)
+  write_with_retry_delay: 10  # Delay between write retries in milliseconds (default: 10)
+  device_response_delay: 40   # Delay to wait for device response in milliseconds (default: 40)
+  read_with_retry_delay: 100   # Delay between read retries in milliseconds (default: 100)
+  read_max_retries: 10     # Maximum number of read retries (default: 10)
+  write_max_retries: 10    # Maximum number of write retries (default: 10)
+  max_retries: 10          # Maximum number of register read/write operation retries (default: 10)
+  # Connection retry configuration
+  connect_retry_initial_delay_ms: 2   # Initial delay for exponential backoff (default: 100ms)
+  connect_retry_max_delay_ms: 400     # Maximum delay for exponential backoff (default: 10s)
+  connect_retry_jitter_percent: 25      # Jitter percentage (0-100, default: 25%)
+
+mqtt:
+  broker: "192.168.1.20"
+  port: 1883
+  username: "mqtt"
+  password: "password"
+  client_id: "aerosmart-gateway"
+  qos: 0
+  retain: true
+  # Connection retry configuration
+  connect_retry_initial_delay_ms: 500   # Initial delay for exponential backoff (default: 500ms)
+  connect_retry_max_delay_ms: 30000     # Maximum delay for exponential backoff (default: 30s)
+  connect_retry_jitter_percent: 25      # Jitter percentage (0-100, default: 25%)
+
+# Device ID for Home Assistant discovery
+device_id: "aerosmart"
+
+# Logging level: debug, info, warn, error
+log_level: "debug"
+
+# Logging configuration
+# Set log_file to empty or "-" to disable file logging (stdout only)
+# This improves SD card lifetime by reducing IO writes
+logging:
+  # Log file path (set to empty to disable file logging)
+  # log_file: "-"
+  log_file: "/var/log/aerosmart.log"
+  # Enable/disable file logging (true/false)
+  file_logging: false
+  # Enable/disable console logging
+  console_logging: true
+
+# Read interval in seconds
+read_interval: 60
+
+# Home Assistant MQTT Discovery
+ha_discovery:
+  enabled: true
+  prefix: "homeassistant"

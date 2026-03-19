@@ -1,0 +1,41 @@
+[Unit]
+Description=Aerosmart Gateway - Connects Aerosmart ventilation to MQTT
+Documentation=https://github.com/nean/aerosmart-gateway
+After=network.target
+Wants=network.target
+
+# Prevent starting if serial port doesn't exist
+ConditionPathExists=/dev/ttyUSB0
+
+[Service]
+Type=simple
+# Run as root (required for serial port access)
+User=root
+Group=root
+
+# Binary location and arguments
+ExecStart=/opt/aerosmart/aerosmart-gateway-armv6 --config /opt/aerosmart/config.yaml --registers /opt/aerosmart/registers.yaml
+
+# Auto-restart on failure
+Restart=on-failure
+RestartSec=5
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=aerosmart
+
+# Security hardening (optional - comment out if needed)
+# NoNewPrivileges=true
+# ProtectSystem=strict
+# ReadWritePaths=/opt/aerosmart /var/log
+
+# Graceful shutdown timeout
+TimeoutStopSec=10
+
+# Restart limit (prevent infinite restart loop)
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+[Install]
+WantedBy=multi-user.target

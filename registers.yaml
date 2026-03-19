@@ -1,0 +1,400 @@
+read_registers:
+  - name: "luefterstatus"
+    command: "130 1067"
+    topic: "aerosmart/luefterstatus"
+    divisor: 1
+    type: "integer"
+    min_value: 0
+    max_value: 5
+    ha:
+      name: "Aerosmart luefterstatus"
+      device_class: null
+      unit: null
+
+  - name: "lueftermode"
+    command: "130 5003"
+    topic: "aerosmart/lueftermode"
+    divisor: 1
+    type: "integer"
+    min_value: 0
+    max_value: 5
+    ha:
+      name: "Aerosmart lueftermode"
+      device_class: null
+      unit: null
+
+  - name: "co2"
+    command: "130 231"
+    topic: "aerosmart/co2"
+    divisor: 1
+    type: "integer"
+    min_value: 0
+    max_value: 5000
+    ha:
+      name: "Aerosmart CO2"
+      device_class: null
+      unit: "ppm"
+
+  - name: "innentemp"
+    command: "130 201"
+    topic: "aerosmart/innentemp"
+    divisor: 1000
+    type: "float"
+    min_value: -20
+    max_value: 50
+    ha:
+      name: "Aerosmart innentemp"
+      device_class: "temperature"
+      unit: "°C"
+
+  - name: "aussentemp"
+    command: "130 203"
+    topic: "aerosmart/aussentemp"
+    divisor: 1000
+    type: "float"
+    min_value: -30
+    max_value: 50
+    ha:
+      name: "Aerosmart aussentemp"
+      device_class: "temperature"
+      unit: "°C"
+
+  - name: "raumsolltemp"
+    command: "130 5017"
+    topic: "aerosmart/raumsolltemp"
+    divisor: 1000
+    type: "float"
+    min_value: 15
+    max_value: 40
+    ha:
+      name: "Aerosmart raumsolltemp"
+      device_class: "temperature"
+      unit: "°C"
+
+  - name: "co2luefterstufe0"
+    command: "130 5275"
+    topic: "aerosmart/co2luefterstufe0"
+    divisor: 1
+    type: "integer"
+    min_value: 0
+    max_value: 3000
+    ha:
+      name: "Aerosmart CO2 Lüfterstufe 0"
+      device_class: null
+      unit: "ppm"
+
+  - name: "co2luefterstufe1"
+    command: "130 5277"
+    topic: "aerosmart/co2luefterstufe1"
+    divisor: 1
+    type: "integer"
+    min_value: 0
+    max_value: 3000
+    ha:
+      name: "Aerosmart CO2 Lüfterstufe 1"
+      device_class: null
+      unit: "ppm"
+
+  - name: "co2luefterstufe2"
+    command: "130 5279"
+    topic: "aerosmart/co2luefterstufe2"
+    divisor: 1
+    type: "integer"
+    min_value: 0
+    max_value: 3000
+    ha:
+      name: "Aerosmart CO2 Lüfterstufe 2"
+      device_class: null
+      unit: "ppm"
+
+  - name: "co2luefterstufe3"
+    command: "130 5281"
+    topic: "aerosmart/co2luefterstufe3"
+    divisor: 1
+    type: "integer"
+    min_value: 0
+    max_value: 3000
+    ha:
+      name: "Aerosmart CO2 Lüfterstufe 3"
+      device_class: null
+      unit: "ppm"
+
+  - name: "beschattungstatus"
+    command: "130 5337"
+    topic: "aerosmart/beschattungstatus"
+    divisor: 1
+    type: "integer"
+    min_value: 0
+    max_value: 1
+    ha:
+      name: "Aerosmart Beschattung Status"
+      device_class: null
+      unit: null
+
+  - name: "beschattungtemp"
+    command: "130 5339"
+    topic: "aerosmart/beschattungtemp"
+    divisor: 1000
+    type: "float"
+    min_value: -20
+    max_value: 50
+    ha:
+      name: "Aerosmart Beschattung Temp"
+      device_class: "temperature"
+      unit: "°C"
+
+  - name: "beschattungaussentemp"
+    command: "130 5341"
+    topic: "aerosmart/beschattungaussentemp"
+    divisor: 1000
+    type: "float"
+    min_value: -30
+    max_value: 50
+    ha:
+      name: "Aerosmart Beschattung Aussentemp"
+      device_class: "temperature"
+      unit: "°C"
+
+  - name: "beschattunganfoderungstatus"
+    command: "130 1219"
+    topic: "aerosmart/beschattunganfoderungstatus"
+    divisor: 1
+    type: "integer"
+    min_value: 0
+    max_value: 1
+    ha:
+      name: "Aerosmart Beschattung Anforderung"
+      device_class: null
+      unit: null
+
+  - name: "abluftprozent"
+    command: "130 1095"
+    topic: "aerosmart/abluftprozent"
+    divisor: 100
+    type: "float"
+    min_value: 0
+    max_value: 100
+    ha:
+      name: "Aerosmart Abluft Prozent"
+      device_class: null
+      unit: "%"
+
+  - name: "abluftumin"
+    command: "130 1187"
+    topic: "aerosmart/abluftumin"
+    divisor: 1
+    type: "integer"
+    min_value: 0
+    max_value: 5000
+    ha:
+      name: "Aerosmart Abluft U/min"
+      device_class: null
+      unit: "rpm"
+
+  - name: "zuluftprozent"
+    command: "130 1093"
+    topic: "aerosmart/zuluftprozent"
+    divisor: 100
+    type: "float"
+    min_value: 0
+    max_value: 100
+    ha:
+      name: "Aerosmart Zuluft Prozent"
+      device_class: null
+      unit: "%"
+
+  - name: "zuluftumin"
+    command: "130 1185"
+    topic: "aerosmart/zuluftumin"
+    divisor: 1
+    type: "integer"
+    min_value: 0
+    max_value: 5000
+    ha:
+      name: "Aerosmart Zuluft U/min"
+      device_class: null
+      unit: "rpm"
+
+  - name: "abluftsollvolumenstrom"
+    command: "130 1085"
+    topic: "aerosmart/abluftsollvolumenstrom"
+    divisor: 1
+    type: "integer"
+    min_value: 0
+    max_value: 800
+    ha:
+      name: "Aerosmart Abluft Sollvolumenstrom"
+      device_class: null
+      unit: "m³/h"
+
+  - name: "zuluftsollvolumenstrom"
+    command: "130 1083"
+    topic: "aerosmart/zuluftsollvolumenstrom"
+    divisor: 1
+    type: "integer"
+    min_value: 0
+    max_value: 800
+    ha:
+      name: "Aerosmart Zuluft Sollvolumenstrom"
+      device_class: null
+      unit: "m³/h"
+
+  - name: "badplusstatus"
+    command: "140 5037"
+    topic: "aerosmart/badplusstatus"
+    divisor: 1
+    type: "integer"
+    min_value: 0
+    max_value: 1
+    ha:
+      name: "Aerosmart Bad Plus Status"
+      device_class: null
+      unit: null
+
+  - name: "waermepumpestatus"
+    command: "140 1045"
+    topic: "aerosmart/waermepumpestatus"
+    divisor: 1
+    type: "integer"
+    min_value: 0
+    max_value: 1
+    ha:
+      name: "Aerosmart Wärmepumpe Status"
+      device_class: null
+      unit: null
+
+  - name: "boilertemp"
+    command: "140 213"
+    topic: "aerosmart/boilertemp"
+    divisor: 1000
+    type: "float"
+    min_value: 0
+    max_value: 95
+    ha:
+      name: "Aerosmart Boiler Temp"
+      device_class: "temperature"
+      unit: "°C"
+
+  - name: "boilerwaermepumpetemp"
+    command: "140 215"
+    topic: "aerosmart/boilerwaermepumpetemp"
+    divisor: 1000
+    type: "float"
+    min_value: -20
+    max_value: 70
+    ha:
+      name: "Aerosmart Boiler Wärmepumpe Temp"
+      device_class: "temperature"
+      unit: "°C"
+
+  - name: "boilerverdampfregistertemp"
+    command: "140 211"
+    topic: "aerosmart/boilerverdampfregistertemp"
+    divisor: 1000
+    type: "float"
+    min_value: -20
+    max_value: 70
+    ha:
+      name: "Aerosmart Boiler Verdampferregister Temp"
+      device_class: "temperature"
+      unit: "°C"
+
+  - name: "heizstufe1anforderungstatus"
+    command: "140 1033"
+    topic: "aerosmart/heizstufe1anforderungstatus"
+    divisor: 1
+    type: "integer"
+    min_value: 0
+    max_value: 1
+    ha:
+      name: "Aerosmart Heizstufe 1 Anforderung"
+      device_class: null
+      unit: null
+
+  - name: "heizstufe2anforderungstatus"
+    command: "140 1035"
+    topic: "aerosmart/heizstufe2anforderungstatus"
+    divisor: 1
+    type: "integer"
+    min_value: 0
+    max_value: 1
+    ha:
+      name: "Aerosmart Heizstufe 2 Anforderung"
+      device_class: null
+      unit: null
+
+  - name: "heizungplusstatus"
+    command: "140 5493"
+    topic: "aerosmart/heizungplusstatus"
+    divisor: 1
+    type: "integer"
+    min_value: 0
+    max_value: 1
+    ha:
+      name: "Aerosmart Heizung Plus Status"
+      device_class: null
+      unit: null
+
+  - name: "boilerheizstabanforderungstatus"
+    command: "140 1039"
+    topic: "aerosmart/boilerheizstabanforderungstatus"
+    divisor: 1
+    type: "integer"
+    min_value: 0
+    max_value: 1
+    ha:
+      name: "Aerosmart Boiler Heizstab Anforderung"
+      device_class: null
+      unit: null
+
+write_registers:
+  - name: "luefterstufe"
+    command_template: "130 5002 {value}"
+    subscribe_topic: "dw/aerosmart/luefterstufe"
+    topic: "aerosmart/lueftermode"
+    min_value: 0
+    max_value: 5
+    verify_registers:
+      - "luefterstatus"
+      - "lueftermode"
+    ha:
+      name: "Aerosmart Lüfterstufe"
+      command_topic: "dw/aerosmart/luefterstufe"
+
+  - name: "boilerheizstab"
+    command_template: "140 5036 {value}"
+    subscribe_topic: "dw/aerosmart/boilerheizstab"
+    topic: "aerosmart/boilerheizstabanforderungstatus"
+    min_value: 0
+    max_value: 1
+    verify_registers:
+      - "badplusstatus"
+    ha:
+      name: "Aerosmart Boiler Heizstab"
+      command_topic: "dw/aerosmart/boilerheizstab"
+
+derived_registers:
+  - name: "zuluftabluftprozent"
+    topic: "aerosmart/zuluftabluftprozent"
+    formula: "round((zuluftumin / abluftumin) * 100, 1)"
+    sources: ["zuluftumin", "abluftumin"]
+    ha:
+      name: "Aerosmart Zuluft/Abluft Prozent"
+      unit: "%"
+
+  - name: "co2luefterstufe4"
+    topic: "aerosmart/co2luefterstufe4"
+    formula: "round(co2luefterstufe3 * 1.2)"
+    sources: ["co2luefterstufe3"]
+    ha:
+      name: "Aerosmart CO2 Lüfterstufe 4"
+      unit: "ppm"
+
+  - name: "beschattungtemp_adjusted"
+    topic: "aerosmart/beschattungtemp_adjusted"
+    formula: "beschattungtemp - 0.5 if beschattungaussentemp < aussentemp else beschattungtemp + 1"
+    sources: ["beschattungtemp", "beschattungaussentemp", "aussentemp"]
+    ha:
+      name: "Aerosmart Beschattung Temp Adjustiert"
+      unit: "°C"
+      device_class: "temperature"
