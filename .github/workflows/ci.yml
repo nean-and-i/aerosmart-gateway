@@ -25,7 +25,7 @@ jobs:
         with:
           version: v2.11.3
           # version: v1.64.8
-          # install-mode: goinstall 
+          # install-mode: goinstall
           args: --timeout=5m
 
   test:
@@ -60,8 +60,13 @@ jobs:
     needs: [lint, test]
     strategy:
       matrix:
-        goos: [linux, darwin]
-        goarch: [amd64, arm64, arm]
+        include:
+          - goarch: amd64
+          - goarch: arm64
+          - goarch: arm
+            goarm: 6
+          - goarch: arm
+            goarm: 7
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -74,19 +79,20 @@ jobs:
 
       - name: Build
         env:
-          GOOS: ${{ matrix.goos }}
+          GOOS: linux
           GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
         run: |
-          EXT=""
-          if [ "$GOOS" = "windows" ]; then
-            EXT=".exe"
+          SUFFIX="${GOARCH}"
+          if [ -n "$GOARM" ]; then
+            SUFFIX="${GOARCH}v${GOARM}"
           fi
-          go build -ldflags "-s -w" -o aerosmart-gateway-${GOOS}-${GOARCH}${EXT} ./cmd/main.go
+          go build -ldflags "-s -w" -o aerosmart-gateway-linux-${SUFFIX} ./cmd/main.go
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
-          name: binary-${{ matrix.goos }}-${{ matrix.goarch }}
+          name: binary-linux-${{ matrix.goarch }}${{ matrix.goarm && format('v{0}', matrix.goarm) || '' }}
           path: aerosmart-gateway-*
           retention-days: 7
 
