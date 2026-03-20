@@ -6,7 +6,7 @@ A Go-based gateway application that communicates with Drexel&Weiss Aerosmart M v
 
 ## Features
 
-- **Serial Communication**: Reads and writes to Aerosmart M device via serial over USB (NOT Modbus RTU, no modbus settings required)
+- **Serial Communication**: Reads and writes to Aerosmart M device via serial over [USB located on Mainboard - refer to INSTALLATION.md](INSTALLATION.md). NOTE: It is **NOT** Modbus RTU, no modbus settings required.
 - **MQTT Integration**: Publishes sensor data and subscribes to control commands
 - **Home Assistant Discovery**: Auto-discovers sensors and switches in Home Assistant
 - **Derived Calculations**: Calculates derived values (e.g., zuluftabluftprozent, co2luefterstufe4)
