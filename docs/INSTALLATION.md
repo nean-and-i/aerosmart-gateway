@@ -21,7 +21,7 @@ This document provides detailed instructions for setting up and running the Aero
 
 ### Hardware Requirements
 
-- **Aerosmart M Ventilation Device**: The gateway communicates with Aerosmart M units via USB serial
+- **Aerosmart M Ventilation Device**: The gateway communicates with Aerosmart M units via USB serial.   The USB connector on the Drexel and Weiss mainboard is actually a serial interface which can be used to readout and control the entire unit. The protocol and registers are the same as documented for the modbus (900.6666_00_TI_Modbus_Parameter_DE.pdf), but the communication is done via serial over USB, not Modbus RTU. No modbus settings are required. ![USB location on mainboard](aerosmartpi-install02.jpg)
 - **Serial Cable**: USB cable to connect the Aerosmart device to your computer/server
 - **Computer/Server**: A device to run the gateway (Raspberry Pi, Linux server, macOS, etc.)
 
