@@ -67,7 +67,7 @@ do_start() {
     FILE_LOGGING_DISABLED=$(check_file_logging_disabled)
     
     # Build command arguments
-    CMD_ARGS="--config $CONFIG --registers $REGISTERS"
+    CMD_ARGS="-config $CONFIG -registers $REGISTERS"
     
     # Start the daemon with start-stop-daemon
     # --make-pidfile: automatically create PID file

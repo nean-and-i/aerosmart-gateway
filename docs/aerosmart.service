@@ -14,7 +14,7 @@ User=root
 Group=root
 
 # Binary location and arguments
-ExecStart=/opt/aerosmart/aerosmart-gateway --config /opt/aerosmart/config.yaml --registers /opt/aerosmart/registers.yaml
+ExecStart=/opt/aerosmart/aerosmart-gateway -config /opt/aerosmart/config.yaml -registers /opt/aerosmart/registers.yaml
 
 # Auto-restart on failure
 Restart=on-failure

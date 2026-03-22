@@ -84,7 +84,7 @@ Create a `config.yaml` file with the following structure:
 serial:
   port: "/dev/ttyUSB0"           # Serial device path
   baudrate: 115200               # Communication speed
-  read_timeout: 2                # Read timeout in seconds
+  read_timeout: 1                # Read timeout in milliseconds (0 = 200ms default)
   device_response_delay: 40      # Wait after write (ms)
   write_with_retry_delay: 10     # Write retry delay (ms)
   read_with_retry_delay: 100     # Read retry delay (ms)
@@ -329,7 +329,7 @@ Wants=network.target
 [Service]
 Type=simple
 User=root
-ExecStart=/opt/aerosmart/aerosmart-gateway --config /opt/aerosmart/config.yaml --registers /opt/aerosmart/registers.yaml
+ExecStart=/opt/aerosmart/aerosmart-gateway -config /opt/aerosmart/config.yaml -registers /opt/aerosmart/registers.yaml
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal
@@ -635,6 +635,6 @@ docker run -d \
 For issues and questions:
 
 1. Check the [troubleshooting section](#troubleshooting)
-2. Review the [application flow documentation](docs/APPLICATION_FLOW.md)
-3. Review the [timing diagrams](docs/TIMING_DIAGRAMS.md)
+2. Review the [application flow documentation](APPLICATION_FLOW.md)
+3. Review the [timing diagrams](TIMING_DIAGRAMS.md)
 4. Open an issue on GitHub

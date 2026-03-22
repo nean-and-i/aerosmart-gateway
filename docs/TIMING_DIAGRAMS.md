@@ -44,8 +44,8 @@ This document contains detailed timing diagrams illustrating the interactions be
 │                             ▼                   │                          │
 │                    ┌────────────────┐           │                          │
 │                    │   registers/   │           │                          │
-│                    │   writer.go    │           │                          │
-│                    │                │           │                          │
+│                    │   reader.go    │           │                          │
+│                    │   (Writer)     │           │                          │
 │                    │ - HandleMessage│───────────┘                          │
 │                    │ - TriggerFull  │                                      │
 │                    └────────────────┘                                      │
@@ -62,24 +62,27 @@ Time (ms)   Component          Action
 ─────────────────────────────────────────────────────────────────────────────
 0           main              Load config.yaml
 10          main              Load registers.yaml
-15          main              Initialize logger
+15          main              Initialize logger (level, file/console)
 20          serial            NewSerialPort("/dev/ttyUSB0", 115200, ...)
-25          serial            Open() - connect to device
-30          mqtt              NewClient(broker, port, ...)
-35          mqtt              Connect() - connect to broker
-40          mqtt              Publish HA discovery configs
-45          registers         NewReader(serial, mqtt, readRegisters)
-50          registers         NewWriter(serial, mqtt, writeRegisters)
-55          mqtt              Subscribe("dw/aerosmart/luefterstufe")
-60          mqtt              Subscribe("dw/aerosmart/boilerheizstab")
-65          main              TriggerFullReadout() - initial read
-70          registers         ReadAll() - read all registers
-75          serial            SendAndReceive("130 1067", 10) - reg 1
-80          serial            SendAndReceive("130 5003", 10) - reg 2
+25          serial            connectSerialWithRetry() - exponential backoff
+30          serial            Open() - connect to device
+35          mqtt              NewClient(broker, port, ...)
+40          mqtt              connectMQTTWithRetry() - exponential backoff
+45          mqtt              Connect() - connect to broker
+50          mqtt              publishHADiscovery() - sensor & switch configs
+55          registers         NewReader(serial, mqtt, readRegisters)
+60          registers         NewWriter(serial, mqtt, writeRegisters)
+65          registers         writer.SetReader(reader)
+70          mqtt              Subscribe("dw/aerosmart/luefterstufe")
+75          mqtt              Subscribe("dw/aerosmart/boilerheizstab")
+80          main              Start periodic ticker (60s interval)
+85          main              writer.TriggerFullReadout() - initial read
+90          registers         reader.ReadAll() - read all registers
+95          serial            SendAndReceive("130 1067", 10) - reg 1
+100         serial            SendAndReceive("130 5003", 10) - reg 2
 ...         ...               ... (more registers)
-200         mqtt              Publish all values to topics
-205          main              Start periodic ticker (60s interval)
-210          main              Application running
+200         registers         reader.PublishAll(values) - publish to MQTT
+205         main              Application running, waiting for ticker
 ```
 
 ---
@@ -89,30 +92,35 @@ Time (ms)   Component          Action
 ```
 Time (ms)   Component          Action
 ─────────────────────────────────────────────────────────────────────────────
-0           main              Ticker fires - TriggerFullReadout()
-5           writer            Check writePriorityChan (empty)
+0           main              Ticker fires - writer.TriggerFullReadout()
+5           writer            Try send to writePriorityChan (succeeds = empty)
+6           writer            Drain channel, no write pending
 10          reader            ReadAll() - start read cycle
 15          reader            Mark isReading = true
 20          serial            SendAndReceive("130 1067", 10)
-25          serial            ForceReopen() - clean state
+25          serial            ForceReopen() - close, wait 5ms, reopen
 30          serial            FlushInputMultiple(3)
-35          serial            Write("130 1067\r\n")
+35          serial            WriteWithRetry("130 1067\r\n", 10, 10ms)
 40          serial            Sleep(deviceResponseDelay=40ms)
-45          serial            Read() - wait for response
-50          serial            <-- "130 1067 3" (fan speed 3)
-55          serial            Parse response
-60          reader            Validate value (3 in range 0-5)
-65          mqtt              Publish("aerosmart/luefterstatus", "3")
-70          serial            SendAndReceive("130 5003", 10)
-75          serial            Write("130 5003\r\n")
-80          serial            Sleep(deviceResponseDelay)
-85          serial            Read()
-90          serial            <-- "130 5003 3"
-95          mqtt              Publish("aerosmart/lueftermode", "3")
+80          serial            ReadWithRetry(10, 100ms) - wait for response
+85          serial            <-- "130 1067 3" (fan speed 3)
+90          reader            Parse & validate value (3 in range 0-5)
+95          serial            SendAndReceive("130 5003", 10)
+                              (ForceReopen only on attempt 0 of first call;
+                               subsequent calls: FlushInputMultiple(3) + write)
+100         serial            WriteWithRetry("130 5003\r\n", 10, 10ms)
+105         serial            Sleep(deviceResponseDelay=40ms)
+145         serial            ReadWithRetry(10, 100ms)
+150         serial            <-- "130 5003 3"
+155         reader            Parse & validate value
 ...         ...               ... (continue for all registers)
 500         reader            Mark isReading = false
 505         reader            Store values in reader.values
-510         main              Wait for next ticker
+510         reader            PublishAll(values) - publish all to MQTT
+515         mqtt              Publish("aerosmart/luefterstatus", "3")
+520         mqtt              Publish("aerosmart/lueftermode", "3")
+...         ...               ... (publish all valid register values)
+550         main              Wait for next ticker
 ```
 
 ### Detailed SendAndReceive Flow
@@ -155,25 +163,29 @@ Time (ms)   Component          Action
 5           mqtt              Callback invoked with message "3"
 10          writer            HandleMessage("dw/aerosmart/luefterstufe", "3")
 15          writer            SignalWritePriority() - send to channel
-20          writer            Cancel() - cancel any ongoing read
-25          writer            ResetContext() - create new context
-30          writer            Validate value (3 in range 0-5)
+20          writer            reader.Cancel() - cancel any ongoing read
+25          writer            reader.ResetContext() - create new context
+30          writer            Find matching register, validate value (3 in 0-5)
 35          writer            Build command: "130 5002 3"
 40          serial            SendAndReceive("130 5002 3", 10)
-45          serial            Write("130 5002 3\r\n")
-50          serial            Sleep(40ms)
-55          serial            Read() - get response
-60          serial            <-- "130 5002 OK"
-65          serial            FlushBuffer() - clear stale data
-70          writer            Read verify register: luefterstatus
-75          serial            SendAndReceive("130 1067", 10)
-80          serial            <-- "130 1067 3"
-85          mqtt              Publish("aerosmart/luefterstatus", "3")
-90          writer            Read verify register: lueftermode
-95          serial            SendAndReceive("130 5003", 10)
-100         serial            <-- "130 5003 3"
-105         mqtt              Publish("aerosmart/lueftermode", "3")
-110         writer            Complete - return nil
+45          serial            ForceReopen() + FlushInputMultiple(3)
+50          serial            WriteWithRetry("130 5002 3\r\n", 10, 10ms)
+55          serial            Sleep(deviceResponseDelay=40ms)
+95          serial            ReadWithRetry(10, 100ms) - get response
+100         serial            <-- "130 5002 OK"
+105         writer            FlushBuffer() - FlushInputMultiple(5)
+110         writer            Sleep(deviceResponseDelay=40ms) - wait before verify
+150         writer            Read verify register: luefterstatus
+155         serial            reader.ReadSingle(luefterstatus)
+160         serial            SendAndReceive("130 1067", 10)
+165         serial            <-- "130 1067 3"
+170         mqtt              Publish("aerosmart/luefterstatus", "3")
+175         writer            Read verify register: lueftermode
+180         serial            reader.ReadSingle(lueftermode)
+185         serial            SendAndReceive("130 5003", 10)
+190         serial            <-- "130 5003 3"
+195         mqtt              Publish("aerosmart/lueftermode", "3")
+200         writer            Complete - return nil
 ```
 
 ### Write Priority Signaling
@@ -267,7 +279,7 @@ Time (ms)   Component          Action
 25          serial            Write("130 1067\r\n")
 30          serial            Sleep(40ms)
 35          serial            Read() - waiting for response...
-40          
+40
 
 MQTT Broker       Message published: "dw/aerosmart/luefterstufe" = "3"
 45          mqtt              Callback invoked
@@ -365,7 +377,8 @@ publishHADiscovery()
 │       UniqueID: "aerosmart_luefterstatus",                               │
 │       Device: {...}                                                      │
 │     }                                                                    │
-│  2. Publish to "homeassistant/sensor/aerosmart_luefterstatus/config"     │
+│  2. Publish to                                                           │
+│          "homeassistant/sensor/aerosmart/aerosmart_luefterstatus/config" │
 │  3. Sleep(2ms) - rate limiting                                           │
 │                                                                          │
 │ For each write register with HA config:                                  │
@@ -376,7 +389,8 @@ publishHADiscovery()
 │       UniqueID: "aerosmart_luefterstufe",                                │
 │       Device: {...}                                                      │
 │     }                                                                    │
-│  2. Publish to "homeassistant/switch/aerosmart_luefterstufe/config"      │
+│  2. Publish to                                                           │
+│          "homeassistant/switch/aerosmart/aerosmart_luefterstufe/config"  │
 │  3. Sleep(2ms) - rate limiting                                           │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
@@ -413,7 +427,6 @@ Signal (SIGINT/SIGTERM) received
 │    - open = false                                                        │
 │                                                                          │
 │ 9. log.Info("Aerosmart Gateway stopped")                                 │
-│ 10. os.Exit(0)                                                           │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 

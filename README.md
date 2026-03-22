@@ -6,7 +6,7 @@ A Go-based gateway application that communicates with Drexel&Weiss Aerosmart M v
 
 ## Features
 
-- **Serial Communication**: Reads and writes to Aerosmart M device via serial over [USB located on Mainboard - refer to INSTALLATION.md](INSTALLATION.md). NOTE: It is **NOT** Modbus RTU, no modbus settings required.
+- **Serial Communication**: Reads and writes to Aerosmart M device via serial over [USB located on Mainboard - refer to INSTALLATION.md](docs/INSTALLATION.md). NOTE: It is **NOT** Modbus RTU, no modbus settings required.
 - **MQTT Integration**: Publishes sensor data and subscribes to control commands
 - **Home Assistant Discovery**: Auto-discovers sensors and switches in Home Assistant
 - **Derived Calculations**: Calculates derived values (e.g., zuluftabluftprozent, co2luefterstufe4)
@@ -44,8 +44,8 @@ The application follows a layered architecture with the following main component
                               ▼
                     ┌─────────────────┐
                     │   registers/    │
-                    │   writer.go     │
-                    │                 │
+                    │   reader.go     │
+                    │   (Writer)      │
                     │ - HandleMessage │
                     │ - TriggerFull   │
                     └─────────────────┘
@@ -56,7 +56,7 @@ The application follows a layered architecture with the following main component
 1. **Serial Port** (`internal/serial/serial.go`): Handles all serial communication with the device, including retry logic and port management
 2. **MQTT Client** (`internal/mqtt/client.go`): Manages MQTT connections, publishing, and subscriptions
 3. **Register Reader** (`internal/registers/reader.go`): Reads register values from the device and publishes to MQTT
-4. **Register Writer** (`internal/registers/writer.go`): Handles write commands from MQTT and verifies after writing
+4. **Register Writer** (`internal/registers/reader.go`): Handles write commands from MQTT and verifies after writing
 
 ## Quick Start
 
@@ -139,7 +139,7 @@ For detailed information about the application flow and timing diagrams, see:
 |--------|-------------|---------|
 | `serial.port` | Serial device path | `/dev/ttyUSB0` |
 | `serial.baudrate` | Baud rate | `115200` |
-| `serial.read_timeout` | Read timeout (seconds) | `2` |
+| `serial.read_timeout` | Read timeout (ms, 0=200ms fallback) | `1` |
 | `serial.device_response_delay` | Wait after write (ms) | `40` |
 | `serial.max_retries` | Max operation retries | `10` |
 | `serial.max_reopens` | Max port reopen attempts | `10` |
@@ -160,7 +160,7 @@ For detailed information about the application flow and timing diagrams, see:
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `device_id` | Device identifier | `aerosmart-gateway` |
+| `device_id` | Device identifier | `aerosmart` |
 | `log_level` | Logging level | `debug` |
 | `read_interval` | Read interval (seconds) | `60` |
 | `ha_discovery.enabled` | Enable HA discovery | `true` |
@@ -267,7 +267,7 @@ Wants=network.target
 [Service]
 Type=simple
 User=root
-ExecStart=/opt/aerosmart/aerosmart-gateway --config /opt/aerosmart/config.yaml --registers /opt/aerosmart/registers.yaml
+ExecStart=/opt/aerosmart/aerosmart-gateway -config /opt/aerosmart/config.yaml -registers /opt/aerosmart/registers.yaml
 Restart=on-failure
 RestartSec=5
 
@@ -308,7 +308,7 @@ WORKDIR /app
 COPY --from=builder /app/aerosmart-gateway .
 COPY config.yaml .
 COPY registers.yaml .
-CMD ["./aerosmart-gateway"]
+CMD ["./aerosmart-gateway", "-config", "config.yaml", "-registers", "registers.yaml"]
 ```
 
 ### Code Linting

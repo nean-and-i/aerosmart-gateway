@@ -19,17 +19,17 @@ type SerialConfig struct {
 	XonXoff                    bool   `yaml:"xonxoff"`                        // true
 	DsrDtr                     bool   `yaml:"dsrdtr"`                         // false
 	WriteTimeout               int    `yaml:"write_timeout"`                  // 10
-	ReadTimeout                int    `yaml:"read_timeout"`                   // 5 (seconds)
-	MaxReopens                 int    `yaml:"max_reopens"`                    // 3
-	DeadlineTimeout            int    `yaml:"deadline_timeout"`               // 500 (milliseconds)
-	WriteWithRetryDelay        int    `yaml:"write_with_retry_delay"`         // 400 (milliseconds)
-	DeviceResponseDelay        int    `yaml:"device_response_delay"`          // 100 (milliseconds)
+	ReadTimeout                int    `yaml:"read_timeout"`                   // 1 (milliseconds, 0 = 200ms default)
+	MaxReopens                 int    `yaml:"max_reopens"`                    // 10
+	DeadlineTimeout            int    `yaml:"deadline_timeout"`               // 150 (milliseconds)
+	WriteWithRetryDelay        int    `yaml:"write_with_retry_delay"`         // 10 (milliseconds)
+	DeviceResponseDelay        int    `yaml:"device_response_delay"`          // 40 (milliseconds)
 	ReadWithRetryDelay         int    `yaml:"read_with_retry_delay"`          // 100 (milliseconds)
-	ReadMaxRetries             int    `yaml:"read_max_retries"`               // 3
-	WriteMaxRetries            int    `yaml:"write_max_retries"`              // 3
+	ReadMaxRetries             int    `yaml:"read_max_retries"`               // 10
+	WriteMaxRetries            int    `yaml:"write_max_retries"`              // 10
 	MaxRetries                 int    `yaml:"max_retries"`                    // 10 (max retries for register read/write operations)
-	ConnectRetryInitialDelayMs int    `yaml:"connect_retry_initial_delay_ms"` // 100 (ms)
-	ConnectRetryMaxDelayMs     int    `yaml:"connect_retry_max_delay_ms"`     // 10000 (ms)
+	ConnectRetryInitialDelayMs int    `yaml:"connect_retry_initial_delay_ms"` // 2 (ms)
+	ConnectRetryMaxDelayMs     int    `yaml:"connect_retry_max_delay_ms"`     // 400 (ms)
 	ConnectRetryJitterPercent  int    `yaml:"connect_retry_jitter_percent"`   // 25 (%)
 }
 

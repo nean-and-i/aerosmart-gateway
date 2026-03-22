@@ -34,8 +34,5 @@ COPY registers.yaml .
 RUN adduser -D -u 1000 appuser && chown -R appuser:appuser /app
 USER appuser
 
-# Expose MQTT port (1883) and any other ports if needed
-EXPOSE 1883
-
 # Run the application
-CMD ["./aerosmart-gateway"]
+CMD ["./aerosmart-gateway", "-config", "config.yaml", "-registers", "registers.yaml"]

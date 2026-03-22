@@ -46,13 +46,12 @@ The application follows a layered architecture with the following main component
         └─────────────────────┼─────────────────────┘
                               ▼
                     ┌─────────────────┐
-                    │   serial/       │
-                    │   listener.go   │
-                    │                 │
-                    │ - Continuous    │
-                    │   Read Loop     │
-                    │ - Response      │
-                    │   Processing    │
+                    │   registers/    │
+                    │   reader.go     │
+                    │   (Writer)      │
+                    │ - HandleMessage │
+                    │ - TriggerFull   │
+                    │ - Verification  │
                     └─────────────────┘
 ```
 
@@ -108,11 +107,12 @@ The serial port is configured with the following parameters (from `config.yaml`)
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | Baud Rate | 115200 | Communication speed |
-| Read Timeout | 200ms | Max wait for response |
+| Read Timeout | 1ms (config), 200ms (fallback) | Max wait for serial read (treated as milliseconds in code) |
 | Write Timeout | 10s | Max wait for write |
 | Device Response Delay | 40ms | Wait after write before read |
 | Write Retry Delay | 10ms | Delay between write retries |
 | Read Retry Delay | 100ms | Delay between read retries |
+| Deadline Timeout | 150ms | Flush input deadline timeout |
 | Max Retries | 10 | Max attempts for register operations |
 | Max Reopens | 10 | Max port reopen attempts |
 
@@ -228,9 +228,10 @@ Writer.HandleMessage(topic, message)
 │ 6. Build command from template                      │
 │ 7. Open serial port if not open                     │
 │ 8. SendAndReceive(command) - write + read response  │
-│ 9. FlushBuffer() - clear stale data                 │
-│ 10. Read verify registers (if configured)           │
-│     - Read each verify register                     │
+│ 9. FlushBuffer() - FlushInputMultiple(5)            │
+│ 10. Wait deviceResponseDelay before verification    │
+│ 11. Read verify registers (if configured)           │
+│     - ReadSingle() for each verify register         │
 │     - Publish verified values to MQTT               │
 └─────────────────────────────────────────────────────┘
 ```
@@ -245,15 +246,19 @@ Write Priority Channel
     ▼
 ┌─────────────────────────────────────────────────────┐
 │ Channel: writePriorityChan (buffer size 1)          │
-│                                                         │
-│ When a write message arrives:                        │
-│   - SignalWritePriority() sends struct{}{} to channel│
-│   - This preempts any ongoing read operation         │
-│                                                         │
-│ During periodic read (TriggerFullReadout):           │
-│   - Check writePriorityChan (non-blocking)           │
-│   - If has value: cancel read, skip this cycle       │
-│   - If empty: proceed with normal read               │
+│                                                     │
+│ When a write message arrives (HandleMessage):       │
+│   - SignalWritePriority() tries to send to channel  │
+│   - If channel empty: value added (write pending)   │
+│   - If channel full: already pending, no-op         │
+│   - Then: Cancel() ongoing read + ResetContext()    │
+│                                                     │
+│ During periodic read (TriggerFullReadout):          │
+│   - Try to send to writePriorityChan (non-blocking) │
+│   - If send succeeds (channel was empty):           │
+│     no write pending, drain channel, proceed read   │
+│   - If send fails (channel full from                │
+│     SignalWritePriority): skip this read cycle       │
 └─────────────────────────────────────────────────────┘
 ```
 
@@ -303,12 +308,12 @@ Subscribe(topic, handler)
 When `ha_discovery.enabled: true`, the gateway publishes:
 
 - **Sensor Discovery**: For each read register with HA config
-  - Topic: `homeassistant/sensor/{device_id}_{register_name}/config`
-  - Payload: JSON with name, state_topic, unit, device_class, unique_id
+  - Topic: `homeassistant/sensor/{device_id}/{device_id}_{register_name}/config`
+  - Payload: JSON with name, state_topic, unit, device_class, unique_id, device
 
 - **Switch Discovery**: For each write register with HA config
-  - Topic: `homeassistant/switch/{device_id}_{register_name}/config`
-  - Payload: JSON with name, command_topic, state_topic, unique_id
+  - Topic: `homeassistant/switch/{device_id}/{device_id}_{register_name}/config`
+  - Payload: JSON with name, command_topic, state_topic, unique_id, device
 
 ---
 
@@ -533,7 +538,7 @@ The `SendAndReceive` method implements a hybrid retry approach:
 
 2. **Batch MQTT Publishing**: Instead of publishing each register value individually, consider batching multiple values into a single MQTT message using JSON.
 
-3. **Optimized Buffer Flushing**: The current `FlushInputMultiple(5)` with 10ms sleep between each flush adds latency. Consider more efficient buffer clearing strategies.
+3. **Optimized Buffer Flushing**: `SendAndReceive` calls `FlushInputMultiple(3)` before writes, and `FlushBuffer()` calls `FlushInputMultiple(5)` after writes. Each flush iteration has a 10ms sleep between iterations. Consider more efficient buffer clearing strategies.
 
 ### Reliability
 
@@ -561,12 +566,18 @@ The `SendAndReceive` method implements a hybrid retry approach:
 |-----------|---------|-------------|
 | `port` | /dev/ttyUSB0 | Serial device path |
 | `baudrate` | 115200 | Communication speed |
-| `read_timeout` | 200ms | Read timeout |
+| `read_timeout` | 1ms (config), 200ms (fallback) | Read timeout (treated as milliseconds in code) |
+| `deadline_timeout` | 150ms | Flush input deadline timeout |
 | `device_response_delay` | 40ms | Wait after write |
 | `write_with_retry_delay` | 10ms | Write retry delay |
 | `read_with_retry_delay` | 100ms | Read retry delay |
-| `max_retries` | 10 | Max operation retries |
+| `read_max_retries` | 10 | Max read retries per SendAndReceive |
+| `write_max_retries` | 10 | Max write retries per SendAndReceive |
+| `max_retries` | 10 | Max SendAndReceive attempts |
 | `max_reopens` | 10 | Max port reopen attempts |
+| `connect_retry_initial_delay_ms` | 2ms | Initial backoff delay for connection |
+| `connect_retry_max_delay_ms` | 400ms | Max backoff delay for connection |
+| `connect_retry_jitter_percent` | 25% | Jitter for backoff |
 
 ### MQTT Configuration Parameters
 
