@@ -112,6 +112,8 @@ ha_discovery:
 ```bash
 ./aerosmart-gateway -config config.yaml -registers registers.yaml
 ```
+Example of full register readout:
+![aerosmart-gateway console ](docs/aerosmart-readout-02.png)
 
 ## Documentation
 
