@@ -14,7 +14,7 @@ set -e
 
 # Configuration
 APP_DIR="/opt/aerosmart"
-BINARY_NAME="aerosmart-gateway-armv6"
+BINARY_NAME="aerosmart-gateway"
 CONFIG_FILE="config.yaml"
 REGISTERS_FILE="registers.yaml"
 INIT_SCRIPT="/etc/init.d/aerosmart"
