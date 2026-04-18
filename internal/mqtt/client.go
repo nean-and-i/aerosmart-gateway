@@ -71,6 +71,20 @@ func (c *Client) Connect() error {
 	opts.SetConnectRetryInterval(5 * time.Second)
 	opts.SetMaxReconnectInterval(60 * time.Second)
 
+	// Set KeepAlive to detect network failures within 30 seconds
+	// This ensures faster disconnect detection compared to default
+	opts.SetKeepAlive(30 * time.Second)
+
+	// Set reconnection handler for visibility into reconnection progress
+	opts.SetReconnectingHandler(func(client mqtt.Client, opts *mqtt.ClientOptions) {
+		fmt.Println("MQTT attempting to reconnect...")
+	})
+
+	// Set connection notification handler for state change visibility
+	opts.SetConnectionNotificationHandler(func(client mqtt.Client, notification mqtt.ConnectionNotification) {
+		fmt.Printf("MQTT connection state: %v\n", notification.Type())
+	})
+
 	// Set connection handlers
 	opts.OnConnectionLost = func(client mqtt.Client, err error) {
 		c.mu.Lock()
