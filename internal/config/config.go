@@ -45,11 +45,6 @@ type MQTTConfig struct {
 	ConnectRetryInitialDelayMs int    `yaml:"connect_retry_initial_delay_ms"` // 500 (ms)
 	ConnectRetryMaxDelayMs     int    `yaml:"connect_retry_max_delay_ms"`     // 30000 (ms)
 	ConnectRetryJitterPercent  int    `yaml:"connect_retry_jitter_percent"`   // 25 (%)
-	// Will Message configuration for last-will notification
-	WillTopic   string `yaml:"will_topic"`   // Topic for last-will message
-	WillMessage string `yaml:"will_message"` // Last-will message payload
-	WillQOS     int    `yaml:"will_qos"`     // QoS for last-will message (0-2)
-	WillRetain  bool   `yaml:"will_retain"`  // Retain last-will message
 	// Publish retry configuration
 	PublishRetryCount int `yaml:"publish_retry_count"` // Number of retries for failed publishes
 }

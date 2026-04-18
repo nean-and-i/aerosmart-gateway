@@ -28,19 +28,13 @@ type ConnectionHandler func(connected bool)
 
 // MQTTConfig holds MQTT connection configuration
 type MQTTConfig struct {
-	Broker   string
-	Port     int
-	Username string
-	Password string
-	ClientID string
-	QOS      int
-	Retain   bool
-	// Will Message configuration for last-will notification
-	WillTopic   string
-	WillMessage string
-	WillQOS     int
-	WillRetain  bool
-	// Publish retry configuration
+	Broker            string
+	Port              int
+	Username          string
+	Password          string
+	ClientID          string
+	QOS               int
+	Retain            bool
 	PublishRetryCount int
 }
 
@@ -76,12 +70,6 @@ func (c *Client) Connect() error {
 	opts.SetConnectRetry(true)
 	opts.SetConnectRetryInterval(5 * time.Second)
 	opts.SetMaxReconnectInterval(60 * time.Second)
-
-	// Set Will Message for last-will notification
-	// This notifies when the client disconnects unexpectedly
-	if c.config.WillTopic != "" {
-		opts.SetWill(c.config.WillTopic, c.config.WillMessage, byte(c.config.WillQOS), c.config.WillRetain)
-	}
 
 	// Set connection handlers
 	opts.OnConnectionLost = func(client mqtt.Client, err error) {
