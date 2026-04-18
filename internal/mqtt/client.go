@@ -17,7 +17,14 @@ type Client struct {
 	connected bool
 	mu        sync.RWMutex
 	deviceID  string
+
+	// Subscription tracking for resilience
+	subscribedTopics map[string]MessageHandler // topic -> handler
+	subMu            sync.RWMutex
 }
+
+// ConnectionHandler is a callback for connection state changes
+type ConnectionHandler func(connected bool)
 
 // MQTTConfig holds MQTT connection configuration
 type MQTTConfig struct {
@@ -28,6 +35,13 @@ type MQTTConfig struct {
 	ClientID string
 	QOS      int
 	Retain   bool
+	// Will Message configuration for last-will notification
+	WillTopic   string
+	WillMessage string
+	WillQOS     int
+	WillRetain  bool
+	// Publish retry configuration
+	PublishRetryCount int
 }
 
 // MessageHandler is a function type for handling incoming MQTT messages
@@ -36,13 +50,14 @@ type MessageHandler func(topic string, message string)
 // NewClient creates a new MQTT client
 func NewClient(config *MQTTConfig, deviceID string) *Client {
 	return &Client{
-		config:    config,
-		deviceID:  deviceID,
-		connected: false,
+		config:           config,
+		deviceID:         deviceID,
+		connected:        false,
+		subscribedTopics: make(map[string]MessageHandler),
 	}
 }
 
-// Connect connects to the MQTT broker
+// Connect connects to the MQTT broker with resilience features
 func (c *Client) Connect() error {
 	broker := fmt.Sprintf("tcp://%s:%d", c.config.Broker, c.config.Port)
 
@@ -51,10 +66,22 @@ func (c *Client) Connect() error {
 	opts.SetClientID(c.config.ClientID)
 	opts.SetUsername(c.config.Username)
 	opts.SetPassword(c.config.Password)
-	opts.SetCleanSession(true)
+
+	// Enable persistent session for subscription recovery
+	// This preserves subscriptions across reconnects
+	opts.SetCleanSession(false)
+
+	// Enable auto-reconnect with configurable interval
+	opts.SetAutoReconnect(true)
 	opts.SetConnectRetry(true)
 	opts.SetConnectRetryInterval(5 * time.Second)
-	opts.SetAutoReconnect(true)
+	opts.SetMaxReconnectInterval(60 * time.Second)
+
+	// Set Will Message for last-will notification
+	// This notifies when the client disconnects unexpectedly
+	if c.config.WillTopic != "" {
+		opts.SetWill(c.config.WillTopic, c.config.WillMessage, byte(c.config.WillQOS), c.config.WillRetain)
+	}
 
 	// Set connection handlers
 	opts.OnConnectionLost = func(client mqtt.Client, err error) {
@@ -69,6 +96,12 @@ func (c *Client) Connect() error {
 		c.connected = true
 		c.mu.Unlock()
 		fmt.Printf("MQTT connected to %s\n", broker)
+
+		// Auto-recover subscriptions after reconnect
+		// This ensures we re-subscribe to all topics even with persistent session
+		if err := c.resubscribeAll(); err != nil {
+			fmt.Printf("MQTT failed to recover subscriptions: %v\n", err)
+		}
 	}
 
 	c.client = mqtt.NewClient(opts)
@@ -80,6 +113,50 @@ func (c *Client) Connect() error {
 	c.mu.Lock()
 	c.connected = true
 	c.mu.Unlock()
+
+	return nil
+}
+
+// resubscribeAll re-subscribes to all previously subscribed topics
+func (c *Client) resubscribeAll() error {
+	c.subMu.RLock()
+	topicCount := len(c.subscribedTopics)
+	c.subMu.RUnlock()
+
+	if topicCount == 0 {
+		return nil
+	}
+
+	fmt.Printf("MQTT recovering %d subscriptions...\n", topicCount)
+
+	c.subMu.RLock()
+	topics := make(map[string]MessageHandler)
+	for topic, handler := range c.subscribedTopics {
+		topics[topic] = handler
+	}
+	c.subMu.RUnlock()
+
+	for topic, handler := range topics {
+		if err := c.subscribeTopic(topic, handler); err != nil {
+			return fmt.Errorf("failed to subscribe to %s: %w", topic, err)
+		}
+	}
+
+	fmt.Printf("MQTT all subscriptions recovered\n")
+	return nil
+}
+
+// subscribeTopic subscribes to a single topic with QoS 1
+func (c *Client) subscribeTopic(topic string, handler MessageHandler) error {
+	callback := func(client mqtt.Client, msg mqtt.Message) {
+		handler(msg.Topic(), string(msg.Payload()))
+	}
+
+	// Use QoS 1 for at-least-once delivery guarantee
+	token := c.client.Subscribe(topic, 1, callback)
+	if token.Wait() && token.Error() != nil {
+		return token.Error()
+	}
 
 	return nil
 }
@@ -101,21 +178,60 @@ func (c *Client) IsConnected() bool {
 	return c.connected && c.client != nil
 }
 
-// Publish publishes a message to a topic
+// GetSubscriptionCount returns the number of active subscriptions
+// Useful for health monitoring and debugging
+func (c *Client) GetSubscriptionCount() int {
+	c.subMu.RLock()
+	defer c.subMu.RUnlock()
+	return len(c.subscribedTopics)
+}
+
+// GetSubscribedTopics returns a copy of currently subscribed topics
+// Useful for debugging and health checks
+func (c *Client) GetSubscribedTopics() []string {
+	c.subMu.RLock()
+	defer c.subMu.RUnlock()
+	topics := make([]string, 0, len(c.subscribedTopics))
+	for topic := range c.subscribedTopics {
+		topics = append(topics, topic)
+	}
+	return topics
+}
+
+// Publish publishes a message to a topic with QoS 1 and retry
 func (c *Client) Publish(topic string, value string) error {
 	if !c.IsConnected() {
 		return fmt.Errorf("MQTT client not connected")
 	}
 
-	token := c.client.Publish(topic, byte(c.config.QOS), c.config.Retain, value)
-	if token.Wait() && token.Error() != nil {
-		return fmt.Errorf("failed to publish to %s: %w", topic, token.Error())
+	// Get retry count from config, default to 3
+	retryCount := c.config.PublishRetryCount
+	if retryCount <= 0 {
+		retryCount = 3
 	}
 
-	return nil
+	var lastErr error
+	for attempt := 0; attempt < retryCount; attempt++ {
+		// Use QoS 1 for at-least-once delivery guarantee
+		token := c.client.Publish(topic, 1, c.config.Retain, value)
+		if token.Wait() && token.Error() != nil {
+			lastErr = fmt.Errorf("failed to publish to %s: %w", topic, token.Error())
+			// Wait before retry with exponential backoff
+			if attempt < retryCount-1 {
+				delay := time.Duration(1<<attempt) * time.Second
+				time.Sleep(delay)
+				continue
+			}
+			return lastErr
+		}
+		return nil
+	}
+
+	return lastErr
 }
 
 // Subscribe subscribes to a topic with a message handler
+// Uses QoS 1 for at-least-once delivery and tracks for auto-recovery
 func (c *Client) Subscribe(topic string, handler MessageHandler) error {
 	if !c.IsConnected() {
 		return fmt.Errorf("MQTT client not connected")
@@ -125,10 +241,16 @@ func (c *Client) Subscribe(topic string, handler MessageHandler) error {
 		handler(msg.Topic(), string(msg.Payload()))
 	}
 
-	token := c.client.Subscribe(topic, byte(c.config.QOS), callback)
+	// Use QoS 1 for at-least-once delivery guarantee
+	token := c.client.Subscribe(topic, 1, callback)
 	if token.Wait() && token.Error() != nil {
 		return fmt.Errorf("failed to subscribe to %s: %w", topic, token.Error())
 	}
+
+	// Track subscription for auto-recovery on reconnect
+	c.subMu.Lock()
+	c.subscribedTopics[topic] = handler
+	c.subMu.Unlock()
 
 	return nil
 }
