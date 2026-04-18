@@ -268,15 +268,19 @@ Write Priority Channel
 
 ### MQTT Client Configuration
 
-| Parameter | Description |
-|-----------|-------------|
-| Broker | MQTT broker IP/hostname |
-| Port | MQTT broker port (default: 1883) |
-| Username | Authentication username |
-| Password | Authentication password |
-| ClientID | Unique client identifier |
-| QOS | Quality of Service (0, 1, or 2) |
-| Retain | Retain messages |
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| Broker | MQTT broker IP/hostname | - |
+| Port | MQTT broker port | 1883 |
+| Username | Authentication username | - |
+| Password | Authentication password | - |
+| ClientID | Unique client identifier | `aerosmart-gateway` |
+| QOS | Quality of Service | 1 (internal) |
+| Retain | Retain messages | `true` |
+| KeepAlive | KeepAlive interval (seconds) | 30 |
+| MaxReconnectInterval | Maximum reconnection interval | 60s |
+| CleanSession | Preserve sessions across reconnects | `false` |
+| PublishRetryCount | Number of publish retries | 3 |
 
 ### MQTT Operations
 
@@ -286,9 +290,13 @@ Publish(topic, value)
     ▼
 ┌─────────────────────────────────────┐
 │ 1. Check IsConnected()              │
-│ 2. client.Publish(topic, QOS,       │
-│    Retain, value)                   │
-│ 3. Wait for completion              │
+│ 2. For retry_count attempts:        │
+│    a. client.Publish(topic, 1,      │
+│       Retain, value)                │
+│    b. Wait for completion           │
+│    c. If failed: sleep + retry      │
+│       (1s, 2s, 4s exponential)      │
+│ 3. Return success or error          │
 └─────────────────────────────────────┘
 
 Subscribe(topic, handler)
@@ -297,11 +305,49 @@ Subscribe(topic, handler)
 ┌─────────────────────────────────────┐
 │ 1. Check IsConnected()              │
 │ 2. Define callback function         │
-│ 3. client.Subscribe(topic, QOS,     │
+│ 3. client.Subscribe(topic, 1,       │
 │    callback)                        │
 │ 4. Wait for completion              │
+│ 5. Track subscription for recovery  │
 └─────────────────────────────────────┘
 ```
+
+### MQTT Resilience Features
+
+The gateway implements comprehensive MQTT resilience:
+
+#### Persistent Session (CleanSession=false)
+- Subscriptions are preserved across reconnects
+- Broker maintains subscription state
+- No manual re-subscription needed after connection loss
+
+#### Auto-Reconnect with Exponential Backoff
+- Initial reconnect attempt: 5 seconds
+- Maximum reconnect interval: 60 seconds
+- Jitter: 25% to prevent thundering herd
+
+#### KeepAlive Monitoring
+- Sends PINGREQ every 30 seconds
+- Detects network failures within 30-60 seconds
+- Triggers immediate reconnection on failure
+
+#### Subscription Recovery
+- On reconnect: `resubscribeAll()` is called
+- Re-subscribes to all tracked topics
+- Logs recovery progress:
+  - "MQTT recovering X subscriptions..."
+  - "MQTT all subscriptions recovered"
+
+#### Connection State Handlers
+- `OnConnectionLost`: Sets connected=false, logs error
+- `OnConnect`: Sets connected=true, triggers subscription recovery
+- `SetReconnectingHandler`: Logs reconnection attempts
+- `SetConnectionNotificationHandler`: Logs all state changes
+
+#### Publish Retry
+- Failed publishes are retried up to 3 times
+- Exponential backoff: 1s, 2s, 4s
+- Uses QoS 1 for at-least-once delivery
 
 ### Home Assistant Discovery
 
@@ -314,6 +360,79 @@ When `ha_discovery.enabled: true`, the gateway publishes:
 - **Switch Discovery**: For each write register with HA config
   - Topic: `homeassistant/switch/{device_id}/{device_id}_{register_name}/config`
   - Payload: JSON with name, command_topic, state_topic, unique_id, device
+
+---
+
+## Connection State Flow
+
+### MQTT Connection Lifecycle
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ 1. Initial Connection                                       │
+│    - Connect with CleanSession=false                        │
+│    - Set KeepAlive=30s                                      │
+│    - Set AutoReconnect=true                                 │
+│    - Set MaxReconnectInterval=60s                           │
+│    - Set OnConnectHandler: resubscribeAll()                 │
+│    - Set OnConnectionLostHandler                            │
+│    - Set ReconnectingHandler                                │
+│    - Set ConnectionNotificationHandler                      │
+│    - OnConnect: resubscribeAll()                            │
+└─────────────────────────────────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 2. Connection Lost                                          │
+│    - Network failure or broker restart                      │
+│    - OnConnectionLost fires                                 │
+│    - Auto-reconnect starts                                  │
+│    - ConnectionNotification: ConnectionLost                 │
+│    - ReconnectingHandler logs: "MQTT attempting to          │
+│      reconnect..."                                          │
+└─────────────────────────────────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 3. Reconnection                                             │
+│    - ConnectionNotification: Connecting                     │
+│    - Exponential backoff: 5s, 10s, 20s, 40s, 60s (max)     │
+│    - ReconnectingHandler logs each attempt                  │
+│    - ConnectionNotification: Connected                      │
+│    - OnConnect: resubscribeAll()                            │
+└─────────────────────────────────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 4. Subscription Recovery                                    │
+│    - resubscribeAll() called                                │
+│    - Get all tracked subscriptions from internal map        │
+│    - Re-subscribe to each topic with QoS 1                 │
+│    - Logs: "MQTT recovering X subscriptions..."             │
+│    - For each topic: client.Subscribe(topic, 1, callback)  │
+│    - Logs: "MQTT all subscriptions recovered"              │
+└─────────────────────────────────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 5. Normal Operation                                         │
+│    - Continue periodic read cycle                           │
+│    - Handle incoming MQTT messages                          │
+│    - Publish sensor values to MQTT                          │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Connection State Log Messages
+
+| Event | Log Message |
+|-------|-------------|
+| Reconnecting | `MQTT attempting to reconnect...` |
+| State: Connecting | `MQTT connection state: Connecting` |
+| State: Connected | `MQTT connection state: Connected` |
+| State: ConnectionLost | `MQTT connection state: ConnectionLost` |
+| State: Failed | `MQTT connection state: Failed` |
+| Subscription Recovery | `MQTT recovering X subscriptions...` |
+| Recovery Complete | `MQTT all subscriptions recovered` |
 
 ---
 
@@ -507,11 +626,37 @@ Both serial and MQTT connections use exponential backoff with jitter:
 
 ```
 Initial Delay: 2ms (serial), 500ms (MQTT)
-Max Delay: 400ms (serial), 30s (MQTT)
+Max Delay: 400ms (serial), 60s (MQTT)
 Jitter: 25%
 
 Formula: delay = min(initialDelay * 2^attempt, maxDelay) * (1 + random(-jitter, +jitter))
 ```
+
+### MQTT Resilience Features
+
+#### KeepAlive Disconnect Detection
+- **Interval**: 30 seconds
+- **Detection Time**: 30-60 seconds after network failure
+- **Behavior**: If no PINGRESP received within 30s + ping timeout, connection is considered lost
+
+#### Auto-Reconnect Behavior
+1. Connection lost detected (via KeepAlive or OnConnectionLost)
+2. ReconnectingHandler logs: "MQTT attempting to reconnect..."
+3. Exponential backoff begins: 5s → 10s → 20s → 40s → 60s (max)
+4. On successful connect: OnConnectHandler triggers subscription recovery
+5. Subscription recovery: resubscribeAll() re-subscribes to all topics
+6. Normal operation resumes
+
+#### Publish Retry
+- **Retry Count**: 3 (configurable via `publish_retry_count`)
+- **Backoff**: Exponential (1s, 2s, 4s)
+- **QoS**: Uses QoS 1 for at-least-once delivery
+
+#### Subscription Recovery
+- Subscriptions tracked in internal map
+- On reconnect: resubscribeAll() iterates and re-subscribes
+- Each subscription uses QoS 1
+- Logs recovery progress for monitoring
 
 ### Serial Communication Retry
 
@@ -588,8 +733,25 @@ The `SendAndReceive` method implements a hybrid retry approach:
 | `username` | - | MQTT username |
 | `password` | - | MQTT password |
 | `client_id` | aerosmart-gateway | Client identifier |
-| `qos` | 0 | Quality of Service |
+| `qos` | 0 | Quality of Service (used for config, internal uses QoS 1) |
 | `retain` | true | Retain messages |
+| `publish_retry_count` | 3 | Number of retries for failed publishes |
+| `connect_retry_initial_delay_ms` | 500 | Initial backoff delay (ms) |
+| `connect_retry_max_delay_ms` | 30000 | Maximum backoff delay (ms) |
+| `connect_retry_jitter_percent` | 25 | Jitter percentage for backoff |
+
+### MQTT Resilience Configuration (Internal)
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| `CleanSession` | false | Preserve subscriptions across reconnects |
+| `KeepAlive` | 30s | Disconnect detection interval |
+| `MaxReconnectInterval` | 60s | Maximum time between reconnection attempts |
+| `AutoReconnect` | true | Enable automatic reconnection |
+| `ConnectRetry` | true | Retry initial connection |
+| `ConnectRetryInterval` | 5s | Interval between connection retries |
+| `Subscription QoS` | 1 | At-least-once delivery |
+| `Publish QoS` | 1 | At-least-once delivery |
 
 ### Application Configuration
 

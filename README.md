@@ -8,6 +8,13 @@ A Go-based gateway application that communicates with Drexel&Weiss Aerosmart M v
 
 - **Serial Communication**: Reads and writes to Aerosmart M device via serial over [USB located on Mainboard - refer to INSTALLATION.md](docs/INSTALLATION.md). NOTE: It is **NOT** Modbus RTU, no modbus settings required.
 - **MQTT Integration**: Publishes sensor data and subscribes to control commands
+- **MQTT Resilience**: 
+  - **Persistent Session**: Subscriptions preserved across reconnects (CleanSession=false)
+  - **Auto-Recovery**: Automatically re-subscribes to topics after connection loss
+  - **QoS 1 Support**: At-least-once delivery for critical messages
+  - **KeepAlive Monitoring**: Detects network failures within 30-60 seconds
+  - **Connection State Visibility**: Logs reconnection progress and state changes
+  - **Publish Retry**: Automatic retry with exponential backoff for failed publishes
 - **Home Assistant Discovery**: Auto-discovers sensors and switches in Home Assistant
 - **Derived Calculations**: Calculates derived values (e.g., zuluftabluftprozent, co2luefterstufe4)
 - **Configurable Logging**: Supports debug, info, warn, and error log levels
@@ -153,8 +160,14 @@ For detailed information about the application flow and timing diagrams, see:
 | `mqtt.username` | MQTT username | - |
 | `mqtt.password` | MQTT password | - |
 | `mqtt.client_id` | Client identifier | `aerosmart-gateway` |
-| `mqtt.qos` | Quality of Service | `0` |
+| `mqtt.qos` | Quality of Service (0, 1, or 2) | `0` |
 | `mqtt.retain` | Retain messages | `true` |
+| `mqtt.publish_retry_count` | Number of retries for failed publishes | `3` |
+| `mqtt.connect_retry_initial_delay_ms` | Initial delay for exponential backoff | `500ms` |
+| `mqtt.connect_retry_max_delay_ms` | Maximum delay for exponential backoff | `30000ms` |
+| `mqtt.connect_retry_jitter_percent` | Jitter percentage for backoff | `25%` |
+
+> **MQTT Resilience Note:** The gateway uses QoS 1 (at-least-once delivery) for subscriptions and publishes to ensure message reliability. Persistent sessions (CleanSession=false) preserve subscriptions across reconnects. KeepAlive is set to 30 seconds for fast disconnect detection.
 
 ### Application Configuration
 
@@ -251,6 +264,9 @@ The application implements comprehensive retry logic:
 - **Connection Retry**: Exponential backoff with jitter for both serial and MQTT
 - **Serial Retry**: Write and read retries with port reopening on failure
 - **Max Retries**: Configurable maximum attempts before giving up
+- **MQTT Publish Retry**: Failed publishes are retried with exponential backoff (1s, 2s, 4s)
+- **MQTT KeepAlive**: Detects network failures within 30-60 seconds for fast reconnection
+- **Subscription Recovery**: Automatically re-subscribes to all topics after connection is restored
 
 ## Running as a Service
 

@@ -108,6 +108,13 @@ mqtt:
   connect_retry_initial_delay_ms: 500
   connect_retry_max_delay_ms: 30000
   connect_retry_jitter_percent: 25
+  # MQTT Resilience Configuration
+  # - Persistent Session: Subscriptions preserved across reconnects
+  # - Auto-Recovery: Automatic re-subscription on connection established
+  # - QoS 1: At-least-once delivery for subscriptions and publishes
+  # - KeepAlive: Disconnect detection within 30-60 seconds
+  # - Publish Retry: Retries with exponential backoff (1s, 2s, 4s)
+  publish_retry_count: 3         # Number of retries for failed publishes
 
 # Device ID for Home Assistant
 device_id: "aerosmart"
@@ -255,6 +262,57 @@ If you're using Home Assistant with the built-in MQTT broker:
 2. Find MQTT and configure it
 3. Use the broker address (usually `localhost` if running on the same machine)
 4. Use your Home Assistant MQTT credentials
+
+### MQTT Resilience Features
+
+The gateway implements several features to ensure reliable MQTT communication:
+
+#### Persistent Session
+The gateway uses `CleanSession=false` to preserve subscriptions across reconnects. This means:
+- Subscriptions are automatically restored when the connection is re-established
+- No manual re-subscription is needed after network interruptions or broker restarts
+
+#### Auto-Recovery
+When the MQTT connection is lost, the gateway automatically:
+1. Detects the disconnection (via KeepAlive or connection lost handler)
+2. Initiates reconnection with exponential backoff
+3. Re-subscribes to all previously subscribed topics
+4. Continues normal operation
+
+#### KeepAlive Monitoring
+The gateway sends periodic keepalive packets every 30 seconds to:
+- Detect network failures quickly (within 30-60 seconds)
+- Trigger immediate reconnection attempts
+- Ensure minimal downtime during network issues
+
+#### Connection State Logging
+The gateway logs connection state changes for monitoring:
+```
+MQTT attempting to reconnect...
+MQTT connection state: Connecting
+MQTT connection state: Connected
+MQTT recovering X subscriptions...
+MQTT all subscriptions recovered
+```
+
+#### Publish Retry
+Failed MQTT publishes are automatically retried with exponential backoff:
+- Attempt 1: Immediate
+- Attempt 2: After 1 second
+- Attempt 3: After 2 seconds
+- (Configurable via `publish_retry_count`)
+
+#### Broker Persistence (Recommended for Production)
+For production deployments, enable persistence on your MQTT broker:
+
+**Mosquitto:**
+```conf
+persistence true
+persistence_location /var/lib/mosquitto/
+persistence_interval 300
+```
+
+This ensures messages are not lost during broker restarts.
 
 ---
 
@@ -522,6 +580,28 @@ sudo usermod -a -G dialout $USER
 - The broker may have restarted
 - Check network connectivity
 - The application will automatically reconnect
+- Check logs for reconnection progress:
+  - "MQTT attempting to reconnect..."
+  - "MQTT connection state: Connected"
+  - "MQTT all subscriptions recovered"
+
+**Problem**: Subscriptions not restored after reconnect
+
+- Ensure broker supports persistent sessions
+- Check that CleanSession is not being cleared on the broker
+- Verify logs show "MQTT all subscriptions recovered"
+
+**Problem**: Slow disconnect detection
+
+- Default KeepAlive is 30 seconds
+- Network failures may take 30-60 seconds to detect
+- This is by design to avoid false positives
+
+**Problem**: Messages not delivered after reconnect
+
+- Ensure broker persistence is enabled
+- Check publish retry count in configuration
+- Verify QoS settings match your requirements
 
 ### Data Issues
 

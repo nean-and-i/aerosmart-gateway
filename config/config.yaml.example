@@ -37,6 +37,13 @@ mqtt:
   connect_retry_initial_delay_ms: 500   # Initial delay for exponential backoff (default: 500ms)
   connect_retry_max_delay_ms: 30000     # Maximum delay for exponential backoff (default: 30s)
   connect_retry_jitter_percent: 25      # Jitter percentage (0-100, default: 25%)
+  # MQTT Resilience Configuration
+  # - Persistent Session: Subscriptions preserved across reconnects (CleanSession=false)
+  # - Auto-Recovery: Automatic re-subscription on connection established
+  # - QoS 1: At-least-once delivery for subscriptions and publishes
+  # - KeepAlive: Disconnect detection within 30-60 seconds
+  # - Publish Retry: Retries with exponential backoff (1s, 2s, 4s)
+  publish_retry_count: 3                # Number of retries for failed publishes (default: 3)
 
 # Device ID for Home Assistant discovery
 device_id: "aerosmart"

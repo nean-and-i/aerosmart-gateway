@@ -397,6 +397,118 @@ publishHADiscovery()
 
 ---
 
+## MQTT Reconnection Timing
+
+### Network Disconnection Scenario
+
+```
+Time (s)    Component              Action
+────────────────────────────────────────────────────────────────────────────
+0           Normal                Application running, periodic reads
+0           Network               Network connection lost
+0           MQTT Client           Unaware of disconnection (no PINGRESP)
+30          MQTT Client           KeepAlive timeout (30s + ping timeout)
+30          MQTT Client           OnConnectionLost fires
+30          MQTT Client           connected = false
+30          MQTT Client           Log: "MQTT connection lost: <error>"
+30          MQTT Client           Auto-reconnect starts
+30          MQTT Client           Log: "MQTT attempting to reconnect..."
+35          MQTT Client           ConnectionNotification: Connecting
+35          MQTT Client           Connect to broker
+40          MQTT Client           OnConnect fires
+40          MQTT Client           connected = true
+40          MQTT Client           Log: "MQTT connected to tcp://broker:1883"
+40          MQTT Client           resubscribeAll() called
+40          MQTT Client           Log: "MQTT recovering X subscriptions..."
+41          MQTT Client           Re-subscribe topic 1
+42          MQTT Client           Re-subscribe topic 2
+43          MQTT Client           Log: "MQTT all subscriptions recovered"
+43          Main                  Continue periodic read cycle
+```
+
+### MQTT Broker Restart Scenario
+
+```
+Time (s)    Component              Action
+────────────────────────────────────────────────────────────────────────────
+0           Normal                Application connected, subscribed
+0           MQTT Broker           Broker restarts (loses state)
+0           MQTT Client           Connection lost detected
+0           MQTT Client           OnConnectionLost fires
+0           MQTT Client           Log: "MQTT connection lost: <error>"
+5           MQTT Client           First reconnect attempt (5s backoff)
+5           MQTT Client           Log: "MQTT attempting to reconnect..."
+5           MQTT Client           ConnectionNotification: Connecting
+10          MQTT Client           Connect succeeds
+10          MQTT Client           OnConnect fires
+10          MQTT Client           resubscribeAll() called
+10          MQTT Client           Log: "MQTT recovering X subscriptions..."
+11          MQTT Client           Re-subscribe to all topics (QoS 1)
+12          MQTT Client           Log: "MQTT all subscriptions recovered"
+12          Main                  Continue normal operation
+```
+
+### Publish Retry on Connection Loss
+
+```
+Time (ms)   Component              Action
+────────────────────────────────────────────────────────────────────────────
+0           Reader                Publish("aerosmart/temp", "22.5")
+5           MQTT Client           Check IsConnected() - true
+10          MQTT Client           client.Publish(topic, 1, retain, "22.5")
+15          MQTT Client           Token wait...
+20          Network               Connection lost during publish
+25          MQTT Client           Token error: connection lost
+25          MQTT Client           Retry attempt 1 (sleep 1s)
+26          MQTT Client           client.Publish(...) - SUCCESS
+30          MQTT Client           Return nil (success)
+```
+
+### Connection State Transitions
+
+```
+State: Connected ──────────────────────────────────────────────────────────►
+    │                                                                    │
+    │ OnConnectionLost                                                  │
+    ▼                                                                    │
+State: ConnectionLost ───────────────────────────────────────────────────►
+    │                                                                    │
+    │ AutoReconnect triggered                                           │
+    ▼                                                                    │
+State: Connecting ───────────────────────────────────────────────────────►
+    │                                                                    │
+    │ ReconnectingHandler: "MQTT attempting to reconnect..."            │
+    │ Backoff: 5s → 10s → 20s → 40s → 60s (max)                        │
+    ▼                                                                    │
+State: Connected ───────────────────────────────────────────────────────►
+    │                                                                    │
+    │ OnConnect: resubscribeAll()                                       │
+    │ Log: "MQTT recovering X subscriptions..."                         │
+    │ Re-subscribe all topics                                          │
+    │ Log: "MQTT all subscriptions recovered"                           │
+    ▼                                                                    │
+State: Normal Operation ─────────────────────────────────────────────────►
+```
+
+### KeepAlive Timing Detail
+
+```
+Time (s)    Component              Action
+────────────────────────────────────────────────────────────────────────────
+0           MQTT Client           Connected, KeepAlive timer started
+30          MQTT Client           Send PINGREQ to broker
+30          MQTT Broker           Acknowledge PINGRESP
+30          MQTT Client           KeepAlive timer reset
+60          MQTT Client           Send PINGREQ to broker
+60          MQTT Broker           (NO RESPONSE - network down)
+70          MQTT Client           PINGREQ timeout (10s)
+70          MQTT Client           Connection lost detected
+70          MQTT Client           OnConnectionLost fires
+70          MQTT Client           Auto-reconnect starts
+```
+
+---
+
 ## Graceful Shutdown
 
 ```
