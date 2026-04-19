@@ -311,6 +311,13 @@ func (r *Reader) PublishAll(values map[string]*RegisterValue) error {
 	return nil
 }
 
+// MessageInfo holds information about a processed MQTT message for deduplication
+type MessageInfo struct {
+	Topic     string
+	Value     string
+	Timestamp time.Time
+}
+
 // Writer handles writing registers to the device via MQTT
 type Writer struct {
 	serial    *serial.SerialPort
@@ -319,18 +326,34 @@ type Writer struct {
 	registers []config.WriteRegisterConfig
 	reader    *Reader // Reference to reader for verification
 
-	// Write priority mechanism
+	// Write priority mechanism - using atomic flag for reliable detection
 	writePriorityChan chan struct{} // Channel to signal write priority request
+	writePending      atomic.Bool   // Atomic flag to track if write is pending
+
+	// Message deduplication - track recently processed messages
+	recentMessages      map[string]MessageInfo // topic+value -> info
+	recentMessagesMu    sync.Mutex
+	messageDedupeWindow time.Duration // Time window for deduplication (default 1 second)
+
+	// Message processing metrics
+	lastMessageReceivedTime time.Time     // Timestamp when last MQTT message was received
+	lastMessageProcessTime  time.Time     // Timestamp when last message processing started
+	lastMessageCompleteTime time.Time     // Timestamp when last message processing completed
+	lastMessageLatency      time.Duration // Latency from receive to complete
+	metricsMu               sync.Mutex
 }
 
 // NewWriter creates a new register writer
 func NewWriter(serialPort *serial.SerialPort, mqttClient *mqtt.Client, log *logger.Logger, registers []config.WriteRegisterConfig) *Writer {
 	return &Writer{
-		serial:            serialPort,
-		mqtt:              mqttClient,
-		logger:            log,
-		registers:         registers,
-		writePriorityChan: make(chan struct{}, 1), // Buffer of 1 to handle rapid writes
+		serial:              serialPort,
+		mqtt:                mqttClient,
+		logger:              log,
+		registers:           registers,
+		writePriorityChan:   make(chan struct{}, 1), // Buffer of 1 to handle rapid writes
+		writePending:        atomic.Bool{},
+		recentMessages:      make(map[string]MessageInfo),
+		messageDedupeWindow: 1 * time.Second, // 1 second deduplication window
 	}
 }
 
@@ -344,6 +367,19 @@ func (w *Writer) SetReader(reader *Reader) {
 // Uses SendAndReceive with proper retry logic for reliable communication
 // Signals write priority to preempt any ongoing read operations
 func (w *Writer) HandleMessage(topic string, message string) error {
+	// Record message receive time for metrics
+	receiveTime := time.Now()
+	w.updateLastMessageReceivedTime(receiveTime)
+
+	// Message deduplication - check if we've recently processed this exact message
+	if w.isDuplicateMessage(topic, message) {
+		w.logger.Info("MQTT: Skipping duplicate message on %s: %s (within %v)", topic, message, w.messageDedupeWindow)
+		return nil
+	}
+
+	// Record message processing start time
+	w.updateLastMessageProcessStartTime()
+
 	// Signal write priority to preempt any ongoing read operations
 	w.SignalWritePriority()
 
@@ -460,6 +496,16 @@ func (w *Writer) HandleMessage(topic string, message string) error {
 	}
 
 	w.logger.Info("=== Write operation completed ===")
+
+	// Record message processing completion time and calculate latency
+	w.updateLastMessageCompleteTime()
+
+	// Clean up old deduplication entries periodically
+	w.cleanOldMessages()
+
+	// Clear write pending flag
+	w.ClearWritePending()
+
 	return nil
 }
 
@@ -483,16 +529,32 @@ func (w *Writer) TriggerFullReadout() error {
 		return fmt.Errorf("no reader reference")
 	}
 
-	// Check for write priority - if a write is pending, skip this periodic read
+	// Check for write priority using atomic flag - if a write is pending, skip this periodic read
+	// This is more reliable than channel-based check which can have race conditions
+	if w.writePending.Load() {
+		w.logger.Info("=== Write priority detected (atomic flag), skipping periodic read ===")
+		w.reader.Cancel()
+		// Reset context for next read cycle
+		w.reader.ResetContext()
+		// Drain the channel if there's a pending value
+		select {
+		case <-w.writePriorityChan:
+		default:
+		}
+		return nil
+	}
+
+	// Also check channel for backward compatibility (in case SignalWritePriority was called without atomic flag)
 	select {
 	case w.writePriorityChan <- struct{}{}:
 		// Write priority signaled - cancel any ongoing read and skip this readout
-		w.logger.Info("=== Write priority detected, skipping periodic read ===")
+		w.logger.Info("=== Write priority detected (channel), skipping periodic read ===")
 		w.reader.Cancel()
 		// Reset context for next read cycle
 		w.reader.ResetContext()
 		// Drain the channel to allow next write
 		<-w.writePriorityChan
+		w.writePending.Store(false) // Clear atomic flag
 		return nil
 	default:
 		// No write pending, proceed with normal read
@@ -519,6 +581,9 @@ func (w *Writer) TriggerFullReadout() error {
 // SignalWritePriority signals that a write operation should take priority
 // This will cause the next TriggerFullReadout to cancel any ongoing read
 func (w *Writer) SignalWritePriority() {
+	// Use atomic flag for reliable detection
+	w.writePending.Store(true)
+
 	select {
 	case w.writePriorityChan <- struct{}{}:
 		w.logger.Debug("Write priority signaled")
@@ -526,4 +591,82 @@ func (w *Writer) SignalWritePriority() {
 		// Channel already has a value, write is already pending
 		w.logger.Debug("Write priority already pending")
 	}
+}
+
+// ClearWritePending clears the write pending flag after processing
+func (w *Writer) ClearWritePending() {
+	w.writePending.Store(false)
+}
+
+// isDuplicateMessage checks if this exact message was recently processed
+func (w *Writer) isDuplicateMessage(topic string, value string) bool {
+	key := topic + ":" + value
+
+	w.recentMessagesMu.Lock()
+	defer w.recentMessagesMu.Unlock()
+
+	if info, exists := w.recentMessages[key]; exists {
+		// Check if within deduplication window
+		if time.Since(info.Timestamp) < w.messageDedupeWindow {
+			return true
+		}
+		// Clean up old entries
+		delete(w.recentMessages, key)
+	}
+
+	// Store this message
+	w.recentMessages[key] = MessageInfo{
+		Topic:     topic,
+		Value:     value,
+		Timestamp: time.Now(),
+	}
+
+	return false
+}
+
+// cleanOldMessages removes old entries from the deduplication map
+func (w *Writer) cleanOldMessages() {
+	w.recentMessagesMu.Lock()
+	defer w.recentMessagesMu.Unlock()
+
+	cutoff := time.Now().Add(-w.messageDedupeWindow)
+	for key, info := range w.recentMessages {
+		if info.Timestamp.Before(cutoff) {
+			delete(w.recentMessages, key)
+		}
+	}
+}
+
+// updateLastMessageReceivedTime records when an MQTT message was received
+func (w *Writer) updateLastMessageReceivedTime(t time.Time) {
+	w.metricsMu.Lock()
+	defer w.metricsMu.Unlock()
+	w.lastMessageReceivedTime = t
+}
+
+// updateLastMessageProcessStartTime records when message processing started
+func (w *Writer) updateLastMessageProcessStartTime() {
+	w.metricsMu.Lock()
+	defer w.metricsMu.Unlock()
+	w.lastMessageProcessTime = time.Now()
+}
+
+// updateLastMessageCompleteTime records when message processing completed and calculates latency
+func (w *Writer) updateLastMessageCompleteTime() {
+	w.metricsMu.Lock()
+	defer w.metricsMu.Unlock()
+	w.lastMessageCompleteTime = time.Now()
+
+	// Calculate latency from receive to complete
+	if !w.lastMessageReceivedTime.IsZero() && !w.lastMessageProcessTime.IsZero() {
+		w.lastMessageLatency = w.lastMessageCompleteTime.Sub(w.lastMessageReceivedTime)
+		w.logger.Info("MQTT: Message processing latency: %v (receive -> process -> complete)", w.lastMessageLatency)
+	}
+}
+
+// GetMessageMetrics returns current message processing metrics
+func (w *Writer) GetMessageMetrics() (receiveTime, processTime, completeTime time.Time, latency time.Duration) {
+	w.metricsMu.Lock()
+	defer w.metricsMu.Unlock()
+	return w.lastMessageReceivedTime, w.lastMessageProcessTime, w.lastMessageCompleteTime, w.lastMessageLatency
 }
