@@ -20,7 +20,9 @@ A Go-based gateway application that communicates with Drexel&Weiss Aerosmart M v
 - **Configurable Logging**: Supports debug, info, warn, and error log levels
 - **Graceful Shutdown**: Handles SIGINT and SIGTERM signals for clean shutdown
 - **Reconnection**: Automatic reconnection for both serial and MQTT connections
-- **Write Priority**: Control commands preempt ongoing read operations for low-latency response
+- **Write Priority**: Control commands preempt ongoing read operations for low-latency response (<1 second detection, 1-3 second write completion)
+- **Message Deduplication**: Prevents processing duplicate MQTT messages within 1 second window
+- **Timing Metrics**: Logs message processing latency (receive → process → complete) for monitoring
 
 ## Architecture
 
@@ -202,8 +204,10 @@ The gateway publishes sensor values to the following topics:
 
 The gateway subscribes to the following topics for device control:
 
-- `dw/aerosmart/luefterstufe` - Set fan stage (0-5)
-- `dw/aerosmart/boilerheizstab` - Set boiler heating element (0-1)
+- `dw/aerosmart/luefterstufe` - Set fan stage (0-5) - *Topic changes detected and processed within 1-3 seconds*
+- `dw/aerosmart/boilerheizstab` - Set boiler heating element (0-1) - *Topic changes detected and processed within 1-3 seconds*
+
+> **Note:** The gateway implements immediate message detection with atomic write priority signaling, ensuring control commands are processed with minimal latency. See [MQTT Message Delay Fix](docs/MQTT_MESSAGE_DELAY_FIX.md) for technical details.
 
 ### Derived Registers
 

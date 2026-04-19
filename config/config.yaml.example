@@ -10,9 +10,9 @@ serial:
   timeout: 0
   xonxoff: true
   dsrdtr: false
-  write_timeout: 10
-  read_timeout: 1          # Read timeout in milliseconds (0 = 200ms default)
-  max_reopens: 10           # Maximum number of port reopen attempts (default: 10)
+  write_timeout: 1
+  read_timeout: 10          # Read timeout in milliseconds (0 = 200ms default)
+  max_reopens: 3           # Maximum number of port reopen attempts (default: 10)
   deadline_timeout: 150    # Flush input deadline timeout in milliseconds (default: 150)
   write_with_retry_delay: 10  # Delay between write retries in milliseconds (default: 10)
   device_response_delay: 40   # Delay to wait for device response in milliseconds (default: 40)
@@ -31,7 +31,7 @@ mqtt:
   username: "mqtt"
   password: "password"
   client_id: "aerosmart-gateway"
-  qos: 0
+  qos: 1
   retain: true
   # Connection retry configuration
   connect_retry_initial_delay_ms: 500   # Initial delay for exponential backoff (default: 500ms)
@@ -57,14 +57,14 @@ log_level: "debug"
 logging:
   # Log file path (set to empty to disable file logging)
   # log_file: "-"
-  log_file: "/var/log/aerosmart.log"
+  # log_file: "/var/log/aerosmart.log"
   # Enable/disable file logging (true/false)
   file_logging: false
   # Enable/disable console logging
   console_logging: true
 
 # Read interval in seconds
-read_interval: 60
+read_interval: 120
 
 # Home Assistant MQTT Discovery
 ha_discovery:
