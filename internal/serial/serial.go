@@ -393,10 +393,9 @@ func (s *SerialPort) SendAndReceive(command string, maxRetries int) (string, err
 		// This ensures write operations have priority by waiting for reads to finish
 		s.WaitForReadComplete()
 
-		// For write operations, force reopen port first to ensure clean state
-		// This helps if a read operation left the port in a bad state
-		// The force reopen ignores the reopen count limit
-		if attempt == 0 {
+		// Only force reopen on retry attempts (not first attempt) to avoid unnecessary delays
+		// This was causing significant delays (5ms + port reopen time) on every write
+		if attempt > 0 {
 			_ = s.ForceReopen()
 		}
 
