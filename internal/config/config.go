@@ -49,10 +49,19 @@ type MQTTConfig struct {
 	PublishRetryCount int `yaml:"publish_retry_count"` // Number of retries for failed publishes
 }
 
+// DeviceInfoConfig holds MQTT device info for HA discovery
+type DeviceInfoConfig struct {
+	Name         string `yaml:"name"`         // "Aerosmart Gateway"
+	Manufacturer string `yaml:"manufacturer"` // "Drexel und Weiss"
+	Model        string `yaml:"model"`        // "aerosmartPI"
+	SWVersion    string `yaml:"sw_version"`   // set from build version if empty
+}
+
 // HADiscoveryConfig holds Home Assistant discovery configuration
 type HADiscoveryConfig struct {
-	Enabled bool   `yaml:"enabled"`
-	Prefix  string `yaml:"prefix"` // "homeassistant"
+	Enabled    bool             `yaml:"enabled"`
+	Prefix     string           `yaml:"prefix"`       // "homeassistant"
+	DeviceInfo DeviceInfoConfig `yaml:"device_info"`
 }
 
 // LoggingConfig holds logging configuration
@@ -196,7 +205,7 @@ func LoadAppConfig(path string) (*AppConfig, error) {
 	}
 	// XonXoff defaults to false (no flow control) - no explicit default needed
 	if cfg.DeviceID == "" {
-		cfg.DeviceID = "aerosmart-gateway"
+		cfg.DeviceID = "aerosmart"
 	}
 	if cfg.LogLevel == "" {
 		cfg.LogLevel = "info"
@@ -206,6 +215,15 @@ func LoadAppConfig(path string) (*AppConfig, error) {
 	}
 	if cfg.HADiscovery.Prefix == "" {
 		cfg.HADiscovery.Prefix = "homeassistant"
+	}
+	if cfg.HADiscovery.DeviceInfo.Name == "" {
+		cfg.HADiscovery.DeviceInfo.Name = "Aerosmart Gateway"
+	}
+	if cfg.HADiscovery.DeviceInfo.Manufacturer == "" {
+		cfg.HADiscovery.DeviceInfo.Manufacturer = "Drexel und Weiss"
+	}
+	if cfg.HADiscovery.DeviceInfo.Model == "" {
+		cfg.HADiscovery.DeviceInfo.Model = "aerosmartPI"
 	}
 
 	// Set logging defaults

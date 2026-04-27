@@ -311,13 +311,17 @@ func (c *Client) PublishSwitchDiscovery(switchCfg *HASwitchConfig) error {
 }
 
 // CreateDeviceInfo creates device info for HA discovery
-func CreateDeviceInfo(deviceID, name, manufacturer, model string) map[string]interface{} {
-	return map[string]interface{}{
+func CreateDeviceInfo(deviceID, name, manufacturer, model, swVersion string) map[string]interface{} {
+	info := map[string]interface{}{
 		"identifiers":  []string{deviceID},
 		"name":         name,
 		"manufacturer": manufacturer,
 		"model":        model,
 	}
+	if swVersion != "" {
+		info["sw_version"] = swVersion
+	}
+	return info
 }
 
 // PublishAllSensorDiscovery publishes discovery configs for all sensors

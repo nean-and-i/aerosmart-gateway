@@ -46,6 +46,11 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Set sw_version from build version if not configured
+	if appConfig.HADiscovery.DeviceInfo.SWVersion == "" {
+		appConfig.HADiscovery.DeviceInfo.SWVersion = version
+	}
+
 	// Load registers configuration
 	registersConfig, err := config.LoadRegistersConfig(registersPath)
 	if err != nil {
@@ -156,7 +161,7 @@ func main() {
 	// Publish Home Assistant discovery configs
 	if appConfig.HADiscovery.Enabled {
 		log.Info("Publishing Home Assistant discovery configs...")
-		publishHADiscovery(mqttClient, registersConfig, appConfig.DeviceID, log)
+		publishHADiscovery(mqttClient, registersConfig, appConfig, log)
 		log.Info("Home Assistant discovery configs published")
 	}
 
@@ -329,8 +334,10 @@ func randUint64() uint64 {
 	return uint64(time.Now().UnixNano())
 }
 
-func publishHADiscovery(mqttClient *mqtt.Client, registersConfig *config.RegistersConfig, deviceID string, log *logger.Logger) {
-	deviceInfo := mqtt.CreateDeviceInfo(deviceID, "Aerosmart Gateway", "Aerosmart", "USB")
+func publishHADiscovery(mqttClient *mqtt.Client, registersConfig *config.RegistersConfig, appConfig *config.AppConfig, log *logger.Logger) {
+	di := appConfig.HADiscovery.DeviceInfo
+	deviceID := appConfig.DeviceID
+	deviceInfo := mqtt.CreateDeviceInfo(deviceID, di.Name, di.Manufacturer, di.Model, di.SWVersion)
 
 	// Publish sensor discovery configs
 	for _, reg := range registersConfig.ReadRegisters {

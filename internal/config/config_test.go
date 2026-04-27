@@ -134,6 +134,17 @@ device_id: "my-device"
 	if cfg.ReadInterval != 60 {
 		t.Errorf("Expected default read_interval 60, got %d", cfg.ReadInterval)
 	}
+
+	// Verify device info defaults
+	if cfg.HADiscovery.DeviceInfo.Name != "Aerosmart Gateway" {
+		t.Errorf("Expected default device info name 'Aerosmart Gateway', got %s", cfg.HADiscovery.DeviceInfo.Name)
+	}
+	if cfg.HADiscovery.DeviceInfo.Manufacturer != "Drexel und Weiss" {
+		t.Errorf("Expected default device info manufacturer 'Drexel und Weiss', got %s", cfg.HADiscovery.DeviceInfo.Manufacturer)
+	}
+	if cfg.HADiscovery.DeviceInfo.Model != "aerosmartPI" {
+		t.Errorf("Expected default device info model 'aerosmartPI', got %s", cfg.HADiscovery.DeviceInfo.Model)
+	}
 }
 
 func TestLoadRegistersConfig(t *testing.T) {

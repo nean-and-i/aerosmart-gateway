@@ -69,3 +69,8 @@ read_interval: 120
 ha_discovery:
   enabled: true
   prefix: "homeassistant"
+  device_info:
+    name: "Aerosmart Gateway"
+    manufacturer: "Drexel und Weiss"
+    model: "aerosmartPI"
+    # sw_version: defaults to the application version if not set
