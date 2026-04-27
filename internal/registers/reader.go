@@ -326,9 +326,10 @@ type Writer struct {
 	registers []config.WriteRegisterConfig
 	reader    *Reader // Reference to reader for verification
 
-	// Write priority mechanism - using atomic flag for reliable detection
-	writePriorityChan chan struct{} // Channel to signal write priority request
-	writePending      atomic.Bool   // Atomic flag to track if write is pending
+	// Write priority mechanism - auto-expires after writePriorityTimeout
+	writePriorityTime    time.Time
+	writePriorityTimeout time.Duration
+	writePriorityMu      sync.Mutex
 
 	// Message deduplication - track recently processed messages
 	recentMessages      map[string]MessageInfo // topic+value -> info
@@ -346,14 +347,13 @@ type Writer struct {
 // NewWriter creates a new register writer
 func NewWriter(serialPort *serial.SerialPort, mqttClient *mqtt.Client, log *logger.Logger, registers []config.WriteRegisterConfig) *Writer {
 	return &Writer{
-		serial:              serialPort,
-		mqtt:                mqttClient,
-		logger:              log,
-		registers:           registers,
-		writePriorityChan:   make(chan struct{}, 1), // Buffer of 1 to handle rapid writes
-		writePending:        atomic.Bool{},
-		recentMessages:      make(map[string]MessageInfo),
-		messageDedupeWindow: 1 * time.Second, // 1 second deduplication window
+		serial:               serialPort,
+		mqtt:                 mqttClient,
+		logger:               log,
+		registers:            registers,
+		writePriorityTimeout: 10 * time.Second,
+		recentMessages:       make(map[string]MessageInfo),
+		messageDedupeWindow:  1 * time.Second,
 	}
 }
 
@@ -503,8 +503,8 @@ func (w *Writer) HandleMessage(topic string, message string) error {
 	// Clean up old deduplication entries periodically
 	w.cleanOldMessages()
 
-	// Clear write pending flag
-	w.ClearWritePending()
+	// Clear write priority flag to allow reads to resume
+	w.ClearWritePriority()
 
 	return nil
 }
@@ -529,35 +529,12 @@ func (w *Writer) TriggerFullReadout() error {
 		return fmt.Errorf("no reader reference")
 	}
 
-	// Check for write priority using atomic flag - if a write is pending, skip this periodic read
-	// This is more reliable than channel-based check which can have race conditions
-	if w.writePending.Load() {
-		w.logger.Info("=== Write priority detected (atomic flag), skipping periodic read ===")
+	// Check for write priority - if a write is pending, skip this periodic read
+	if w.isWritePriorityActive() {
+		w.logger.Info("=== Write priority detected, skipping periodic read ===")
 		w.reader.Cancel()
-		// Reset context for next read cycle
 		w.reader.ResetContext()
-		// Drain the channel if there's a pending value
-		select {
-		case <-w.writePriorityChan:
-		default:
-		}
 		return nil
-	}
-
-	// Also check channel for backward compatibility (in case SignalWritePriority was called without atomic flag)
-	select {
-	case w.writePriorityChan <- struct{}{}:
-		// Write priority signaled - cancel any ongoing read and skip this readout
-		w.logger.Info("=== Write priority detected (channel), skipping periodic read ===")
-		w.reader.Cancel()
-		// Reset context for next read cycle
-		w.reader.ResetContext()
-		// Drain the channel to allow next write
-		<-w.writePriorityChan
-		w.writePending.Store(false) // Clear atomic flag
-		return nil
-	default:
-		// No write pending, proceed with normal read
 	}
 
 	w.logger.Info("=== Triggering full register readout ===")
@@ -578,24 +555,38 @@ func (w *Writer) TriggerFullReadout() error {
 	return nil
 }
 
-// SignalWritePriority signals that a write operation should take priority
-// This will cause the next TriggerFullReadout to cancel any ongoing read
+// SignalWritePriority signals that a write operation should take priority.
+// This will cause the next TriggerFullReadout to skip the read cycle.
+// The priority auto-expires after 10 seconds to prevent permanent blocking.
 func (w *Writer) SignalWritePriority() {
-	// Use atomic flag for reliable detection
-	w.writePending.Store(true)
-
-	select {
-	case w.writePriorityChan <- struct{}{}:
-		w.logger.Debug("Write priority signaled")
-	default:
-		// Channel already has a value, write is already pending
-		w.logger.Debug("Write priority already pending")
-	}
+	w.writePriorityMu.Lock()
+	w.writePriorityTime = time.Now()
+	w.writePriorityMu.Unlock()
+	w.logger.Debug("Write priority signaled")
 }
 
-// ClearWritePending clears the write pending flag after processing
-func (w *Writer) ClearWritePending() {
-	w.writePending.Store(false)
+// ClearWritePriority clears the write priority flag, allowing reads to resume.
+func (w *Writer) ClearWritePriority() {
+	w.writePriorityMu.Lock()
+	w.writePriorityTime = time.Time{}
+	w.writePriorityMu.Unlock()
+	w.logger.Debug("Write priority cleared")
+}
+
+// isWritePriorityActive returns true if write priority is active and has not expired.
+func (w *Writer) isWritePriorityActive() bool {
+	w.writePriorityMu.Lock()
+	defer w.writePriorityMu.Unlock()
+	if w.writePriorityTime.IsZero() {
+		return false
+	}
+	if time.Since(w.writePriorityTime) >= w.writePriorityTimeout {
+		// Expired - clear it and log
+		w.writePriorityTime = time.Time{}
+		w.logger.Warn("Write priority expired after %v timeout", w.writePriorityTimeout)
+		return false
+	}
+	return true
 }
 
 // isDuplicateMessage checks if this exact message was recently processed
