@@ -45,7 +45,9 @@ mqtt:
   # - Publish Retry: Retries with exponential backoff (1s, 2s, 4s)
   publish_retry_count: 3                # Number of retries for failed publishes (default: 3)
 
-# Device ID for Home Assistant discovery
+# Device ID for Home Assistant discovery AND ""identifiers for "device_info"
+# device_info:
+#   identifiers: <device_id>
 device_id: "aerosmart"
 
 # Logging level: debug, info, warn, error
@@ -71,6 +73,7 @@ ha_discovery:
   enabled: true
   prefix: "homeassistant"
   device_info:
+    # identifiers: <device_id>
     name: "Aerosmart Gateway"
     manufacturer: "Drexel und Weiss"
     model: "aerosmartPI"

@@ -147,7 +147,7 @@ func main() {
 		Retain:   appConfig.MQTT.Retain,
 	}
 
-	mqttClient := mqtt.NewClient(mqttConfig, appConfig.DeviceID)
+	mqttClient := mqtt.NewClient(mqttConfig, appConfig.DeviceID, appConfig.HADiscovery.Prefix)
 
 	// Connect to MQTT broker with retry
 	log.Info("Connecting to MQTT broker %s:%d...", appConfig.MQTT.Broker, appConfig.MQTT.Port)

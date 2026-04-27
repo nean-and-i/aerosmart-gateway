@@ -44,6 +44,10 @@ build-linux-arm:
 	@echo "$(GREEN)Building for Linux ARM...$(NC)"
 	GOOS=linux GOARCH=arm GOARM=6 $(GO) build $(GOFLAGS) -o $(BINARY_NAME)-linux-armv6 $(MAIN_PATH)
 
+build-linux-armv7:
+	@echo "$(GREEN)Building for Linux ARMv7...$(NC)"
+	GOOS=linux GOARCH=arm GOARM=7 $(GO) build $(GOFLAGS) -o $(BINARY_NAME)-linux-armv7 $(MAIN_PATH)
+
 build-linux-arm64:
 	@echo "$(GREEN)Building for Linux ARM64...$(NC)"
 	GOOS=linux GOARCH=arm64 $(GO) build $(GOFLAGS) -o $(BINARY_NAME)-linux-arm64 $(MAIN_PATH)

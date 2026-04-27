@@ -4,14 +4,18 @@ This document contains detailed timing diagrams illustrating the interactions be
 
 ## Table of Contents
 
-1. [System Overview](#system-overview)
-2. [Initialization Sequence](#initialization-sequence)
-3. [Periodic Read Cycle](#periodic-read-cycle)
-4. [Write Operation with Verification](#write-operation-with-verification)
-5. [Retry and Recovery](#retry-and-recovery)
-6. [Write Priority Preemption](#write-priority-preemption)
-7. [MQTT Message Flow](#mqtt-message-flow)
-8. [Graceful Shutdown](#graceful-shutdown)
+- [Aerosmart Gateway - Timing Diagrams](#aerosmart-gateway---timing-diagrams)
+  - [Table of Contents](#table-of-contents)
+  - [System Overview](#system-overview)
+  - [Initialization Sequence](#initialization-sequence)
+  - [Periodic Read Cycle](#periodic-read-cycle)
+    - [Detailed SendAndReceive Flow](#detailed-sendandreceive-flow)
+  - [Write Operation with Verification](#write-operation-with-verification)
+    - [Write Priority Signaling (Timestamp-Based)](#write-priority-signaling-timestamp-based)
+    - [Message Deduplication](#message-deduplication)
+    - [Performance Comparison](#performance-comparison)
+    - [Key Changes](#key-changes)
+  - [Summary](#summary)
 
 ---
 
@@ -93,8 +97,7 @@ Time (ms)   Component          Action
 Time (ms)   Component          Action
 ─────────────────────────────────────────────────────────────────────────────
 0           main              Ticker fires - writer.TriggerFullReadout()
-5           writer            Try send to writePriorityChan (succeeds = empty)
-6           writer            Drain channel, no write pending
+5           writer            isWritePriorityActive() - no active priority
 10          reader            ReadAll() - start read cycle
 15          reader            Mark isReading = true
 20          serial            SendAndReceive("130 1067", 10)
@@ -163,7 +166,7 @@ Time (ms)   Component          Action
 5           mqtt              Callback invoked with message "3"
 10          writer            HandleMessage("dw/aerosmart/luefterstufe", "3")
 12          writer            isDuplicateMessage() - check for duplicates
-15          writer            SignalWritePriority() - atomic flag + channel
+15          writer            SignalWritePriority() - set timestamp
 20          writer            reader.Cancel() - cancel any ongoing read
 25          writer            reader.ResetContext() - create new context
 30          writer            Find matching register, validate value (3 in 0-5)
@@ -186,47 +189,34 @@ Time (ms)   Component          Action
 185         serial            SendAndReceive("130 5003", 10)
 190         serial            <-- "130 5003 3"
 195         mqtt              Publish("aerosmart/lueftermode", "3")
-200         writer            Complete - return nil
+200         writer            ClearWritePriority() - allow reads to resume
 205         writer            Log: "MQTT: Message processing latency: 2.18s"
 ```
 
-### Write Priority Signaling (Atomic Flag)
+### Write Priority Signaling (Timestamp-Based)
 
 ```
 Writer.SignalWritePriority()
     │
     ▼
 ┌──────────────────────────────────────────────────────────────────────────┐
-│ 1. Set atomic flag:                                                      │
-│    writePending.Store(true)                                              │
-│                                                                          │
-│ 2. Try to send to channel (non-blocking):                               │
-│    select {                                                             │
-│    case writePriorityChan <- struct{}{}:                                │
-│        // Channel was empty - write priority signaled                    │
-│    default:                                                             │
-│        // Channel already has value - write already pending              │
-│    }                                                                    │
+│ writePriorityMu.Lock()                                                   │
+│ writePriorityTime = time.Now()                                           │
+│ writePriorityMu.Unlock()                                                 │
 └──────────────────────────────────────────────────────────────────────────┘
 
 Writer.TriggerFullReadout()
     │
     ▼
 ┌──────────────────────────────────────────────────────────────────────────┐
-│ 1. Check atomic flag (PRIMARY):                                         │
-│    if writePending.Load() {                                             │
-│        // Write pending detected! Skip this read cycle                   │
-│        return nil                                                       │
-│    }                                                                    │
-│                                                                          │
-│ 2. Check channel (backward compatibility):                              │
-│    select {                                                             │
-│    case writePriorityChan <- struct{}{}:                                │
-│        // Channel full - write pending, skip read                        │
-│        return nil                                                       │
-│    default:                                                             │
-│        // No write pending, proceed with normal read                     │
-│    }                                                                    │
+│ if isWritePriorityActive():                                              │
+│   - Lock mutex                                                           │
+│   - If writePriorityTime.IsZero(): return false                         │
+│   - If time.Since(writePriorityTime) >= 10s:                            │
+│       writePriorityTime = Time{} (expired)                              │
+│       return false                                                      │
+│   - Otherwise: return true (skip read cycle)                            │
+│   - Unlock mutex                                                        │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -266,7 +256,7 @@ Time (ms)   Component          Action
 0           MQTT Broker       Message published to "dw/aerosmart/luefterstufe"
 5           mqtt              Callback invoked with message "3"
 10          writer            HandleMessage("dw/aerosmart/luefterstufe", "3")
-15          writer            SignalWritePriority() - send to channel
+15          writer            SignalWritePriority() - set timestamp
 20          writer            reader.Cancel() - cancel any ongoing read
 25          writer            reader.ResetContext() - create new context
 30          writer            Find matching register, validate value (3 in 0-5)
@@ -289,7 +279,7 @@ Time (ms)   Component          Action
 185         serial            SendAndReceive("130 5003", 10)
 190         serial            <-- "130 5003 3"
 195         mqtt              Publish("aerosmart/lueftermode", "3")
-200         writer            Complete - return nil
+200         writer            ClearWritePriority() - allow reads to resume
 ```
 
 ### Write Priority Signaling
@@ -299,12 +289,9 @@ Writer.SignalWritePriority()
     │
     ▼
 ┌──────────────────────────────────────────────────────────────────────────┐
-│ select {                                                                 │
-│ case writePriorityChan <- struct{}{}:                                    │
-│     // Channel was empty - write priority signaled                       │
-│ default:                                                                 │
-│     // Channel already has value - write already pending                 │
-│ }                                                                        │
+│ writePriorityMu.Lock()                                                   │
+│ writePriorityTime = time.Now()                                           │
+│ writePriorityMu.Unlock()                                                 │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -376,7 +363,7 @@ Attempt 9: delay = 400ms * (1 ± 0.25) = 300-400ms (capped)
 Time (ms)   Component          Action
 ─────────────────────────────────────────────────────────────────────────────
 0           main              Ticker fires - TriggerFullReadout()
-5           writer            Check writePriorityChan - EMPTY
+5           writer            isWritePriorityActive() - no active priority
 10          reader            ReadAll() - start reading register 1
 15          reader            isReading = true
 20          serial            SendAndReceive("130 1067", 10)
@@ -388,7 +375,7 @@ Time (ms)   Component          Action
 MQTT Broker       Message published: "dw/aerosmart/luefterstufe" = "3"
 45          mqtt              Callback invoked
 50          writer            HandleMessage() called
-55          writer            SignalWritePriority() - chan <- {}
+55          writer            SignalWritePriority() - set timestamp
 60          writer            Cancel() - reader.Cancel()
 65          writer            ResetContext()
 70          reader            Context cancelled - ctx.Done() signaled
@@ -423,7 +410,7 @@ For each register value:
     │       ▼
     │   ┌────────────────────────────────────┐
     │   │ Check IsConnected()                │
-    │   │ client.Publish(topic, QOS=0,       │
+    │   │ client.Publish(topic, QOS,         │
     │   │             Retain=true, "3")      │
     │   │ token.Wait()                       │
     │   └────────────────────────────────────┘
@@ -433,7 +420,7 @@ For each register value:
     │       ▼
     │   ┌────────────────────────────────────┐
     │   │ Check IsConnected()                │
-    │   │ client.Publish(topic, QOS=0,       │
+    │   │ client.Publish(topic, QOS,         │
     │   │             Retain=true, "3")      │
     │   │ token.Wait()                       │
     │   └────────────────────────────────────┘
@@ -454,7 +441,7 @@ mqttClient.Subscribe("dw/aerosmart/luefterstufe", handler)
 │    }                                                                     │
 │                                                                          │
 │ 2. Subscribe:                                                            │
-│    token := client.Subscribe(topic, QOS=0, callback)                     │
+│    token := client.Subscribe(topic, QOS, callback)                     │
 │    token.Wait()                                                          │
 │                                                                          │
 │ 3. When message arrives:                                                 │
@@ -482,7 +469,7 @@ publishHADiscovery()
 │       Device: {...}                                                      │
 │     }                                                                    │
 │  2. Publish to                                                           │
-│          "homeassistant/sensor/aerosmart/aerosmart_luefterstatus/config" │
+│          "{prefix}/sensor/aerosmart/aerosmart_luefterstatus/config"     │
 │  3. Sleep(2ms) - rate limiting                                           │
 │                                                                          │
 │ For each write register with HA config:                                  │
@@ -494,7 +481,7 @@ publishHADiscovery()
 │       Device: {...}                                                      │
 │     }                                                                    │
 │  2. Publish to                                                           │
-│          "homeassistant/switch/aerosmart/aerosmart_luefterstufe/config"  │
+│          "{prefix}/switch/aerosmart/aerosmart_luefterstufe/config"       │
 │  3. Sleep(2ms) - rate limiting                                           │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
@@ -547,7 +534,7 @@ Time (s)    Component              Action
 10          MQTT Client           OnConnect fires
 10          MQTT Client           resubscribeAll() called
 10          MQTT Client           Log: "MQTT recovering X subscriptions..."
-11          MQTT Client           Re-subscribe to all topics (QoS 1)
+10          MQTT Client           Re-subscribe to all topics (configured QoS)
 12          MQTT Client           Log: "MQTT all subscriptions recovered"
 12          Main                  Continue normal operation
 ```
@@ -673,11 +660,11 @@ Signal (SIGINT/SIGTERM) received
 
 ---
 
-## MQTT Message Delay Fix - Race Condition Resolution
+## Write Priority Fix - Race Condition Resolution
 
 ### The Problem
 
-The original implementation used a channel-based write priority detection that had a race condition:
+The original implementation used a channel-based write priority detection that had an inverted logic bug:
 
 ```
 Race Condition Scenario (BEFORE FIX)
@@ -686,42 +673,37 @@ Time    Component          Action
 0ms     Main Loop          TriggerFullReadout() starts
 5ms     writer             select { case writePriorityChan <- {}: ... default: }
         │                  │                                              │
-        │                  │  ← select picks DEFAULT (channel appears empty)
-        │                  ▼                                              │
-        │                  Proceeds with periodic read                    │
-        │                  (WRONG! Write was actually pending)            │
+        │                  │  ← Send SUCCEEDS (channel empty = no write) │
+        │                  ▼  but code treated success as "write pending" │
+        │                  INCORRECTLY skips the periodic read            │
         │                                                                  │
-10ms    MQTT               Message arrives                                │
-15ms    writer             SignalWritePriority() - channel now has value │
-20ms    writer             writePriorityChan is FULL                     │
-        │                                                                  │
-...     reader             Continues reading all registers                │
-        │                  (30+ more seconds until read cycle completes)  │
-        │                                                                  │
-60s+    Main Loop          Next ticker fires                              │
-65s+    writer             Now detects write priority                     │
-70s+    writer             Processes the MQTT message                     │
+        │                  When a write IS pending (channel full):        │
+        │                  ← Send FAILS (default case)                    │
+        │                  INCORRECTLY proceeds with read                  │
 ```
 
 ### The Solution
 
-The fix uses an atomic flag for reliable detection:
+The fix uses a timestamp-based approach with automatic 10-second expiry:
 
 ```
 Race Condition Resolution (AFTER FIX)
 ────────────────────────────────────────────────────────────────────────────
 Time    Component          Action
 0ms     Main Loop          TriggerFullReadout() starts
-5ms     writer             if writePending.Load() { ... }  ← ATOMIC CHECK
+5ms     writer             isWritePriorityActive()
         │                  │                                              │
-        │                  │  ← Atomic flag detected!                     │
+        │                  │  ← Check writePriorityTime                   │
+        │                  │  ← If zero or expired: return false          │
+        │                  │  ← If recent (< 10s): return true           │
         │                  ▼                                              │
-        │                  Skip read cycle immediately                    │
-        │                  Return nil                                     │
+        │                  Correct decision every time                    │
         │                                                                  │
 10ms    MQTT               Message arrives                                │
-15ms    writer             HandleMessage() - processes immediately        │
-20ms     writer            Write operation completes in 1-3 seconds       │
+15ms    writer             HandleMessage() - SignalWritePriority()         │
+        │                  writePriorityTime = time.Now()                 │
+20ms    writer             Write operation completes in 1-3 seconds       │
+25ms    writer             ClearWritePriority() - reads resume immediately│
 ```
 
 ### Performance Comparison
@@ -731,17 +713,16 @@ Time    Component          Action
 | MQTT message detection | 30+ seconds | <1 second | ~30x faster |
 | Write operation total | 30+ seconds | 1-3 seconds | ~20x faster |
 | Serial read time | 10-20 seconds | 400ms | ~25x faster |
-| ForceReopen on writes | Every first attempt | Only on retries | Reduced delays |
-| Detection reliability | Race condition possible | 100% reliable | Fixed |
+| Detection reliability | Inverted logic bug | 100% reliable | Fixed |
+| Recovery from serial errors | Blocked forever | 10s auto-expiry | Fixed |
 
 ### Key Changes
 
-1. **Atomic Flag**: `writePending atomic.Bool` for reliable detection
-2. **Message Deduplication**: 1-second window prevents duplicate processing
-3. **Timing Metrics**: Logs latency for monitoring
-4. **ForceReopen Optimization**: Only on retry attempts, not first
-
-> **Note:** For complete technical documentation of the MQTT message delay fix, see [MQTT Message Delay Fix](MQTT_MESSAGE_DELAY_FIX.md).
+1. **Timestamp-Based Priority**: `writePriorityTime time.Time` with mutex protection
+2. **Auto-Expiry (10 seconds)**: Prevents permanent blocking on serial errors
+3. **Explicit Clear**: `ClearWritePriority()` after successful write allows immediate read resumption
+4. **Message Deduplication**: 1-second window prevents duplicate processing
+5. **Timing Metrics**: Logs latency for monitoring
 
 ---
 
@@ -756,6 +737,4 @@ The timing diagrams above illustrate:
 5. **Write Priority**: Preemption mechanism for time-sensitive control commands
 6. **MQTT Flow**: Message publishing and subscription handling
 7. **Shutdown**: Graceful shutdown with timeout handling
-8. **Race Condition Fix**: Atomic flag implementation for reliable detection
-
 These diagrams help understand the data flow and timing characteristics of the application, which is useful for debugging and performance optimization.

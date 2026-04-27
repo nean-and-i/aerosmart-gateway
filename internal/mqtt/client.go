@@ -12,11 +12,12 @@ import (
 
 // Client represents an MQTT client for communicating with Home Assistant
 type Client struct {
-	client    mqtt.Client
-	config    *MQTTConfig
-	connected bool
-	mu        sync.RWMutex
-	deviceID  string
+	client          mqtt.Client
+	config          *MQTTConfig
+	connected       bool
+	mu              sync.RWMutex
+	deviceID        string
+	discoveryPrefix string
 
 	// Subscription tracking for resilience
 	subscribedTopics map[string]MessageHandler // topic -> handler
@@ -42,10 +43,11 @@ type MQTTConfig struct {
 type MessageHandler func(topic string, message string)
 
 // NewClient creates a new MQTT client
-func NewClient(config *MQTTConfig, deviceID string) *Client {
+func NewClient(config *MQTTConfig, deviceID string, discoveryPrefix string) *Client {
 	return &Client{
 		config:           config,
 		deviceID:         deviceID,
+		discoveryPrefix:  discoveryPrefix,
 		connected:        false,
 		subscribedTopics: make(map[string]MessageHandler),
 	}
@@ -148,14 +150,13 @@ func (c *Client) resubscribeAll() error {
 	return nil
 }
 
-// subscribeTopic subscribes to a single topic with QoS 1
+// subscribeTopic subscribes to a single topic
 func (c *Client) subscribeTopic(topic string, handler MessageHandler) error {
 	callback := func(client mqtt.Client, msg mqtt.Message) {
 		handler(msg.Topic(), string(msg.Payload()))
 	}
 
-	// Use QoS 1 for at-least-once delivery guarantee
-	token := c.client.Subscribe(topic, 1, callback)
+	token := c.client.Subscribe(topic, byte(c.config.QOS), callback)
 	if token.Wait() && token.Error() != nil {
 		return token.Error()
 	}
@@ -200,7 +201,7 @@ func (c *Client) GetSubscribedTopics() []string {
 	return topics
 }
 
-// Publish publishes a message to a topic with QoS 1 and retry
+// Publish publishes a message to a topic with retry
 func (c *Client) Publish(topic string, value string) error {
 	if !c.IsConnected() {
 		return fmt.Errorf("MQTT client not connected")
@@ -214,8 +215,7 @@ func (c *Client) Publish(topic string, value string) error {
 
 	var lastErr error
 	for attempt := 0; attempt < retryCount; attempt++ {
-		// Use QoS 1 for at-least-once delivery guarantee
-		token := c.client.Publish(topic, 1, c.config.Retain, value)
+		token := c.client.Publish(topic, byte(c.config.QOS), c.config.Retain, value)
 		if token.Wait() && token.Error() != nil {
 			lastErr = fmt.Errorf("failed to publish to %s: %w", topic, token.Error())
 			// Wait before retry with exponential backoff
@@ -232,8 +232,7 @@ func (c *Client) Publish(topic string, value string) error {
 	return lastErr
 }
 
-// Subscribe subscribes to a topic with a message handler
-// Uses QoS 1 for at-least-once delivery and tracks for auto-recovery
+// Subscribe subscribes to a topic with a message handler and tracks for auto-recovery
 func (c *Client) Subscribe(topic string, handler MessageHandler) error {
 	if !c.IsConnected() {
 		return fmt.Errorf("MQTT client not connected")
@@ -243,8 +242,7 @@ func (c *Client) Subscribe(topic string, handler MessageHandler) error {
 		handler(msg.Topic(), string(msg.Payload()))
 	}
 
-	// Use QoS 1 for at-least-once delivery guarantee
-	token := c.client.Subscribe(topic, 1, callback)
+	token := c.client.Subscribe(topic, byte(c.config.QOS), callback)
 	if token.Wait() && token.Error() != nil {
 		return fmt.Errorf("failed to subscribe to %s: %w", topic, token.Error())
 	}
@@ -288,7 +286,7 @@ type HASwitchConfig struct {
 
 // PublishSensorDiscovery publishes sensor discovery config to HA
 func (c *Client) PublishSensorDiscovery(sensor *HASensorConfig) error {
-	topic := fmt.Sprintf("homeassistant/sensor/%s/%s/config", c.deviceID, sensor.UniqueID)
+	topic := fmt.Sprintf("%s/sensor/%s/%s/config", c.discoveryPrefix, c.deviceID, sensor.UniqueID)
 
 	data, err := json.Marshal(sensor)
 	if err != nil {
@@ -300,7 +298,7 @@ func (c *Client) PublishSensorDiscovery(sensor *HASensorConfig) error {
 
 // PublishSwitchDiscovery publishes switch discovery config to HA
 func (c *Client) PublishSwitchDiscovery(switchCfg *HASwitchConfig) error {
-	topic := fmt.Sprintf("homeassistant/switch/%s/%s/config", c.deviceID, switchCfg.UniqueID)
+	topic := fmt.Sprintf("%s/switch/%s/%s/config", c.discoveryPrefix, c.deviceID, switchCfg.UniqueID)
 
 	data, err := json.Marshal(switchCfg)
 	if err != nil {

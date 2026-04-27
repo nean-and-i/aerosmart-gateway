@@ -8,10 +8,10 @@ A Go-based gateway application that communicates with Drexel&Weiss Aerosmart M v
 
 - **Serial Communication**: Reads and writes to Aerosmart M device via serial over [USB located on Mainboard - refer to INSTALLATION.md](docs/INSTALLATION.md). NOTE: It is **NOT** Modbus RTU, no modbus settings required.
 - **MQTT Integration**: Publishes sensor data and subscribes to control commands
-- **MQTT Resilience**: 
+- **MQTT Resilience**:
   - **Persistent Session**: Subscriptions preserved across reconnects (CleanSession=false)
   - **Auto-Recovery**: Automatically re-subscribes to topics after connection loss
-  - **QoS 1 Support**: At-least-once delivery for critical messages
+  - **Configurable QoS**: Supports QoS 0, 1, or 2 (default: 1 for at-least-once delivery)
   - **KeepAlive Monitoring**: Detects network failures within 30-60 seconds
   - **Connection State Visibility**: Logs reconnection progress and state changes
   - **Publish Retry**: Automatic retry with exponential backoff for failed publishes
@@ -20,7 +20,7 @@ A Go-based gateway application that communicates with Drexel&Weiss Aerosmart M v
 - **Configurable Logging**: Supports debug, info, warn, and error log levels
 - **Graceful Shutdown**: Handles SIGINT and SIGTERM signals for clean shutdown
 - **Reconnection**: Automatic reconnection for both serial and MQTT connections
-- **Write Priority**: Control commands preempt ongoing read operations for low-latency response (<1 second detection, 1-3 second write completion)
+- **Write Priority**: Control commands preempt ongoing read operations for low-latency response (<1 second detection, 1-3 second write completion). Write priority auto-expires after 10 seconds to prevent blocking on serial errors.
 - **Message Deduplication**: Prevents processing duplicate MQTT messages within 1 second window
 - **Timing Metrics**: Logs message processing latency (receive → process → complete) for monitoring
 
@@ -109,11 +109,17 @@ mqtt:
   client_id: "aerosmart-gateway"
 
 device_id: "aerosmart"
-log_level: "debug"
+log_level: "info"
 read_interval: 60
 
 ha_discovery:
   enabled: true
+  prefix: "homeassistant"
+  device_info:
+    name: "Aerosmart Gateway"
+    manufacturer: "Drexel und Weiss"
+    model: "aerosmartPI"
+    # sw_version: defaults to the application version if not set
 ```
 
 ### Running the Application
@@ -148,7 +154,7 @@ For detailed information about the application flow and timing diagrams, see:
 |--------|-------------|---------|
 | `serial.port` | Serial device path | `/dev/ttyUSB0` |
 | `serial.baudrate` | Baud rate | `115200` |
-| `serial.read_timeout` | Read timeout (ms, 0=200ms fallback) | `1` |
+| `serial.read_timeout` | Read timeout (ms, 0=200ms fallback) | `2` |
 | `serial.device_response_delay` | Wait after write (ms) | `40` |
 | `serial.max_retries` | Max operation retries | `10` |
 | `serial.max_reopens` | Max port reopen attempts | `10` |
@@ -162,23 +168,28 @@ For detailed information about the application flow and timing diagrams, see:
 | `mqtt.username` | MQTT username | - |
 | `mqtt.password` | MQTT password | - |
 | `mqtt.client_id` | Client identifier | `aerosmart-gateway` |
-| `mqtt.qos` | Quality of Service (0, 1, or 2) | `0` |
+| `mqtt.qos` | Quality of Service (0, 1, or 2) | `1` |
 | `mqtt.retain` | Retain messages | `true` |
 | `mqtt.publish_retry_count` | Number of retries for failed publishes | `3` |
 | `mqtt.connect_retry_initial_delay_ms` | Initial delay for exponential backoff | `500ms` |
 | `mqtt.connect_retry_max_delay_ms` | Maximum delay for exponential backoff | `30000ms` |
 | `mqtt.connect_retry_jitter_percent` | Jitter percentage for backoff | `25%` |
 
-> **MQTT Resilience Note:** The gateway uses QoS 1 (at-least-once delivery) for subscriptions and publishes to ensure message reliability. Persistent sessions (CleanSession=false) preserve subscriptions across reconnects. KeepAlive is set to 30 seconds for fast disconnect detection.
+> **MQTT Resilience Note:** The gateway uses the configured QoS level (default: 1, at-least-once delivery) for subscriptions and publishes to ensure message reliability. Persistent sessions (CleanSession=false) preserve subscriptions across reconnects. KeepAlive is set to 30 seconds for fast disconnect detection.
 
 ### Application Configuration
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `device_id` | Device identifier | `aerosmart` |
-| `log_level` | Logging level | `debug` |
+| `device_id` | Device identifier (used as HA identifiers) | `aerosmart` |
+| `log_level` | Logging level | `info` |
 | `read_interval` | Read interval (seconds) | `60` |
 | `ha_discovery.enabled` | Enable HA discovery | `true` |
+| `ha_discovery.prefix` | HA discovery topic prefix | `homeassistant` |
+| `ha_discovery.device_info.name` | Device display name | `Aerosmart Gateway` |
+| `ha_discovery.device_info.manufacturer` | Device manufacturer | `Drexel und Weiss` |
+| `ha_discovery.device_info.model` | Device model | `aerosmartPI` |
+| `ha_discovery.device_info.sw_version` | Software version (defaults to app version) | - |
 
 ## MQTT Topics
 
@@ -207,7 +218,7 @@ The gateway subscribes to the following topics for device control:
 - `dw/aerosmart/luefterstufe` - Set fan stage (0-5) - *Topic changes detected and processed within 1-3 seconds*
 - `dw/aerosmart/boilerheizstab` - Set boiler heating element (0-1) - *Topic changes detected and processed within 1-3 seconds*
 
-> **Note:** The gateway implements immediate message detection with atomic write priority signaling, ensuring control commands are processed with minimal latency. See [MQTT Message Delay Fix](docs/MQTT_MESSAGE_DELAY_FIX.md) for technical details.
+> **Note:** The gateway implements immediate message detection with timestamp-based write priority signaling (auto-expires after 10 seconds), ensuring control commands are processed with minimal latency.
 
 ### Derived Registers
 

@@ -35,7 +35,7 @@ func TestDerivedCalculator_Calculate(t *testing.T) {
 	}
 
 	// Create a mock MQTT client (nil is fine for testing calculations)
-	mqttClient := mqtt.NewClient(nil, "test")
+	mqttClient := mqtt.NewClient(nil, "test", "homeassistant")
 
 	// Create the derived calculator
 	calc := NewDerivedCalculator(mqttClient, log, derivedRegisters)
@@ -123,7 +123,7 @@ func TestDerivedCalculator_MissingSource(t *testing.T) {
 		},
 	}
 
-	mqttClient := mqtt.NewClient(nil, "test")
+	mqttClient := mqtt.NewClient(nil, "test", "homeassistant")
 	calc := NewDerivedCalculator(mqttClient, log, derivedRegisters)
 
 	sourceValues := map[string]*RegisterValue{}
@@ -153,7 +153,7 @@ func TestDerivedCalculator_DivisionByZero(t *testing.T) {
 		},
 	}
 
-	mqttClient := mqtt.NewClient(nil, "test")
+	mqttClient := mqtt.NewClient(nil, "test", "homeassistant")
 	calc := NewDerivedCalculator(mqttClient, log, derivedRegisters)
 
 	// Test with abluftumin = 0

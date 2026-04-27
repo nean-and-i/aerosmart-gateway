@@ -107,7 +107,7 @@ The serial port is configured with the following parameters (from `config.yaml`)
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | Baud Rate | 115200 | Communication speed |
-| Read Timeout | 1ms (config), 200ms (fallback) | Max wait for serial read (treated as milliseconds in code) |
+| Read Timeout | 2ms (config), 200ms (fallback) | Max wait for serial read (treated as milliseconds in code) |
 | Write Timeout | 10s | Max wait for write |
 | Device Response Delay | 40ms | Wait after write before read |
 | Write Retry Delay | 10ms | Delay between write retries |
@@ -233,50 +233,62 @@ Writer.HandleMessage(topic, message)
 │ 11. Read verify registers (if configured)           │
 │     - ReadSingle() for each verify register         │
 │     - Publish verified values to MQTT               │
+│ 12. ClearWritePriority() - allow reads to resume    │
 └─────────────────────────────────────────────────────┘
 ```
 
 ### Write Priority Mechanism
 
-The application implements a write priority mechanism to ensure control commands are processed with minimal latency. The mechanism uses a dual-check approach with an atomic flag for reliable detection and a channel for backward compatibility.
+The application implements a write priority mechanism to ensure control commands are processed with minimal latency. The mechanism uses a timestamp-based approach with automatic expiry to prevent permanent blocking.
 
-#### Atomic Flag Implementation (Primary)
+#### Timestamp-Based Implementation
 
-The current implementation uses an atomic flag (`writePending atomic.Bool`) for reliable write priority detection:
+The current implementation uses a mutex-protected timestamp (`writePriorityTime time.Time`) with a 10-second auto-expiry timeout:
 
 ```
-Write Priority Detection (Atomic Flag)
+Write Priority Detection (Timestamp-Based)
     │
     ▼
 ┌─────────────────────────────────────────────────────┐
-│ Writer.writePending (atomic.Bool)                   │
+│ Writer.writePriorityTime (time.Time)                │
+│ Writer.writePriorityTimeout = 10 seconds            │
+│ Writer.writePriorityMu (sync.Mutex)                 │
 │                                                     │
 │ When a write message arrives (HandleMessage):       │
 │   1. SignalWritePriority()                          │
-│      - writePending.Store(true)  ← ATOMIC FLAG      │
-│      - writePriorityChan <- {}   ← CHANNEL         │
+│      - Lock mutex                                   │
+│      - writePriorityTime = time.Now()              │
+│      - Unlock mutex                                 │
 │   2. Cancel() ongoing read + ResetContext()         │
+│   ... (write + verify) ...                          │
+│   N. ClearWritePriority()                           │
+│      - Lock mutex                                   │
+│      - writePriorityTime = time.Time{} (zero)      │
+│      - Unlock mutex                                 │
 │                                                     │
 │ During periodic read (TriggerFullReadout):          │
-│   1. Check writePending.Load()  ← ATOMIC CHECK      │
-│      - If true: skip read cycle immediately         │
-│   2. Also check channel for backward compatibility  │
-│      - If channel full: skip read cycle             │
+│   1. Call isWritePriorityActive()                   │
+│      - If writePriorityTime is zero: return false  │
+│      - If time.Since >= 10s: expire + return false │
+│      - Otherwise: return true (skip read)          │
 └─────────────────────────────────────────────────────┘
 ```
 
-**Why Atomic Flag?**
-- The original channel-based approach had a race condition
-- If MQTT message and periodic ticker fired simultaneously, the `select` with `default` could miss the write signal
-- The atomic flag ensures reliable detection regardless of timing
+**Why Timestamp with Auto-Expiry?**
+- The original channel-based approach had an inverted logic bug
+- The atomic flag approach could block reads permanently on serial errors
+- The timestamp approach auto-expires after 10 seconds, ensuring reads always resume
+- Explicit `ClearWritePriority()` after successful writes allows immediate read resumption
 
-#### Performance Improvement
+#### Performance
 
-| Metric | Before (Channel-only) | After (Atomic + Channel) |
-|--------|----------------------|--------------------------|
-| MQTT detection | 30+ seconds | <1 second |
-| Write completion | 30+ seconds | 1-3 seconds |
-| Reliability | Race condition possible | 100% reliable |
+| Metric | Value |
+|--------|-------|
+| MQTT detection | <1 second |
+| Write completion | 1-3 seconds |
+| Auto-expiry timeout | 10 seconds |
+| Reads resume after success | Immediately (ClearWritePriority) |
+| Reads resume on serial error | After 10 seconds (auto-expiry) |
 
 #### Message Deduplication
 
@@ -333,7 +345,7 @@ Timing Metrics
 └─────────────────────────────────────────────────────┘
 ```
 
-> **Note:** For detailed technical documentation of the MQTT message delay fix, see [MQTT Message Delay Fix](MQTT_MESSAGE_DELAY_FIX.md).
+> **Note:** The write priority mechanism uses timestamps with automatic 10-second expiry to ensure system recovery from serial errors.
 
 ---
 
@@ -348,7 +360,7 @@ Timing Metrics
 | Username | Authentication username | - |
 | Password | Authentication password | - |
 | ClientID | Unique client identifier | `aerosmart-gateway` |
-| QOS | Quality of Service | 1 (internal) |
+| QOS | Quality of Service | Configurable (default: 1) |
 | Retain | Retain messages | `true` |
 | KeepAlive | KeepAlive interval (seconds) | 30 |
 | MaxReconnectInterval | Maximum reconnection interval | 60s |
@@ -364,7 +376,7 @@ Publish(topic, value)
 ┌─────────────────────────────────────┐
 │ 1. Check IsConnected()              │
 │ 2. For retry_count attempts:        │
-│    a. client.Publish(topic, 1,      │
+│    a. client.Publish(topic, QOS,     │
 │       Retain, value)                │
 │    b. Wait for completion           │
 │    c. If failed: sleep + retry      │
@@ -378,7 +390,7 @@ Subscribe(topic, handler)
 ┌─────────────────────────────────────┐
 │ 1. Check IsConnected()              │
 │ 2. Define callback function         │
-│ 3. client.Subscribe(topic, 1,       │
+│ 3. client.Subscribe(topic, QOS,     │
 │    callback)                        │
 │ 4. Wait for completion              │
 │ 5. Track subscription for recovery  │
@@ -420,18 +432,18 @@ The gateway implements comprehensive MQTT resilience:
 #### Publish Retry
 - Failed publishes are retried up to 3 times
 - Exponential backoff: 1s, 2s, 4s
-- Uses QoS 1 for at-least-once delivery
+- Uses configured QoS level (default: 1) for at-least-once delivery
 
 ### Home Assistant Discovery
 
 When `ha_discovery.enabled: true`, the gateway publishes:
 
 - **Sensor Discovery**: For each read register with HA config
-  - Topic: `homeassistant/sensor/{device_id}/{device_id}_{register_name}/config`
+  - Topic: `{ha_discovery.prefix}/sensor/{device_id}/{device_id}_{register_name}/config`
   - Payload: JSON with name, state_topic, unit, device_class, unique_id, device
 
 - **Switch Discovery**: For each write register with HA config
-  - Topic: `homeassistant/switch/{device_id}/{device_id}_{register_name}/config`
+  - Topic: `{ha_discovery.prefix}/switch/{device_id}/{device_id}_{register_name}/config`
   - Payload: JSON with name, command_topic, state_topic, unique_id, device
 
 ---
@@ -480,9 +492,9 @@ When `ha_discovery.enabled: true`, the gateway publishes:
 │ 4. Subscription Recovery                                    │
 │    - resubscribeAll() called                                │
 │    - Get all tracked subscriptions from internal map        │
-│    - Re-subscribe to each topic with QoS 1                 │
+│    - Re-subscribe to each topic with configured QoS       │
 │    - Logs: "MQTT recovering X subscriptions..."             │
-│    - For each topic: client.Subscribe(topic, 1, callback)  │
+│    - For each topic: client.Subscribe(topic, QOS, callback)  │
 │    - Logs: "MQTT all subscriptions recovered"              │
 └─────────────────────────────────────────────────────────────┘
                             │
@@ -723,12 +735,12 @@ Formula: delay = min(initialDelay * 2^attempt, maxDelay) * (1 + random(-jitter, 
 #### Publish Retry
 - **Retry Count**: 3 (configurable via `publish_retry_count`)
 - **Backoff**: Exponential (1s, 2s, 4s)
-- **QoS**: Uses QoS 1 for at-least-once delivery
+- **QoS**: Uses configured QoS level (default: 1) for at-least-once delivery
 
 #### Subscription Recovery
 - Subscriptions tracked in internal map
 - On reconnect: resubscribeAll() iterates and re-subscribes
-- Each subscription uses QoS 1
+- Each subscription uses the configured QoS level
 - Logs recovery progress for monitoring
 
 ### Serial Communication Retry
@@ -784,7 +796,7 @@ The `SendAndReceive` method implements a hybrid retry approach:
 |-----------|---------|-------------|
 | `port` | /dev/ttyUSB0 | Serial device path |
 | `baudrate` | 115200 | Communication speed |
-| `read_timeout` | 1ms (config), 200ms (fallback) | Read timeout (treated as milliseconds in code) |
+| `read_timeout` | 2ms (config default), 200ms (fallback if 0) | Read timeout (treated as milliseconds in code) |
 | `deadline_timeout` | 150ms | Flush input deadline timeout |
 | `device_response_delay` | 40ms | Wait after write |
 | `write_with_retry_delay` | 10ms | Write retry delay |
@@ -806,7 +818,7 @@ The `SendAndReceive` method implements a hybrid retry approach:
 | `username` | - | MQTT username |
 | `password` | - | MQTT password |
 | `client_id` | aerosmart-gateway | Client identifier |
-| `qos` | 0 | Quality of Service (used for config, internal uses QoS 1) |
+| `qos` | 1 | Quality of Service (0, 1, or 2) |
 | `retain` | true | Retain messages |
 | `publish_retry_count` | 3 | Number of retries for failed publishes |
 | `connect_retry_initial_delay_ms` | 500 | Initial backoff delay (ms) |
@@ -830,7 +842,12 @@ The `SendAndReceive` method implements a hybrid retry approach:
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `device_id` | aerosmart | Device identifier for HA |
-| `log_level` | debug | Logging level |
+| `device_id` | aerosmart | Device identifier for HA (used as identifiers) |
+| `log_level` | info | Logging level |
 | `read_interval` | 60s | Periodic read interval |
 | `ha_discovery.enabled` | true | Enable HA discovery |
+| `ha_discovery.prefix` | homeassistant | Discovery topic prefix |
+| `ha_discovery.device_info.name` | Aerosmart Gateway | Device display name |
+| `ha_discovery.device_info.manufacturer` | Drexel und Weiss | Device manufacturer |
+| `ha_discovery.device_info.model` | aerosmartPI | Device model |
+| `ha_discovery.device_info.sw_version` | (app version) | Software version |

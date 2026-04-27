@@ -84,7 +84,7 @@ Create a `config.yaml` file with the following structure:
 serial:
   port: "/dev/ttyUSB0"           # Serial device path
   baudrate: 115200               # Communication speed
-  read_timeout: 1                # Read timeout in milliseconds (0 = 200ms default)
+  read_timeout: 2                # Read timeout in milliseconds (0 = 200ms default)
   device_response_delay: 40      # Wait after write (ms)
   write_with_retry_delay: 10     # Write retry delay (ms)
   read_with_retry_delay: 100     # Read retry delay (ms)
@@ -102,7 +102,7 @@ mqtt:
   username: "mqtt"               # MQTT username
   password: "your_password"      # MQTT password
   client_id: "aerosmart-gateway" # Client identifier
-  qos: 0                         # Quality of Service (0, 1, or 2)
+  qos: 1                         # Quality of Service (0, 1, or 2)
   retain: true                   # Retain messages
   # Connection retry settings
   connect_retry_initial_delay_ms: 500
@@ -134,6 +134,11 @@ read_interval: 60
 ha_discovery:
   enabled: true
   prefix: "homeassistant"
+  device_info:
+    name: "Aerosmart Gateway"
+    manufacturer: "Drexel und Weiss"
+    model: "aerosmartPI"
+    # sw_version: defaults to the application version if not set
 ```
 
 ### Registers Configuration
