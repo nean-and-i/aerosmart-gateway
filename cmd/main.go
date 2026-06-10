@@ -4,7 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"math"
+	"math/rand"
 	"os"
 	"os/signal"
 	"sync"
@@ -138,13 +138,14 @@ func main() {
 
 	// Initialize MQTT client
 	mqttConfig := &mqtt.MQTTConfig{
-		Broker:   appConfig.MQTT.Broker,
-		Port:     appConfig.MQTT.Port,
-		Username: appConfig.MQTT.Username,
-		Password: appConfig.MQTT.Password,
-		ClientID: appConfig.MQTT.ClientID,
-		QOS:      appConfig.MQTT.QOS,
-		Retain:   appConfig.MQTT.Retain,
+		Broker:            appConfig.MQTT.Broker,
+		Port:              appConfig.MQTT.Port,
+		Username:          appConfig.MQTT.Username,
+		Password:          appConfig.MQTT.Password,
+		ClientID:          appConfig.MQTT.ClientID,
+		QOS:               appConfig.MQTT.QOS,
+		Retain:            appConfig.MQTT.Retain,
+		PublishRetryCount: appConfig.MQTT.PublishRetryCount,
 	}
 
 	mqttClient := mqtt.NewClient(mqttConfig, appConfig.DeviceID, appConfig.HADiscovery.Prefix)
@@ -173,6 +174,11 @@ func main() {
 
 	// Connect writer to reader for verification after fan control
 	writer.SetReader(reader)
+
+	// Initialize derived register calculator and connect it to the writer so
+	// derived values are computed and published after each full readout
+	derivedCalc := registers.NewDerivedCalculator(mqttClient, log, registersConfig.DerivedRegisters)
+	writer.SetDerivedCalculator(derivedCalc)
 
 	// Subscribe to write register topics
 	writeTopics := writer.GetSubscribeTopics()
@@ -224,8 +230,11 @@ func main() {
 	// Wait for shutdown signal
 	<-ctx.Done()
 
-	// Immediate cleanup - force shutdown
-	log.Info("Force shutdown initiated...")
+	// Wait for the read-loop goroutine to finish its in-flight operation before
+	// closing the serial port, so we don't tear down resources mid-read.
+	// The signal handler's 5s timeout bounds this wait as a backstop.
+	log.Info("Shutdown initiated, waiting for read loop to finish...")
+	wg.Wait()
 
 	// Disconnect MQTT first
 	mqttClient.Disconnect()
@@ -319,19 +328,13 @@ func calculateBackoffWithJitter(attempt int, initialDelayMs int, maxDelayMs int,
 	}
 
 	// Add jitter: random value between -jitterPercent% and +jitterPercent%
+	// rand.Float64() yields [0,1); (2*x-1) maps that to [-1,1).
 	if jitterPercent > 0 {
-		jitterMultiplier := 1.0 + (float64(jitterPercent)/100.0)*(2*math.Float64frombits(randUint64())/float64(0xFFFFFFFFFFFFFFFF)-1)
+		jitterMultiplier := 1.0 + (float64(jitterPercent)/100.0)*(2*rand.Float64()-1)
 		delayMs *= jitterMultiplier
 	}
 
 	return time.Duration(int(delayMs)) * time.Millisecond
-}
-
-// randUint64 returns a random uint64 for jitter calculation
-func randUint64() uint64 {
-	// Simple random using time-based seed (good enough for retry jitter)
-	// For more secure random, use crypto/rand
-	return uint64(time.Now().UnixNano())
 }
 
 func publishHADiscovery(mqttClient *mqtt.Client, registersConfig *config.RegistersConfig, appConfig *config.AppConfig, log *logger.Logger) {
@@ -372,6 +375,25 @@ func publishHADiscovery(mqttClient *mqtt.Client, registersConfig *config.Registe
 		}
 		if err := mqttClient.PublishSwitchDiscovery(&switchConfig); err != nil {
 			log.Warn("Failed to publish switch discovery for %s: %v", reg.Name, err)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	// Publish derived sensor discovery configs
+	for _, reg := range registersConfig.DerivedRegisters {
+		if reg.HA.Name == "" {
+			continue
+		}
+		sensorConfig := mqtt.HASensorConfig{
+			Name:        reg.HA.Name,
+			StateTopic:  reg.Topic,
+			Unit:        reg.HA.Unit,
+			DeviceClass: reg.HA.DeviceClass,
+			UniqueID:    fmt.Sprintf("%s_%s", deviceID, reg.Name),
+			Device:      deviceInfo,
+		}
+		if err := mqttClient.PublishSensorDiscovery(&sensorConfig); err != nil {
+			log.Warn("Failed to publish sensor discovery for %s: %v", reg.Name, err)
 		}
 		time.Sleep(2 * time.Millisecond)
 	}

@@ -324,7 +324,8 @@ type Writer struct {
 	mqtt      *mqtt.Client
 	logger    *logger.Logger
 	registers []config.WriteRegisterConfig
-	reader    *Reader // Reference to reader for verification
+	reader    *Reader            // Reference to reader for verification
+	derived   *DerivedCalculator // Optional: calculates derived registers after a full readout
 
 	// Write priority mechanism - auto-expires after writePriorityTimeout
 	writePriorityTime    time.Time
@@ -360,6 +361,13 @@ func NewWriter(serialPort *serial.SerialPort, mqttClient *mqtt.Client, log *logg
 // SetReader sets the reader for verification after write operations
 func (w *Writer) SetReader(reader *Reader) {
 	w.reader = reader
+}
+
+// SetDerivedCalculator sets the calculator used to compute and publish derived
+// register values after each full readout. Optional; if unset, no derived values
+// are calculated.
+func (w *Writer) SetDerivedCalculator(derived *DerivedCalculator) {
+	w.derived = derived
 }
 
 // HandleMessage handles an incoming MQTT message for write registers
@@ -549,6 +557,19 @@ func (w *Writer) TriggerFullReadout() error {
 	// Publish all values to MQTT
 	if err := w.reader.PublishAll(values); err != nil {
 		w.logger.Error("Failed to publish register values: %v", err)
+	}
+
+	// Calculate and publish derived register values from the freshly read values.
+	// Derived values run only on cycles where a read actually happened (skipped
+	// under write priority), keeping them consistent with their source registers.
+	if w.derived != nil {
+		derivedValues, err := w.derived.Calculate(values)
+		if err != nil {
+			w.logger.Error("Failed to calculate derived registers: %v", err)
+		}
+		if err := w.derived.PublishAll(derivedValues); err != nil {
+			w.logger.Error("Failed to publish derived register values: %v", err)
+		}
 	}
 
 	w.logger.Info("=== Full register readout completed ===")
