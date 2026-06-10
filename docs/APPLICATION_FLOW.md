@@ -88,6 +88,7 @@ The application follows a layered architecture with the following main component
 
 9. Initialize Register Writer
    └─> NewWriter() with write registers config
+   └─> SetDerivedCalculator() — derived registers computed & published each readout
 
 10. Subscribe to Write Register Topics
     └─> For each write register: mqttClient.Subscribe()
@@ -192,7 +193,7 @@ SerialPort.SendAndReceive(command, maxRetries)
 ┌─────────────────────────────────────────────────────┐
 │ For each attempt (0 to maxRetries-1)                │
 │  1. WaitForReadComplete() - wait for ongoing reads  │
-│  2. ForceReopen() on first attempt - clean state    │
+│  2. ForceReopen() on retry attempts only (>0)       │
 │  3. FlushInputMultiple(3) - clear stale data        │
 │  4. WriteWithRetry() - write command with retries   │
 │     └─> If fails: tryReopen() and continue          │
@@ -406,10 +407,10 @@ The gateway implements comprehensive MQTT resilience:
 - Broker maintains subscription state
 - No manual re-subscription needed after connection loss
 
-#### Auto-Reconnect with Exponential Backoff
-- Initial reconnect attempt: 5 seconds
-- Maximum reconnect interval: 60 seconds
-- Jitter: 25% to prevent thundering herd
+#### Auto-Reconnect
+- Reconnect retry interval: 5 seconds (fixed, `SetConnectRetryInterval`)
+- Maximum reconnect interval: 60 seconds (`SetMaxReconnectInterval`)
+- Handled by the paho client. The `connect_retry_*` config values apply only to the *initial* connect loop in `main.go`, not to steady-state reconnects.
 
 #### KeepAlive Monitoring
 - Sends PINGREQ every 30 seconds
@@ -481,7 +482,7 @@ When `ha_discovery.enabled: true`, the gateway publishes:
 ┌─────────────────────────────────────────────────────────────┐
 │ 3. Reconnection                                             │
 │    - ConnectionNotification: Connecting                     │
-│    - Exponential backoff: 5s, 10s, 20s, 40s, 60s (max)     │
+│    - Fixed 5s retry interval, capped at 60s max            │
 │    - ReconnectingHandler logs each attempt                  │
 │    - ConnectionNotification: Connected                      │
 │    - OnConnect: resubscribeAll()                            │
@@ -665,7 +666,7 @@ Component:    Main Loop            Writer              SerialPort        Device
    +30ms      │                    │                   │ <───────────────│ Response
               │                    │                   │                 │
               │                    │                   │ Read reg 1      │
-              │                    │                   │ <───────────────│ (partial)
+              │                    │                   │ <───────────────│ (completes)
               │                    │                   │                 │
               │                    │                   │                 │
    +50ms      │                    │ MQTT message      │                 │
@@ -673,13 +674,13 @@ Component:    Main Loop            Writer              SerialPort        Device
               │                    │──────────────────>│                 │
               │                    │                   │                 │
               │                    │ SignalWritePriority│                │
-              │                    │ (writePriorityChan)│               │
+              │                    │ (sets timestamp)   │               │
               │                    │                   │                 │
               │                    │ Cancel()          │                 │
               │                    │──────────────────>│                 │
               │                    │                   │                 │
               │ Check write        │                   │                 │
-              │ priority channel   │                   │                 │
+              │ priority (active?) │                   │                 │
               │───────────────────>│                   │                 │
               │                    │                   │                 │
               │ Write detected!    │                   │                 │
@@ -710,8 +711,8 @@ Component:    Main Loop            Writer              SerialPort        Device
 Both serial and MQTT connections use exponential backoff with jitter:
 
 ```
-Initial Delay: 2ms (serial), 500ms (MQTT)
-Max Delay: 400ms (serial), 60s (MQTT)
+Initial Delay: 100ms (serial), 500ms (MQTT)
+Max Delay: 10000ms (serial), 30000ms (MQTT)
 Jitter: 25%
 
 Formula: delay = min(initialDelay * 2^attempt, maxDelay) * (1 + random(-jitter, +jitter))
@@ -727,7 +728,7 @@ Formula: delay = min(initialDelay * 2^attempt, maxDelay) * (1 + random(-jitter, 
 #### Auto-Reconnect Behavior
 1. Connection lost detected (via KeepAlive or OnConnectionLost)
 2. ReconnectingHandler logs: "MQTT attempting to reconnect..."
-3. Exponential backoff begins: 5s → 10s → 20s → 40s → 60s (max)
+3. Auto-reconnect retries at a fixed 5s interval (capped at 60s)
 4. On successful connect: OnConnectHandler triggers subscription recovery
 5. Subscription recovery: resubscribeAll() re-subscribes to all topics
 6. Normal operation resumes
@@ -755,7 +756,7 @@ The `SendAndReceive` method implements a hybrid retry approach:
 ### Port Reopen Strategy
 
 - **Automatic Reopen**: On communication failure, the port is automatically reopened
-- **Force Reopen**: For write operations, the port is force-reopened on the first attempt to ensure clean state
+- **Force Reopen**: On retry attempts only (attempt > 0), the port is force-reopened to recover a clean state; the first attempt reuses the open connection
 - **Max Reopens**: Limited to `maxReopens` attempts before giving up
 
 ---
@@ -805,8 +806,8 @@ The `SendAndReceive` method implements a hybrid retry approach:
 | `write_max_retries` | 10 | Max write retries per SendAndReceive |
 | `max_retries` | 10 | Max SendAndReceive attempts |
 | `max_reopens` | 10 | Max port reopen attempts |
-| `connect_retry_initial_delay_ms` | 2ms | Initial backoff delay for connection |
-| `connect_retry_max_delay_ms` | 400ms | Max backoff delay for connection |
+| `connect_retry_initial_delay_ms` | 100ms | Initial backoff delay for connection |
+| `connect_retry_max_delay_ms` | 10000ms | Max backoff delay for connection |
 | `connect_retry_jitter_percent` | 25% | Jitter for backoff |
 
 ### MQTT Configuration Parameters

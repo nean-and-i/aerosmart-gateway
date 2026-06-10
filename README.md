@@ -163,7 +163,7 @@ For detailed information about the application flow and timing diagrams, see:
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `mqtt.broker` | MQTT broker address | `localhost` |
+| `mqtt.broker` | MQTT broker address | _(required)_ |
 | `mqtt.port` | MQTT broker port | `1883` |
 | `mqtt.username` | MQTT username | - |
 | `mqtt.password` | MQTT password | - |
@@ -265,7 +265,7 @@ Example of Home Assistant dashboard:
 ### Write Operation
 
 1. MQTT message received on write topic
-2. Writer signals write priority (cancels ongoing read)
+2. Writer signals write priority, preempting the periodic read cycle (the in-flight single-register read finishes first; remaining registers are skipped)
 3. Parse and validate value
 4. Send command to device
 5. Read response and verify
@@ -287,32 +287,17 @@ The application implements comprehensive retry logic:
 
 ### systemd (Linux)
 
-Create a systemd service file at `/etc/systemd/system/aerosmart.service`:
+The repository ships a ready-to-use, hardened unit at [`docs/aerosmart.service`](docs/aerosmart.service) and an installer ([`docs/install.sh`](docs/install.sh)) that deploys the binary, config, and service. See the [Installation Guide](docs/INSTALLATION.md) for the full walkthrough.
 
-```ini
-[Unit]
-Description=Aerosmart Gateway - Connects Aerosmart ventilation to MQTT
-After=network.target
-Wants=network.target
-
-[Service]
-Type=simple
-User=root
-ExecStart=/opt/aerosmart/aerosmart-gateway -config /opt/aerosmart/config.yaml -registers /opt/aerosmart/registers.yaml
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Then enable and start the service:
+To install the service manually:
 
 ```bash
+sudo cp docs/aerosmart.service /etc/systemd/system/aerosmart.service
 sudo systemctl daemon-reload
-sudo systemctl enable aerosmart
-sudo systemctl start aerosmart
+sudo systemctl enable --now aerosmart
 ```
+
+The unit expects the binary and config under `/opt/aerosmart/` (`aerosmart-gateway`, `config.yaml`, `registers.yaml`) and gates startup on the serial device via `ConditionPathExists=/dev/ttyUSB0`.
 
 
 ## Development

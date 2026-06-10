@@ -77,6 +77,7 @@ Time (ms)   Component          Action
 55          registers         NewReader(serial, mqtt, readRegisters)
 60          registers         NewWriter(serial, mqtt, writeRegisters)
 65          registers         writer.SetReader(reader)
+67          registers         writer.SetDerivedCalculator(derivedCalc)
 70          mqtt              Subscribe("dw/aerosmart/luefterstufe")
 75          mqtt              Subscribe("dw/aerosmart/boilerheizstab")
 80          main              Start periodic ticker (60s interval)
@@ -101,7 +102,7 @@ Time (ms)   Component          Action
 10          reader            ReadAll() - start read cycle
 15          reader            Mark isReading = true
 20          serial            SendAndReceive("130 1067", 10)
-25          serial            ForceReopen() - close, wait 5ms, reopen
+25          serial            WaitForReadComplete() - no read pending
 30          serial            FlushInputMultiple(3)
 35          serial            WriteWithRetry("130 1067\r\n", 10, 10ms)
 40          serial            Sleep(deviceResponseDelay=40ms)
@@ -109,8 +110,8 @@ Time (ms)   Component          Action
 85          serial            <-- "130 1067 3" (fan speed 3)
 90          reader            Parse & validate value (3 in range 0-5)
 95          serial            SendAndReceive("130 5003", 10)
-                              (ForceReopen only on attempt 0 of first call;
-                               subsequent calls: FlushInputMultiple(3) + write)
+                              (No ForceReopen on attempt 0; ForceReopen runs
+                               only on retry attempts >0)
 100         serial            WriteWithRetry("130 5003\r\n", 10, 10ms)
 105         serial            Sleep(deviceResponseDelay=40ms)
 145         serial            ReadWithRetry(10, 100ms)
@@ -140,7 +141,7 @@ SendAndReceive(command, maxRetries=10)
 ┌──────────────────────────────────────────────────────────────────────────┐
 │ Attempt 0:                                                               │
 │  1. WaitForReadComplete() - wait for any ongoing read to finish          │
-│  2. ForceReopen() - close and reopen port for clean state                │
+│  2. No ForceReopen on attempt 0 (only on retries >0)                     │
 │  3. FlushInputMultiple(3) - clear stale data                             │
 │  4. WriteWithRetry("130 1067\r\n", 10, 10ms)                             │
 │     - Write attempt 1: SUCCESS                                           │
@@ -251,36 +252,6 @@ Writer.isDuplicateMessage(topic, value)
 │ return false  // Process this message                                   │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
-Time (ms)   Component          Action
-─────────────────────────────────────────────────────────────────────────────
-0           MQTT Broker       Message published to "dw/aerosmart/luefterstufe"
-5           mqtt              Callback invoked with message "3"
-10          writer            HandleMessage("dw/aerosmart/luefterstufe", "3")
-15          writer            SignalWritePriority() - set timestamp
-20          writer            reader.Cancel() - cancel any ongoing read
-25          writer            reader.ResetContext() - create new context
-30          writer            Find matching register, validate value (3 in 0-5)
-35          writer            Build command: "130 5002 3"
-40          serial            SendAndReceive("130 5002 3", 10)
-45          serial            ForceReopen() + FlushInputMultiple(3)
-50          serial            WriteWithRetry("130 5002 3\r\n", 10, 10ms)
-55          serial            Sleep(deviceResponseDelay=40ms)
-95          serial            ReadWithRetry(10, 100ms) - get response
-100         serial            <-- "130 5002 OK"
-105         writer            FlushBuffer() - FlushInputMultiple(5)
-110         writer            Sleep(deviceResponseDelay=40ms) - wait before verify
-150         writer            Read verify register: luefterstatus
-155         serial            reader.ReadSingle(luefterstatus)
-160         serial            SendAndReceive("130 1067", 10)
-165         serial            <-- "130 1067 3"
-170         mqtt              Publish("aerosmart/luefterstatus", "3")
-175         writer            Read verify register: lueftermode
-180         serial            reader.ReadSingle(lueftermode)
-185         serial            SendAndReceive("130 5003", 10)
-190         serial            <-- "130 5003 3"
-195         mqtt              Publish("aerosmart/lueftermode", "3")
-200         writer            ClearWritePriority() - allow reads to resume
-```
 
 ### Write Priority Signaling
 
@@ -337,20 +308,21 @@ SendAndReceive fails
 ### Connection Retry with Exponential Backoff
 
 ```
-Initial delay: 2ms (serial), 500ms (MQTT)
-Max delay: 400ms (serial), 30s (MQTT)
+Initial delay: 100ms (serial), 500ms (MQTT)
+Max delay: 10000ms (serial), 30000ms (MQTT)
 Jitter: 25%
 
-Attempt 0: delay = 2ms * (1 ± 0.25) = 1.5-2.5ms
-Attempt 1: delay = 4ms * (1 ± 0.25) = 3-5ms
-Attempt 2: delay = 8ms * (1 ± 0.25) = 6-10ms
-Attempt 3: delay = 16ms * (1 ± 0.25) = 12-20ms
-Attempt 4: delay = 32ms * (1 ± 0.25) = 24-40ms
-Attempt 5: delay = 64ms * (1 ± 0.25) = 48-80ms
-Attempt 6: delay = 128ms * (1 ± 0.25) = 96-160ms
-Attempt 7: delay = 256ms * (1 ± 0.25) = 192-320ms
-Attempt 8: delay = 400ms * (1 ± 0.25) = 300-400ms (capped)
-Attempt 9: delay = 400ms * (1 ± 0.25) = 300-400ms (capped)
+Serial connect retry: delay = min(100ms * 2^attempt, 10000ms) * (1 ± 0.25)
+Attempt 0: ~100ms
+Attempt 1: ~200ms
+Attempt 2: ~400ms
+Attempt 3: ~800ms
+Attempt 4: ~1600ms
+Attempt 5: ~3200ms
+Attempt 6: ~6400ms
+Attempt 7: ~10000ms (capped)
+Attempt 8: ~10000ms (capped)
+Attempt 9: ~10000ms (capped)
 ```
 
 ---
@@ -370,19 +342,17 @@ Time (ms)   Component          Action
 25          serial            Write("130 1067\r\n")
 30          serial            Sleep(40ms)
 35          serial            Read() - waiting for response...
-40
-
-MQTT Broker       Message published: "dw/aerosmart/luefterstufe" = "3"
+40          MQTT Broker       Message published: "dw/aerosmart/luefterstufe" = "3"
 45          mqtt              Callback invoked
 50          writer            HandleMessage() called
 55          writer            SignalWritePriority() - set timestamp
 60          writer            Cancel() - reader.Cancel()
 65          writer            ResetContext()
-70          reader            Context cancelled - ctx.Done() signaled
-75          serial            Read() returns (interrupted)
-80          main              select: ctx.Done() case selected
-85          main              Skip remaining registers
-90          main              Close(forceQuit)
+70          reader            ctx.Done() signaled (checked between registers)
+75          serial            in-flight Read() completes (NOT interrupted)
+80          reader            ReadAll sees ctx.Done(), stops; skips remaining regs
+85          serial            writeMu released by the finished read
+90          writer            write SendAndReceive() acquires writeMu
 95          writer            HandleMessage() continues
 100         serial            SendAndReceive("130 5002 3", 10)
 105         serial            Write command
@@ -492,6 +462,11 @@ publishHADiscovery()
 
 ### Network Disconnection Scenario
 
+> Detection time depends on when the failure falls within the 30s KeepAlive ping
+> cycle — from ~30s (failure just before a ping) up to ~70s (failure just after a
+> successful ping; see "KeepAlive Timing Detail" below). The timeline shows the
+> early-detection case.
+
 ```
 Time (s)    Component              Action
 ────────────────────────────────────────────────────────────────────────────
@@ -569,7 +544,7 @@ State: ConnectionLost ───────────────────�
 State: Connecting ───────────────────────────────────────────────────────►
     │                                                                    │
     │ ReconnectingHandler: "MQTT attempting to reconnect..."            │
-    │ Backoff: 5s → 10s → 20s → 40s → 60s (max)                        │
+    │ Reconnect: fixed 5s interval (capped 60s)                        │
     ▼                                                                    │
 State: Connected ───────────────────────────────────────────────────────►
     │                                                                    │
@@ -712,9 +687,11 @@ Time    Component          Action
 |--------|------------|-----------|-------------|
 | MQTT message detection | 30+ seconds | <1 second | ~30x faster |
 | Write operation total | 30+ seconds | 1-3 seconds | ~20x faster |
-| Serial read time | 10-20 seconds | 400ms | ~25x faster |
-| Detection reliability | Inverted logic bug | 100% reliable | Fixed |
-| Recovery from serial errors | Blocked forever | 10s auto-expiry | Fixed |
+| Serial round-trip per register | reopen on every write | reopen only on retries | faster (config-dependent) |
+| Detection reliability | Inverted logic bug | reliable | Fixed |
+| Recovery from serial errors | Blocked until cleared | 10s auto-expiry | Fixed |
+
+> The latency figures above are illustrative. Actual read/write durations depend on the serial config (`device_response_delay`, `read_max_retries`, register count) and are logged per cycle.
 
 ### Key Changes
 

@@ -15,7 +15,7 @@
 
 NAME=aerosmart
 DESC="Aerosmart Gateway"
-PROGRAM=/opt/aerosmart/aerosmart-gateway-armv6
+PROGRAM=/opt/aerosmart/aerosmart-gateway
 PIDFILE=/var/run/aerosmart.pid
 LOGFILE=/var/log/aerosmart.log
 CONFIG=/opt/aerosmart/config.yaml

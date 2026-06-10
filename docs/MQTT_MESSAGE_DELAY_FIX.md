@@ -1,14 +1,18 @@
 # MQTT Message Delay Fix - Technical Documentation
 
-This document provides a comprehensive analysis of the MQTT message delay issue that was identified and fixed in the Aerosmart Gateway application.
+This document explains the MQTT message delay issue that affected the Aerosmart
+Gateway and the **write-priority mechanism** that resolves it. The mechanism
+described here reflects the current implementation in
+[`internal/registers/reader.go`](../internal/registers/reader.go) and
+[`internal/serial/serial.go`](../internal/serial/serial.go).
 
 ## Table of Contents
 
 1. [Issue Description](#issue-description)
 2. [Root Cause Analysis](#root-cause-analysis)
-3. [Fixes Implemented](#fixes-implemented)
+3. [The Write-Priority Mechanism](#the-write-priority-mechanism)
 4. [Implementation Details](#implementation-details)
-5. [Performance Improvements](#performance-improvements)
+5. [Performance](#performance)
 6. [Testing and Verification](#testing-and-verification)
 7. [Configuration](#configuration)
 
@@ -18,380 +22,232 @@ This document provides a comprehensive analysis of the MQTT message delay issue 
 
 ### Problem Statement
 
-The Aerosmart Gateway experienced significant delays (30+ seconds) in detecting and processing MQTT messages for write register topics, specifically:
+The gateway used to experience significant delays in detecting and processing
+MQTT messages for write register topics:
 - `dw/aerosmart/luefterstufe` - Fan stage control (0-5)
 - `dw/aerosmart/boilerheizstab` - Boiler heating element control (0-1)
 
 ### Impact
 
-- Control commands from Home Assistant or other MQTT clients were not executed in a timely manner
-- Users experienced lag when adjusting fan speed or boiler settings
-- The write priority mechanism intended to provide low-latency responses was not functioning reliably
+- Control commands from Home Assistant were not executed in a timely manner.
+- Users experienced lag when adjusting fan speed or boiler settings.
+- A write could be delayed until the next periodic read cycle completed.
 
 ### Symptoms
 
-1. MQTT message published to write topic (e.g., `dw/aerosmart/luefterstufe`)
-2. Message not processed immediately - delays of 30-60 seconds observed
-3. Write operation only executed after next periodic read cycle completed
-4. Inconsistent behavior - sometimes fast, sometimes delayed
+1. MQTT message published to a write topic.
+2. Message not processed immediately — delays of tens of seconds observed.
+3. The write executed only after the in-progress periodic read finished.
 
 ---
 
 ## Root Cause Analysis
 
-### Root Cause 1: Race Condition in Write Priority Detection
+### Root Cause 1: race in the original channel-based write-priority signal
 
-The original implementation used a channel-based mechanism to signal write priority:
+The **original** implementation (since replaced) signalled write priority over a
+channel and checked it from `TriggerFullReadout()` with a `select`/`default`.
+When an MQTT message and the periodic ticker fired nearly simultaneously, the
+non-blocking `select` could miss the signal and proceed with the read, so the
+write only ran after that read completed.
 
-```go
-// Original SignalWritePriority()
-func (w *Writer) SignalWritePriority() {
-    select {
-    case w.writePriorityChan <- struct{}{}:
-        w.logger.Debug("Write priority signaled")
-    default:
-        w.logger.Debug("Write priority already pending")
-    }
-}
-```
+### Root Cause 2: unnecessary serial port reopen on the first attempt
 
-The problem occurred in `TriggerFullReadout()`:
-
-```go
-// Original TriggerFullReadout()
-func (w *Writer) TriggerFullReadout() error {
-    select {
-    case w.writePriorityChan <- struct{}{}:
-        // Write priority signaled - skip this read
-        w.reader.Cancel()
-        w.reader.ResetContext()
-        <-w.writePriorityChan  // Drain channel
-        return nil
-    default:
-        // No write pending, proceed with normal read
-    }
-    // ... continue with read cycle
-}
-```
-
-**The Race Condition:**
-1. MQTT message arrives → `SignalWritePriority()` tries to send to channel
-2. At the same time, periodic ticker fires → `TriggerFullReadout()` checks channel
-3. If both operations happen nearly simultaneously, the `select` with `default` case could:
-   - Miss the write signal (channel already has value but not yet consumed)
-   - Proceed with periodic read while write is actually pending
-4. The write only processes after the periodic read completes (up to 60 seconds later)
-
-### Root Cause 2: Unnecessary Serial Port Reopen
-
-The `SendAndReceive` function was calling `ForceReopen()` on every first write attempt:
-
-```go
-// Original SendAndReceive
-func (s *SerialPort) SendAndReceive(command string, maxRetries int) (string, error) {
-    for attempt := 0; attempt < maxRetries; attempt++ {
-        // Force reopen on FIRST attempt - unnecessary!
-        if attempt == 0 {
-            _ = s.ForceReopen()
-        }
-        // ... rest of logic
-    }
-}
-```
-
-This caused:
-- 5ms delay for port close + reopen
-- Disruption of serial communication with device
-- Additional delays in write operations
+`SendAndReceive` used to call `ForceReopen()` on **every first** write attempt,
+adding a close/reopen (~5 ms plus device settling) and disrupting communication
+on every command.
 
 ---
 
-## Fixes Implemented
+## The Write-Priority Mechanism
 
-### Fix 1: Atomic Write Priority Flag
+The current design replaces the channel with a **timestamp guarded by a mutex**,
+plus an automatic expiry so a failed write can never block reads indefinitely.
 
-Replaced the unreliable channel-based detection with an atomic flag:
+### State ([`Writer`](../internal/registers/reader.go))
 
 ```go
 type Writer struct {
-    // Write priority mechanism - using atomic flag for reliable detection
-    writePriorityChan chan struct{} // Channel to signal write priority request
-    writePending      atomic.Bool   // Atomic flag to track if write is pending
+    // Write priority mechanism - auto-expires after writePriorityTimeout
+    writePriorityTime    time.Time
+    writePriorityTimeout time.Duration // 10s (set in NewWriter)
+    writePriorityMu      sync.Mutex
+    // ...
 }
 ```
 
-**SignalWritePriority()** - Now sets both channel and atomic flag:
+### Signalling priority
+
+`SignalWritePriority()` simply records the current time:
+
 ```go
 func (w *Writer) SignalWritePriority() {
-    // Use atomic flag for reliable detection
-    w.writePending.Store(true)
-    
-    select {
-    case w.writePriorityChan <- struct{}{}:
-        w.logger.Debug("Write priority signaled")
-    default:
-        w.logger.Debug("Write priority already pending")
-    }
+    w.writePriorityMu.Lock()
+    w.writePriorityTime = time.Now()
+    w.writePriorityMu.Unlock()
+    w.logger.Debug("Write priority signaled")
 }
 ```
 
-**TriggerFullReadout()** - Checks atomic flag first:
+### Detecting priority (with auto-expiry)
+
+`isWritePriorityActive()` reports whether a write is pending and **clears stale
+priority** once `writePriorityTimeout` (10 s) has elapsed — this guards against a
+write that failed without clearing priority:
+
+```go
+func (w *Writer) isWritePriorityActive() bool {
+    w.writePriorityMu.Lock()
+    defer w.writePriorityMu.Unlock()
+    if w.writePriorityTime.IsZero() {
+        return false
+    }
+    if time.Since(w.writePriorityTime) >= w.writePriorityTimeout {
+        w.writePriorityTime = time.Time{}
+        w.logger.Warn("Write priority expired after %v timeout", w.writePriorityTimeout)
+        return false
+    }
+    return true
+}
+```
+
+`TriggerFullReadout()` checks it and skips the periodic read when a write is
+pending:
+
 ```go
 func (w *Writer) TriggerFullReadout() error {
-    // Check for write priority using atomic flag - more reliable
-    if w.writePending.Load() {
-        w.logger.Info("=== Write priority detected (atomic flag), skipping periodic read ===")
+    if w.isWritePriorityActive() {
+        w.logger.Info("=== Write priority detected, skipping periodic read ===")
         w.reader.Cancel()
         w.reader.ResetContext()
-        // Drain the channel if there's a pending value
-        select {
-        case <-w.writePriorityChan:
-        default:
-        }
         return nil
     }
-    
-    // Also check channel for backward compatibility
-    select {
-    case w.writePriorityChan <- struct{}{}:
-        // ... channel-based detection
-    default:
-        // No write pending
-    }
+    // ... read all registers, publish, then compute/publish derived registers
 }
 ```
 
-### Fix 2: Message Deduplication
+### Preemption is cooperative, not interrupt-based
 
-Added deduplication to prevent processing duplicate MQTT messages within a 1-second window:
+When a write arrives, `HandleMessage()` calls `reader.Cancel()` to cancel the
+read context. The read loop (`Reader.ReadAllWithContext`) checks `ctx.Done()`
+**between registers**, and all serial I/O is serialized by the serial layer's
+`writeMu`. So an in-flight single-register read runs to completion, the write
+then acquires `writeMu`, and the remaining registers in that cycle are skipped.
+Detection is immediate; the write completes once the current register read
+finishes (typically within a couple of seconds).
 
-```go
-type MessageInfo struct {
-    Topic     string
-    Value     string
-    Timestamp time.Time
-}
+### Clearing priority
 
-type Writer struct {
-    recentMessages      map[string]MessageInfo
-    recentMessagesMu    sync.Mutex
-    messageDedupeWindow time.Duration // Default: 1 second
-}
-```
+On a **successful** write, `HandleMessage()` calls `ClearWritePriority()` (resets
+the timestamp to zero) so reads resume immediately. On a **failed** write,
+`HandleMessage()` logs the error, returns `nil`, and deliberately leaves priority
+set — it auto-expires via the 10 s timeout above, so reads resume even if the
+serial device is unresponsive.
 
-The deduplication check is performed at the start of `HandleMessage()`:
-```go
-func (w *Writer) HandleMessage(topic string, message string) error {
-    // Message deduplication - check if we've recently processed this exact message
-    if w.isDuplicateMessage(topic, message) {
-        w.logger.Info("MQTT: Skipping duplicate message on %s: %s", topic, message)
-        return nil
-    }
-    // ... rest of handling
-}
-```
+### Supporting fixes
 
-### Fix 3: Timing Metrics
+- **Message deduplication** — `HandleMessage()` ignores an identical
+  topic+value seen within a 1 s window (`isDuplicateMessage`), preventing
+  duplicate retained/republished messages from triggering redundant writes.
+- **Timing metrics** — receive → process → complete timestamps yield a logged
+  end-to-end latency for monitoring.
+- **ForceReopen optimization** — `SendAndReceive` now reopens the port only on
+  retry attempts (`attempt > 0`), not on the first attempt:
 
-Added comprehensive timing metrics for monitoring:
-
-```go
-type Writer struct {
-    // Message processing metrics
-    lastMessageReceivedTime time.Time
-    lastMessageProcessTime  time.Time
-    lastMessageCompleteTime time.Time
-    lastMessageLatency      time.Duration
-    metricsMu               sync.Mutex
-}
-```
-
-Metrics are logged:
-```
-MQTT: Message processing latency: 2.185206666s (receive -> process -> complete)
-```
-
-### Fix 4: ForceReopen Optimization
-
-Removed unnecessary ForceReopen on first write attempt:
-
-```go
-// Updated SendAndReceive
-func (s *SerialPort) SendAndReceive(command string, maxRetries int) (string, error) {
-    for attempt := 0; attempt < maxRetries; attempt++ {
-        // Only force reopen on retry attempts (not first attempt)
-        if attempt > 0 {
-            _ = s.ForceReopen()
-        }
-        // ... rest of logic
-    }
-}
-```
+  ```go
+  if attempt > 0 {
+      _ = s.ForceReopen()
+  }
+  ```
 
 ---
 
 ## Implementation Details
 
-### Code Changes
+### File: [`internal/registers/reader.go`](../internal/registers/reader.go)
 
-#### File: `internal/registers/reader.go`
+**`Writer` fields:** `writePriorityTime`, `writePriorityTimeout`,
+`writePriorityMu`; `recentMessages` / `messageDedupeWindow` for dedup; and the
+message-timing metric fields.
 
-**Writer struct additions:**
-- `writePending atomic.Bool` - Atomic flag for write priority
-- `recentMessages map[string]MessageInfo` - Deduplication tracking
-- `messageDedupeWindow time.Duration` - Deduplication window (1 second)
-- Timing metric fields (`lastMessageReceivedTime`, etc.)
+**Key methods:** `SignalWritePriority()`, `ClearWritePriority()`,
+`isWritePriorityActive()`, `isDuplicateMessage()`, `cleanOldMessages()`, the
+`updateLastMessage*Time()` metric helpers, and `GetMessageMetrics()`.
+`HandleMessage()` runs the dedup check, signals priority, cancels the read, writes
++ verifies, and clears priority on success. `TriggerFullReadout()` skips the read
+when priority is active.
 
-**New methods:**
-- `SignalWritePriority()` - Sets atomic flag + sends to channel
-- `ClearWritePending()` - Clears atomic flag
-- `isDuplicateMessage(topic, value string) bool` - Deduplication check
-- `cleanOldMessages()` - Cleanup old deduplication entries
-- `updateLastMessageReceivedTime(t time.Time)` - Record receive time
-- `updateLastMessageProcessStartTime()` - Record process start
-- `updateLastMessageCompleteTime()` - Record completion, calculate latency
-- `GetMessageMetrics()` - Return current metrics
+### File: [`internal/serial/serial.go`](../internal/serial/serial.go)
 
-**Updated methods:**
-- `HandleMessage()` - Added deduplication check, timing metrics
-- `TriggerFullReadout()` - Added atomic flag check before channel check
+`SendAndReceive` serializes all device I/O under `writeMu` and force-reopens the
+port only on retry attempts.
 
-#### File: `internal/serial/serial.go`
-
-**SendAndReceive changes:**
-- ForceReopen now only called on retry attempts (`attempt > 0`)
-- First attempt uses existing port connection for faster response
-
-### Log Messages
-
-Key log messages to verify fix is working:
+### Key log messages
 
 | Log Message | Meaning |
 |-------------|---------|
-| `Write priority signaled` | MQTT message received, write priority set |
-| `Write priority detected (atomic flag)` | Periodic read skipped due to pending write |
-| `Write priority detected (channel)` | Periodic read skipped (backward compatibility) |
-| `MQTT: Message processing latency: X.XXs` | Total processing time from receive to complete |
-| `MQTT: Skipping duplicate message` | Deduplication prevented redundant processing |
+| `Write priority signaled` | MQTT message received, priority timestamp set |
+| `=== Write priority detected, skipping periodic read ===` | Periodic read skipped due to a pending write |
+| `Write priority expired after 10s timeout` | Priority auto-cleared after the timeout (e.g. after a failed write) |
+| `MQTT: Message processing latency: X.XXs ...` | End-to-end processing time |
+| `MQTT: Skipping duplicate message ...` | Deduplication prevented redundant processing |
 
 ---
 
-## Performance Improvements
+## Performance
 
-### Before Fix
+| Metric | Before | After |
+|--------|--------|-------|
+| MQTT message detection | delayed until next read cycle | immediate (<1 s) |
+| Write completion | tens of seconds | ~1-3 s |
+| ForceReopen on writes | every first attempt | only on retry attempts |
 
-| Metric | Value |
-|--------|-------|
-| MQTT message detection | 30+ seconds (delayed until next periodic read) |
-| Write operation time | 30+ seconds |
-| Serial read time | 10-20 seconds (due to ForceReopen) |
-| ForceReopen on writes | Every first attempt (5ms + port reopen) |
-
-### After Fix
-
-| Metric | Value |
-|--------|-------|
-| MQTT message detection | <1 second (immediate) |
-| Write operation time | 1-3 seconds |
-| Serial read time | 400ms (normal) |
-| ForceReopen on writes | Only on retry attempts |
-
-### Test Results
-
-```
-Test 1: Received=2, Written=1, Latency=5.76s
-Test 2: Received=1, Written=1
-Test 3: Received=1, Written=1
-Test 4: Received=1, Written=1
-Test 5: Received=1, Written=1
-```
-
-- MQTT messages now detected immediately upon arrival
-- Write operations complete in 1-3 seconds
-- Serial communication more reliable (no unnecessary port reopens)
+> The "before/after" figures are illustrative; actual read-cycle and write
+> durations depend on the serial config (`device_response_delay`,
+> `read_max_retries`, register count) and are reported in the logs per cycle.
 
 ---
 
 ## Testing and Verification
 
-### How to Verify the Fix
-
-1. **Start the application** with debug logging enabled:
+1. Start the application (debug logging helps):
    ```bash
-   ./aerosmart-gateway --config config.yaml --registers registers.yaml
+   ./aerosmart-gateway -config config.yaml -registers registers.yaml
    ```
-
-2. **Publish an MQTT message** to a write topic:
+2. Publish to a write topic:
    ```bash
    mosquitto_pub -t 'dw/aerosmart/luefterstufe' -m '2' -q 1
    ```
-
-3. **Check logs** for immediate response:
-   - Should see: `Received MQTT message on dw/aerosmart/luefterstufe: 2`
-   - Should see: `Write priority signaled`
-   - Should see: `=== Writing to device ===`
-   - Should see: `MQTT: Message processing latency: X.XXs`
-
-4. **Verify serial communication**:
-   - Serial reads should complete in ~400ms
-   - No unnecessary ForceReopen messages in logs
-
-### Expected Log Output
-
-```
-[2026-04-19 12:04:00] Received MQTT message on dw/aerosmart/luefterstufe: 2
-[2026-04-19 12:04:00] Write priority signaled
-[2026-04-19 12:04:00] === Writing to device ===
-[2026-04-19 12:04:01] SERIAL WRITE (took 0s): cmd="130 5002 2" response="..."
-[2026-04-19 12:04:01] Successfully wrote luefterstufe = 2 to device
-[2026-04-19 12:04:03] === Write operation completed ===
-[2026-04-19 12:04:03] MQTT: Message processing latency: 2.185206666s (receive -> process -> complete)
-```
-
-### Metrics to Monitor
-
-1. **Message Processing Latency**
-   - Target: <5 seconds
-   - Alert if: >10 seconds
-
-2. **Serial Read Time**
-   - Target: <500ms
-   - Alert if: >2000ms
-
-3. **Write Success Rate**
-   - Target: >90%
-   - Alert if: <80%
+3. Expect logs similar to:
+   ```
+   Received MQTT message on dw/aerosmart/luefterstufe: 2
+   Write priority signaled
+   === Writing to device ===
+   SERIAL WRITE: cmd="130 5002 2" response="..."
+   Successfully wrote luefterstufe = 2 to device
+   === Write operation completed ===
+   MQTT: Message processing latency: 2.18s (receive -> process -> complete)
+   ```
 
 ---
 
 ## Configuration
 
-### Current Configuration
+The mechanism needs no configuration; the two tunables are currently **hardcoded
+constants** set in `NewWriter`:
 
-The fix requires no additional configuration - it works automatically:
+| Setting | Value | Where |
+|---------|-------|-------|
+| Message deduplication window | 1 second | `messageDedupeWindow` in `NewWriter` |
+| Write priority timeout | 10 seconds | `writePriorityTimeout` in `NewWriter` |
 
-| Setting | Value | Description |
-|---------|-------|-------------|
-| Message Deduplication Window | 1 second | Time window to prevent duplicate processing |
-| Write Priority Detection | Atomic flag + channel | Dual mechanism for reliability |
-
-### Future Configuration Options
-
-Potential configurable options (not yet implemented):
-
-1. **Message Deduplication Window**
-   - Default: 1 second
-   - Range: 100ms - 10 seconds
-   - Purpose: Adjust deduplication window for different use cases
-
-2. **Write Priority Timeout**
-   - Default: None (unlimited)
-   - Purpose: Auto-clear write priority if processing takes too long
+Exposing these via `config.yaml` is a possible future enhancement; today they are
+compile-time constants.
 
 ---
 
 ## Related Documentation
 
-- [Application Flow Analysis](APPLICATION_FLOW.md) - Detailed flow diagrams
-- [Timing Diagrams](TIMING_DIAGRAMS.md) - Visual timing representations
-- [README.md](../README.md) - General application documentation
+- [Application Flow Analysis](APPLICATION_FLOW.md)
+- [Timing Diagrams](TIMING_DIAGRAMS.md)
+- [README.md](../README.md)

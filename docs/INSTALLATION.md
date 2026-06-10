@@ -84,13 +84,13 @@ Create a `config.yaml` file with the following structure:
 serial:
   port: "/dev/ttyUSB0"           # Serial device path
   baudrate: 115200               # Communication speed
-  read_timeout: 2                # Read timeout in milliseconds (0 = 200ms default)
+  read_timeout: 10               # Read timeout in milliseconds (0 = 200ms default)
   device_response_delay: 40      # Wait after write (ms)
   write_with_retry_delay: 10     # Write retry delay (ms)
   read_with_retry_delay: 100     # Read retry delay (ms)
   max_retries: 10                # Max operation retries
-  max_reopens: 10                # Max port reopen attempts
-  # Connection retry settings
+  max_reopens: 3                 # Max port reopen attempts (code default: 10)
+  # Connection retry settings (code defaults: 100ms / 10000ms)
   connect_retry_initial_delay_ms: 2
   connect_retry_max_delay_ms: 400
   connect_retry_jitter_percent: 25
@@ -123,12 +123,12 @@ device_id: "aerosmart"
 log_level: "debug"               # debug, info, warn, error
 
 logging:
-  log_file: "/var/log/aerosmart.log"  # Log file path (empty to disable)
+  # log_file: "/var/log/aerosmart.log"  # Uncomment to set the file logging path (default: /var/log/aerosmart.log)
   file_logging: false             # Enable file logging
   console_logging: true           # Enable console logging
 
 # Read interval in seconds
-read_interval: 60
+read_interval: 120
 
 # Home Assistant MQTT Discovery
 ha_discovery:
@@ -375,49 +375,24 @@ mosquitto_pub -t "dw/aerosmart/luefterstufe" -m "3"
 
 ### systemd (Linux)
 
-1. **Create the service file**:
+The repository ships a ready-to-use unit at [`docs/aerosmart.service`](aerosmart.service) and an installer [`docs/install.sh`](install.sh) that performs every step below automatically. To install manually:
+
+1. **Install the application files**:
 
 ```bash
-sudo nano /etc/systemd/system/aerosmart.service
-```
-
-2. **Add the following content**:
-
-```ini
-[Unit]
-Description=Aerosmart Gateway - Connects Aerosmart ventilation to MQTT
-After=network.target
-Wants=network.target
-
-[Service]
-Type=simple
-User=root
-ExecStart=/opt/aerosmart/aerosmart-gateway -config /opt/aerosmart/config.yaml -registers /opt/aerosmart/registers.yaml
-Restart=on-failure
-RestartSec=5
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-```
-
-3. **Install the application**:
-
-```bash
-# Create the installation directory
 sudo mkdir -p /opt/aerosmart
-
-# Copy the binary and configuration
 sudo cp aerosmart-gateway /opt/aerosmart/
-sudo cp config.yaml /opt/aerosmart/
-sudo cp registers.yaml /opt/aerosmart/
-
-# Set permissions
+sudo cp config.yaml registers.yaml /opt/aerosmart/
 sudo chmod +x /opt/aerosmart/aerosmart-gateway
 ```
 
-4. **Enable and start the service**:
+2. **Install the service unit** (the shipped unit gates startup on the serial device via `ConditionPathExists=/dev/ttyUSB0` and auto-restarts on failure):
+
+```bash
+sudo cp docs/aerosmart.service /etc/systemd/system/aerosmart.service
+```
+
+3. **Enable and start the service**:
 
 ```bash
 sudo systemctl daemon-reload
@@ -425,7 +400,7 @@ sudo systemctl enable aerosmart
 sudo systemctl start aerosmart
 ```
 
-5. **Check status**:
+4. **Check status**:
 
 ```bash
 sudo systemctl status aerosmart

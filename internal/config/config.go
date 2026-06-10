@@ -16,10 +16,10 @@ type SerialConfig struct {
 	Parity                     string `yaml:"parity"`                         // N
 	StopBits                   int    `yaml:"stopbits"`                       // 1
 	Timeout                    int    `yaml:"timeout"`                        // 0 (non-blocking)
-	XonXoff                    bool   `yaml:"xonxoff"`                        // true
+	XonXoff                    bool   `yaml:"xonxoff"`                        // false
 	DsrDtr                     bool   `yaml:"dsrdtr"`                         // false
 	WriteTimeout               int    `yaml:"write_timeout"`                  // 10
-	ReadTimeout                int    `yaml:"read_timeout"`                   // 1 (milliseconds, 0 = 200ms default)
+	ReadTimeout                int    `yaml:"read_timeout"`                   // 2 (milliseconds; 0 falls back to 200ms in the serial layer)
 	MaxReopens                 int    `yaml:"max_reopens"`                    // 10
 	DeadlineTimeout            int    `yaml:"deadline_timeout"`               // 150 (milliseconds)
 	WriteWithRetryDelay        int    `yaml:"write_with_retry_delay"`         // 10 (milliseconds)
@@ -28,8 +28,8 @@ type SerialConfig struct {
 	ReadMaxRetries             int    `yaml:"read_max_retries"`               // 10
 	WriteMaxRetries            int    `yaml:"write_max_retries"`              // 10
 	MaxRetries                 int    `yaml:"max_retries"`                    // 10 (max retries for register read/write operations)
-	ConnectRetryInitialDelayMs int    `yaml:"connect_retry_initial_delay_ms"` // 2 (ms)
-	ConnectRetryMaxDelayMs     int    `yaml:"connect_retry_max_delay_ms"`     // 400 (ms)
+	ConnectRetryInitialDelayMs int    `yaml:"connect_retry_initial_delay_ms"` // 100 (ms)
+	ConnectRetryMaxDelayMs     int    `yaml:"connect_retry_max_delay_ms"`     // 10000 (ms)
 	ConnectRetryJitterPercent  int    `yaml:"connect_retry_jitter_percent"`   // 25 (%)
 }
 
@@ -60,7 +60,7 @@ type DeviceInfoConfig struct {
 // HADiscoveryConfig holds Home Assistant discovery configuration
 type HADiscoveryConfig struct {
 	Enabled    bool             `yaml:"enabled"`
-	Prefix     string           `yaml:"prefix"`       // "homeassistant"
+	Prefix     string           `yaml:"prefix"` // "homeassistant"
 	DeviceInfo DeviceInfoConfig `yaml:"device_info"`
 }
 
