@@ -35,3 +35,7 @@ go.work.sum
 
 # Ansible
 .ansible
+
+# macos junk
+.DS_Store
+.claude
