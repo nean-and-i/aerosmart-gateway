@@ -353,6 +353,31 @@ func (c *AppConfig) Validate() error {
 	if c.MQTT.QOS < 0 || c.MQTT.QOS > 2 {
 		problems = append(problems, fmt.Sprintf("mqtt.qos: %d is not 0, 1 or 2", c.MQTT.QOS))
 	}
+	// Negative durations make the retry and reopen loops spin without waiting.
+	for _, d := range []struct {
+		key   string
+		value int
+	}{
+		{"serial.read_timeout", c.Serial.ReadTimeout},
+		{"serial.response_timeout", c.Serial.ResponseTimeout},
+		{"serial.retry_backoff", c.Serial.RetryBackoff},
+		{"serial.reopen_backoff", c.Serial.ReopenBackoff},
+		{"serial.reopen_max_backoff", c.Serial.ReopenMaxBackoff},
+		{"serial.health_check_interval", c.Serial.HealthCheckInterval},
+		{"serial.write_priority_timeout", c.Serial.WritePriorityTimeout},
+		{"mqtt.op_timeout", c.MQTT.OpTimeout},
+		{"mqtt.connect_retry_initial_delay_ms", c.MQTT.ConnectRetryInitialDelayMs},
+		{"mqtt.connect_retry_max_delay_ms", c.MQTT.ConnectRetryMaxDelayMs},
+		{"ha_discovery.expire_after", c.HADiscovery.ExpireAfter},
+	} {
+		if d.value < 0 {
+			problems = append(problems, fmt.Sprintf("%s: %d must not be negative", d.key, d.value))
+		}
+	}
+	if p := c.MQTT.ConnectRetryJitterPercent; p < 0 || p > 100 {
+		problems = append(problems, fmt.Sprintf("mqtt.connect_retry_jitter_percent: %d is not in 0..100", p))
+	}
+
 	if !c.Logging.ConsoleLogging && !c.Logging.FileLogging {
 		problems = append(problems, "logging: both console_logging and file_logging are disabled, "+
 			"so nothing would be logged anywhere")
@@ -363,6 +388,26 @@ func (c *AppConfig) Validate() error {
 	}
 	return nil
 }
+
+// EffectiveResponseTimeout is the response budget the serial layer will
+// actually use: read_timeout is rounded up to the kernel's 100ms granularity,
+// and a response can never arrive faster than one read, so a smaller
+// response_timeout is raised to it.
+func (c *AppConfig) EffectiveResponseTimeout() int {
+	readTimeout := c.Serial.ReadTimeout
+	if readTimeout < serialReadGranularityMs {
+		readTimeout = serialReadGranularityMs
+	} else if r := readTimeout % serialReadGranularityMs; r != 0 {
+		readTimeout += serialReadGranularityMs - r
+	}
+	if c.Serial.ResponseTimeout < readTimeout {
+		return readTimeout
+	}
+	return c.Serial.ResponseTimeout
+}
+
+// serialReadGranularityMs mirrors the kernel's termios VTIME resolution.
+const serialReadGranularityMs = 100
 
 // ValidateCycleBudget reports a retry budget that cannot finish a full readout
 // within one read interval.
@@ -375,7 +420,7 @@ func (c *AppConfig) ValidateCycleBudget(registerCount int) error {
 		return nil
 	}
 
-	perRegisterMs := c.Serial.Retries * (c.Serial.ResponseTimeout + c.Serial.RetryBackoff)
+	perRegisterMs := c.Serial.Retries * (c.EffectiveResponseTimeout() + c.Serial.RetryBackoff)
 	worstCycleMs := perRegisterMs * registerCount
 	if worstCycleMs <= c.ReadInterval*1000 {
 		return nil
@@ -385,7 +430,7 @@ func (c *AppConfig) ValidateCycleBudget(registerCount int) error {
 		"which exceeds read_interval (%ds); lower serial.retries or serial.response_timeout, "+
 		"or raise read_interval",
 		ErrInvalidConfig, registerCount, c.Serial.Retries,
-		c.Serial.ResponseTimeout+c.Serial.RetryBackoff,
+		c.EffectiveResponseTimeout()+c.Serial.RetryBackoff,
 		float64(worstCycleMs)/1000, c.ReadInterval)
 }
 

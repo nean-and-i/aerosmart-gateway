@@ -2,4 +2,7 @@ package main
 
 import "github.com/nean/aerosmart-gateway/internal/logger"
 
-func testMainLogger() *logger.Logger { return logger.New("error") }
+// testMainLogger discards output: several tests exercise error paths.
+func testMainLogger() *logger.Logger {
+	return logger.NewWithConfig(logger.Config{Level: "error", ConsoleLogging: false})
+}

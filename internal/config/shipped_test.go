@@ -29,6 +29,12 @@ func TestShippedConfigsValidate(t *testing.T) {
 	if err := ac.Validate(); err != nil {
 		t.Errorf("config.yaml is invalid:\n%v", err)
 	}
+	// The shipped retry budget must fit inside the shipped read interval.
+	if err := ac.ValidateCycleBudget(len(rc.ReadRegisters)); err != nil {
+		t.Errorf("shipped retry budget does not fit the read interval:\n%v", err)
+	}
+	t.Logf("%d read registers, worst-case cycle fits within the %ds interval",
+		len(rc.ReadRegisters), ac.ReadInterval)
 	for _, note := range ac.DeprecatedKeys() {
 		t.Logf("deprecated: %s", note)
 	}

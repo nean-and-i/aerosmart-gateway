@@ -93,7 +93,10 @@ func (p *fakePublisher) get(topic string) (string, bool) {
 	return v, ok
 }
 
-func testLogger() *logger.Logger { return logger.New("error") }
+// testLogger discards output: several tests exercise error paths on purpose.
+func testLogger() *logger.Logger {
+	return logger.NewWithConfig(logger.Config{Level: "error", ConsoleLogging: false})
+}
 
 var fanReg = config.ReadRegisterConfig{
 	Name: "luefterstatus", Command: "130 1067", Topic: "aerosmart/luefterstatus",
@@ -461,8 +464,8 @@ func TestPollerSkipsCycleWhileWriteIsPending(t *testing.T) {
 
 	gate.Preempt() // a write is in progress
 
-	if err := p.RunCycle(context.Background()); err != nil {
-		t.Fatalf("RunCycle() error = %v, want nil", err)
+	if err := p.RunCycle(context.Background()); !errors.Is(err, ErrCycleSkipped) {
+		t.Fatalf("RunCycle() error = %v, want ErrCycleSkipped", err)
 	}
 	if dev.callCount() != 0 {
 		t.Errorf("device called %d times during suppression, want 0", dev.callCount())
@@ -628,8 +631,8 @@ func TestPollerSkipsCycleWhilePortUnhealthy(t *testing.T) {
 	p := NewPoller(NewReader(dev, pub, testLogger(), []config.ReadRegisterConfig{fanReg}, 3, time.Millisecond),
 		nil, NewReadGate(time.Second), testLogger())
 
-	if err := p.RunCycle(context.Background()); err != nil {
-		t.Fatalf("RunCycle() error = %v, want nil", err)
+	if err := p.RunCycle(context.Background()); !errors.Is(err, ErrCycleSkipped) {
+		t.Fatalf("RunCycle() error = %v, want ErrCycleSkipped", err)
 	}
 	if dev.callCount() != 0 {
 		t.Errorf("device called %d times while the port was unhealthy, want 0", dev.callCount())
@@ -665,5 +668,52 @@ func TestHandleMessageAllowsValueChangeAndBack(t *testing.T) {
 	dev.mu.Unlock()
 	if writes != 3 {
 		t.Errorf("write commands sent = %d, want 3 (3, 0, 3)", writes)
+	}
+}
+
+// RawValue must carry what the device actually reported, so a suspicious
+// reading can be traced back; it was being filled with the processed value.
+func TestReadAllRecordsRawDeviceValue(t *testing.T) {
+	dev := &fakeDevice{responses: map[string]string{"130 201": "21500"}}
+	r := NewReader(dev, newFakePublisher(), testLogger(), []config.ReadRegisterConfig{tempReg}, 1, time.Millisecond)
+
+	values, err := r.ReadAll(context.Background())
+	if err != nil {
+		t.Fatalf("ReadAll() error = %v", err)
+	}
+	v := values["innentemp"]
+	if v == nil {
+		t.Fatal("innentemp missing")
+	}
+	if v.Value != "21.5" {
+		t.Errorf("Value = %q, want 21.5", v.Value)
+	}
+	if v.RawValue != "21500" {
+		t.Errorf("RawValue = %q, want the device value 21500", v.RawValue)
+	}
+}
+
+// A skipped cycle must be distinguishable, so the caller can retry sooner than
+// a full interval instead of losing minutes to a brief port blip.
+func TestPollerReportsSkippedCycle(t *testing.T) {
+	dev := &fakeDevice{unhealthy: true}
+	p := NewPoller(NewReader(dev, newFakePublisher(), testLogger(), []config.ReadRegisterConfig{fanReg}, 1, time.Millisecond),
+		nil, NewReadGate(time.Second), testLogger())
+
+	err := p.RunCycle(context.Background())
+	if !errors.Is(err, ErrCycleSkipped) {
+		t.Fatalf("RunCycle() error = %v, want ErrCycleSkipped", err)
+	}
+}
+
+func TestPollerReportsSkippedCycleWhenSuppressed(t *testing.T) {
+	dev := &fakeDevice{responses: map[string]string{"130 1067": "3"}}
+	gate := NewReadGate(time.Hour)
+	p := NewPoller(NewReader(dev, newFakePublisher(), testLogger(), []config.ReadRegisterConfig{fanReg}, 1, time.Millisecond),
+		nil, gate, testLogger())
+	gate.Preempt()
+
+	if err := p.RunCycle(context.Background()); !errors.Is(err, ErrCycleSkipped) {
+		t.Fatalf("RunCycle() error = %v, want ErrCycleSkipped", err)
 	}
 }

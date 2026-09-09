@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	paho "github.com/eclipse/paho.mqtt.golang"
@@ -60,6 +61,10 @@ type Client struct {
 
 	subMu            sync.RWMutex
 	subscribedTopics map[string]MessageHandler
+
+	// shuttingDown makes publishes fail fast instead of sleeping through their
+	// retry backoff, which could otherwise outlast the shutdown grace period.
+	shuttingDown atomic.Bool
 }
 
 // NewClient creates a new MQTT client.
@@ -204,6 +209,9 @@ func (c *Client) resubscribeAll() {
 }
 
 // Disconnect marks the gateway offline and closes the connection.
+//
+// Publishes stop retrying from here on, so a broker that has gone away cannot
+// stretch shutdown past its grace period.
 func (c *Client) Disconnect() {
 	client := c.handle()
 	if client == nil {
@@ -214,6 +222,7 @@ func (c *Client) Disconnect() {
 			c.logger.Warn("MQTT failed to publish offline state: %v", err)
 		}
 	}
+	c.shuttingDown.Store(true)
 	client.Disconnect(250)
 
 	c.mu.Lock()
@@ -242,6 +251,9 @@ func (c *Client) publishRetained(topic string, value string, retain bool) error 
 	var lastErr error
 	for attempt := 1; attempt <= attempts; attempt++ {
 		if attempt > 1 {
+			if c.shuttingDown.Load() {
+				return lastErr
+			}
 			time.Sleep(time.Duration(attempt-1) * 250 * time.Millisecond)
 		}
 		client := c.handle()

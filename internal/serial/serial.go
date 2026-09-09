@@ -29,10 +29,6 @@ import (
 // ErrPortNotOpen is returned when an operation needs an open port and has none.
 var ErrPortNotOpen = errors.New("serial: port not open")
 
-// ErrUnsupportedOption is returned at construction for a configured option the
-// driver cannot honour, rather than silently ignoring it.
-var ErrUnsupportedOption = errors.New("serial: unsupported option")
-
 // Logger is the subset of logging this package needs.
 type Logger interface {
 	Debug(format string, args ...interface{})
@@ -263,15 +259,6 @@ func (s *SerialPort) markUnhealthy(cause error) {
 		s.log.Error("serial: port %s marked unhealthy: %v", s.cfg.Port, cause)
 	}
 }
-
-// GetPortName returns the configured device path.
-func (s *SerialPort) GetPortName() string { return s.cfg.Port }
-
-// GetBaudRate returns the configured baud rate.
-func (s *SerialPort) GetBaudRate() int { return s.cfg.BaudRate }
-
-// ResponseTimeout returns the per-transaction budget.
-func (s *SerialPort) ResponseTimeout() time.Duration { return s.cfg.ResponseTimeout }
 
 // session returns the current port and frame reader. Callers must hold txMu,
 // which guarantees the port is not swapped while they use it.

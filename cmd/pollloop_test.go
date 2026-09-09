@@ -6,6 +6,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/nean/aerosmart-gateway/internal/registers"
 )
 
 type countingCycler struct {
@@ -46,7 +48,7 @@ func TestPollLoopRunsImmediatelyThenStopsOnCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	done := make(chan struct{})
-	go func() { pollLoop(ctx, c, time.Hour, testMainLogger()); close(done) }()
+	go func() { pollLoop(ctx, c, time.Hour, 10*time.Millisecond, testMainLogger()); close(done) }()
 
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) && c.count() == 0 {
@@ -71,7 +73,7 @@ func TestPollLoopContinuesAfterCycleError(t *testing.T) {
 	defer cancel()
 
 	done := make(chan struct{})
-	go func() { pollLoop(ctx, c, 10*time.Millisecond, testMainLogger()); close(done) }()
+	go func() { pollLoop(ctx, c, 10*time.Millisecond, 10*time.Millisecond, testMainLogger()); close(done) }()
 
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) && c.count() < 3 {
@@ -93,7 +95,7 @@ func TestPollLoopWaitsIntervalAfterCycleEnds(t *testing.T) {
 	defer cancel()
 
 	done := make(chan struct{})
-	go func() { pollLoop(ctx, c, interval, testMainLogger()); close(done) }()
+	go func() { pollLoop(ctx, c, interval, interval, testMainLogger()); close(done) }()
 
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
@@ -131,7 +133,7 @@ func TestPollLoopContinuesAfterPreemptedCycle(t *testing.T) {
 	defer cancel()
 
 	done := make(chan struct{})
-	go func() { pollLoop(ctx, c, 10*time.Millisecond, testMainLogger()); close(done) }()
+	go func() { pollLoop(ctx, c, 10*time.Millisecond, 10*time.Millisecond, testMainLogger()); close(done) }()
 
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) && c.count() < 3 {
@@ -147,4 +149,28 @@ func TestPollLoopContinuesAfterPreemptedCycle(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("pollLoop did not return after the parent context was cancelled")
 	}
+}
+
+// A skipped cycle (port recovering, or a write in flight) must be retried
+// sooner than a full interval, or a half-second blip costs two intervals of
+// data.
+func TestPollLoopRetriesSoonAfterSkippedCycle(t *testing.T) {
+	c := &countingCycler{err: registers.ErrCycleSkipped}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() { pollLoop(ctx, c, time.Hour, 10*time.Millisecond, testMainLogger()); close(done) }()
+
+	// With a one-hour interval, a second cycle can only happen if a skip uses
+	// the short retry delay instead.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && c.count() < 2 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if c.count() < 2 {
+		t.Fatalf("cycles run = %d, want at least 2; a skipped cycle waited the full interval", c.count())
+	}
+	cancel()
+	<-done
 }

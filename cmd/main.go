@@ -29,8 +29,15 @@ var (
 	version       = "1.0.0"
 )
 
-// shutdownGrace bounds the orderly shutdown before the process is forced down.
-const shutdownGrace = 10 * time.Second
+const (
+	// shutdownGrace bounds the orderly shutdown before the process is forced
+	// down.
+	shutdownGrace = 10 * time.Second
+
+	// skipRetryDelay is how soon to retry after a cycle that read nothing,
+	// rather than waiting a whole read interval.
+	skipRetryDelay = 5 * time.Second
+)
 
 func init() {
 	flag.StringVar(&configPath, "config", "config.yaml", "Path to config file")
@@ -173,6 +180,10 @@ func run() error {
 		appConfig.MQTT.ConnectRetryInitialDelayMs,
 		appConfig.MQTT.ConnectRetryMaxDelayMs,
 		appConfig.MQTT.ConnectRetryJitterPercent); err != nil {
+		// Stop the supervisor before closing, or it reopens the port as the
+		// process exits and toggles DTR/RTS at the device.
+		cancel()
+		wg.Wait()
 		_ = serialPort.Close()
 		return fmt.Errorf("mqtt: %w", err)
 	}
@@ -217,7 +228,7 @@ func run() error {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		pollLoop(ctx, poller, time.Duration(appConfig.ReadInterval)*time.Second, log)
+		pollLoop(ctx, poller, time.Duration(appConfig.ReadInterval)*time.Second, skipRetryDelay, log)
 	}()
 
 	<-ctx.Done()
@@ -275,9 +286,16 @@ type cycler interface {
 // The wait is measured from the end of each cycle rather than from a fixed
 // ticker, so a readout that overruns the interval still leaves the device an
 // idle gap instead of being polled back-to-back.
-func pollLoop(ctx context.Context, c cycler, interval time.Duration, log *logger.Logger) {
+//
+// skipDelay is used instead of interval when a cycle read nothing (a write was
+// in flight, or the port is being recovered), so a momentary blip does not
+// cost a whole interval of data.
+func pollLoop(ctx context.Context, c cycler, interval, skipDelay time.Duration, log *logger.Logger) {
 	if interval <= 0 {
 		interval = time.Minute
+	}
+	if skipDelay <= 0 || skipDelay > interval {
+		skipDelay = interval
 	}
 
 	for {
@@ -290,10 +308,16 @@ func pollLoop(ctx context.Context, c cycler, interval time.Duration, log *logger
 			log.Info("Read loop stopped")
 			return
 		}
+		wait := interval
 		switch {
 		case err == nil:
 		case errors.Is(err, context.Canceled):
 			log.Debug("Read cycle preempted by a write")
+			wait = skipDelay
+		case errors.Is(err, registers.ErrCycleSkipped):
+			// Nothing was read, so waiting a whole interval would lose data
+			// over what may be a momentary blip.
+			wait = skipDelay
 		default:
 			log.Error("Read cycle failed: %v", err)
 		}
@@ -302,7 +326,7 @@ func pollLoop(ctx context.Context, c cycler, interval time.Duration, log *logger
 		case <-ctx.Done():
 			log.Info("Read loop stopped")
 			return
-		case <-time.After(interval):
+		case <-time.After(wait):
 		}
 	}
 }
