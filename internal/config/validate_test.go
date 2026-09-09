@@ -254,3 +254,39 @@ logging:
 		t.Fatal("Validate() = nil, want an error about having no log sink")
 	}
 }
+
+// The budget guard must account for the whole cycle: a per-register figure can
+// never exceed a read interval and so never fires.
+func TestValidateCycleBudgetUsesRegisterCount(t *testing.T) {
+	cfg, err := LoadAppConfig(writeConfig(t, `
+mqtt:
+  broker: "x"
+read_interval: 30
+serial:
+  retries: 3
+  response_timeout: 300
+  retry_backoff: 100
+`))
+	if err != nil {
+		t.Fatalf("LoadAppConfig() error = %v", err)
+	}
+
+	// 3 attempts x 400ms = 1.2s per register; 40 registers is 48s > 30s.
+	if err := cfg.ValidateCycleBudget(40); err == nil {
+		t.Fatal("ValidateCycleBudget(40) = nil, want an error: the worst-case cycle overruns the interval")
+	}
+	// 10 registers is 12s, comfortably inside 30s.
+	if err := cfg.ValidateCycleBudget(10); err != nil {
+		t.Errorf("ValidateCycleBudget(10) error = %v, want nil", err)
+	}
+}
+
+func TestValidateCycleBudgetIgnoresZeroRegisters(t *testing.T) {
+	cfg, err := LoadAppConfig(writeConfig(t, "mqtt:\n  broker: \"x\"\n"))
+	if err != nil {
+		t.Fatalf("LoadAppConfig() error = %v", err)
+	}
+	if err := cfg.ValidateCycleBudget(0); err != nil {
+		t.Errorf("ValidateCycleBudget(0) error = %v, want nil", err)
+	}
+}

@@ -150,8 +150,11 @@ type SerialPort struct {
 	healthy bool
 }
 
-// New creates a serial port from cfg. It returns an error for options the
-// driver cannot honour, instead of ignoring them.
+// New creates a serial port from cfg.
+//
+// Options this driver cannot honour (xonxoff, dsrdtr) are rejected earlier, by
+// config.AppConfig.Validate, so an unusable setting fails at startup rather
+// than being silently ignored here.
 func New(cfg Config, log Logger) *SerialPort {
 	cfg.applyDefaults(log)
 	s := &SerialPort{cfg: cfg, log: log}
@@ -160,30 +163,6 @@ func New(cfg Config, log Logger) *SerialPort {
 		s.opener = s.openTarm
 	}
 	return s
-}
-
-// Validate reports configured options this driver cannot honour. Callers
-// should treat a non-nil result as fatal: silently ignoring flow control means
-// XON/XOFF bytes are parsed as frame data.
-func (c *Config) Validate() error {
-	if c.XonXoff {
-		return fmt.Errorf("%w: xonxoff (software flow control) is not supported by the tarm/serial driver", ErrUnsupportedOption)
-	}
-	if c.DsrDtr {
-		return fmt.Errorf("%w: dsrdtr (hardware flow control) is not supported by the tarm/serial driver", ErrUnsupportedOption)
-	}
-	switch strings.ToUpper(c.Parity) {
-	case "N", "O", "E":
-	default:
-		return fmt.Errorf("%w: parity %q", ErrUnsupportedOption, c.Parity)
-	}
-	if c.DataBits < 5 || c.DataBits > 8 {
-		return fmt.Errorf("%w: bytesize %d", ErrUnsupportedOption, c.DataBits)
-	}
-	if c.StopBits != 1 && c.StopBits != 2 {
-		return fmt.Errorf("%w: stopbits %d", ErrUnsupportedOption, c.StopBits)
-	}
-	return nil
 }
 
 // openTarm opens the real device with every configured line setting applied.
@@ -235,7 +214,13 @@ func (s *SerialPort) openLocked() error {
 }
 
 // Close closes the port. It is idempotent.
+//
+// It takes txMu so it waits for any in-flight transaction to finish rather
+// than closing the device mid-exchange.
 func (s *SerialPort) Close() error {
+	s.txMu.Lock()
+	defer s.txMu.Unlock()
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.closeLocked()
@@ -360,30 +345,43 @@ func (s *SerialPort) Transact(ctx context.Context, command string) (string, erro
 // transient read failure cannot trigger a device-resetting reopen.
 func (s *SerialPort) Supervise(ctx context.Context) {
 	backoff := s.cfg.ReopenBackoff
+	var healthySince time.Time
+
 	for {
 		if ctx.Err() != nil {
 			return
 		}
 		if s.IsHealthy() {
-			backoff = s.cfg.ReopenBackoff
+			if healthySince.IsZero() {
+				healthySince = time.Now()
+			}
+			// Only treat the port as genuinely recovered once it has stayed
+			// healthy for a while; otherwise a port that opens but keeps
+			// failing I/O would reset the backoff and be reopened in a loop.
+			if time.Since(healthySince) >= s.cfg.MaxReopenBackoff {
+				backoff = s.cfg.ReopenBackoff
+			}
 			if !sleepCtx(ctx, s.cfg.HealthCheckInterval) {
 				return
 			}
 			continue
 		}
+		healthySince = time.Time{}
 
 		if err := s.reopen(); err != nil {
 			s.log.Warn("serial: reopen of %s failed, retrying in %v: %v", s.cfg.Port, backoff, err)
-			if !sleepCtx(ctx, backoff) {
-				return
-			}
-			if backoff *= 2; backoff > s.cfg.MaxReopenBackoff {
-				backoff = s.cfg.MaxReopenBackoff
-			}
-			continue
+		} else {
+			s.log.Info("serial: port %s reopened, holding off %v before another attempt", s.cfg.Port, backoff)
 		}
-		s.log.Info("serial: port %s reopened", s.cfg.Port)
-		backoff = s.cfg.ReopenBackoff
+
+		// Wait after every attempt, successful or not: reopening toggles
+		// DTR/RTS, which many devices treat as a reset.
+		if !sleepCtx(ctx, backoff) {
+			return
+		}
+		if backoff *= 2; backoff > s.cfg.MaxReopenBackoff {
+			backoff = s.cfg.MaxReopenBackoff
+		}
 	}
 }
 

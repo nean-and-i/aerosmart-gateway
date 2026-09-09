@@ -5,7 +5,9 @@ import (
 	"errors"
 	"log"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 // captureLogger returns a logger writing into buf at the given level.
@@ -72,4 +74,38 @@ func TestErrorAlwaysLogged(t *testing.T) {
 	if !strings.Contains(out, "loud 1") {
 		t.Errorf("output = %q, want the error message", out)
 	}
+}
+
+// Close runs during shutdown while other goroutines may still be logging.
+func TestConcurrentLoggingAndClose(t *testing.T) {
+	dir := t.TempDir()
+	l := NewWithConfig(Config{
+		Level:          "debug",
+		LogFile:        dir + "/test.log",
+		FileLogging:    true,
+		ConsoleLogging: false,
+	})
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			for j := 0; j < 50; j++ {
+				l.Info("worker %d line %d", n, j)
+			}
+		}(i)
+	}
+
+	time.Sleep(2 * time.Millisecond)
+	if err := l.Close(); err != nil {
+		t.Errorf("Close() error = %v", err)
+	}
+	wg.Wait()
+
+	// Close must be idempotent: shutdown paths can reach it twice.
+	if err := l.Close(); err != nil {
+		t.Errorf("second Close() error = %v", err)
+	}
+	l.Info("after close must not panic")
 }

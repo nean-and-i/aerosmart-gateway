@@ -311,3 +311,51 @@ func TestWritePreemptsAnInFlightReadCycle(t *testing.T) {
 		t.Fatal("read cycle did not yield to a write")
 	}
 }
+
+// End-to-end guard for the regression the review caught: a write preempts a
+// cycle, whose context.Canceled must not be mistaken for shutdown. Polling has
+// to carry on afterwards.
+func TestPollingSurvivesAWritePreemption(t *testing.T) {
+	dev := &lossyDevice{chunk: 2}
+	log := logger.New("error")
+	sp := serial.New(serial.Config{
+		Port:            "/dev/fake",
+		ReadTimeout:     100 * time.Millisecond,
+		ResponseTimeout: 200 * time.Millisecond,
+		ReopenBackoff:   time.Millisecond,
+		Opener:          func() (serial.Port, error) { return dev, nil },
+	}, log)
+	if err := sp.Open(); err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer func() { _ = sp.Close() }()
+
+	pub := newRecordingPublisher()
+	gate := registers.NewReadGate(50 * time.Millisecond)
+	reader := registers.NewReader(sp, pub, log, readRegisters, 3, 10*time.Millisecond)
+	poller := registers.NewPoller(reader, nil, gate, log)
+
+	// First cycle succeeds.
+	if err := poller.RunCycle(context.Background()); err != nil {
+		t.Fatalf("first RunCycle() error = %v", err)
+	}
+
+	// A write arrives and preempts.
+	gate.Preempt()
+	if err := poller.RunCycle(context.Background()); err != nil {
+		t.Fatalf("suppressed RunCycle() error = %v, want nil", err)
+	}
+	gate.Release()
+
+	// Polling must still work afterwards.
+	pub.mu.Lock()
+	pub.seen = map[string]string{}
+	pub.mu.Unlock()
+
+	if err := poller.RunCycle(context.Background()); err != nil {
+		t.Fatalf("RunCycle() after preemption error = %v", err)
+	}
+	if v, ok := pub.get("aerosmart/luefterstatus"); !ok || v != "3" {
+		t.Errorf("luefterstatus after preemption = %q (%v), want 3; polling did not resume", v, ok)
+	}
+}

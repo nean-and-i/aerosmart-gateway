@@ -50,27 +50,26 @@ type MessageHandler func(topic string, message string)
 
 // Client is an MQTT client for talking to Home Assistant.
 type Client struct {
+	// mu guards client, which is replaced on every Connect attempt and read
+	// from paho's callback goroutines and the read loop.
+	mu     sync.RWMutex
 	client paho.Client
+
 	config *MQTTConfig
 	logger Logger
-
-	deviceID        string
-	discoveryPrefix string
 
 	subMu            sync.RWMutex
 	subscribedTopics map[string]MessageHandler
 }
 
 // NewClient creates a new MQTT client.
-func NewClient(config *MQTTConfig, deviceID string, discoveryPrefix string, log Logger) *Client {
+func NewClient(config *MQTTConfig, log Logger) *Client {
 	if config != nil && config.OpTimeout <= 0 {
 		config.OpTimeout = 5 * time.Second
 	}
 	return &Client{
 		config:           config,
 		logger:           log,
-		deviceID:         deviceID,
-		discoveryPrefix:  discoveryPrefix,
 		subscribedTopics: make(map[string]MessageHandler),
 	}
 }
@@ -119,9 +118,17 @@ func (c *Client) Connect() error {
 		go c.onConnected()
 	})
 
-	c.client = paho.NewClient(opts)
+	// Tear down any client from a previous attempt: left running it would keep
+	// trying to connect under the same ClientID and its OnConnect could still
+	// fire against this Client.
+	c.closeExisting()
 
-	token := c.client.Connect()
+	client := paho.NewClient(opts)
+	c.mu.Lock()
+	c.client = client
+	c.mu.Unlock()
+
+	token := client.Connect()
 	if !token.WaitTimeout(c.config.OpTimeout) {
 		return fmt.Errorf("connect to %s timed out after %v", broker, c.config.OpTimeout)
 	}
@@ -129,6 +136,25 @@ func (c *Client) Connect() error {
 		return fmt.Errorf("connect to %s: %w", broker, err)
 	}
 	return nil
+}
+
+// closeExisting disconnects a client left over from an earlier attempt.
+func (c *Client) closeExisting() {
+	c.mu.Lock()
+	previous := c.client
+	c.client = nil
+	c.mu.Unlock()
+
+	if previous != nil {
+		previous.Disconnect(0)
+	}
+}
+
+// handle returns the current paho client, or nil.
+func (c *Client) handle() paho.Client {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.client
 }
 
 // onConnected restores subscriptions and announces availability.
@@ -179,21 +205,27 @@ func (c *Client) resubscribeAll() {
 
 // Disconnect marks the gateway offline and closes the connection.
 func (c *Client) Disconnect() {
-	if c.client == nil {
+	client := c.handle()
+	if client == nil {
 		return
 	}
-	if c.IsConnected() {
+	if client.IsConnected() {
 		if err := c.publishAvailability(payloadOffline); err != nil {
 			c.logger.Warn("MQTT failed to publish offline state: %v", err)
 		}
 	}
-	c.client.Disconnect(250)
+	client.Disconnect(250)
+
+	c.mu.Lock()
+	c.client = nil
+	c.mu.Unlock()
 }
 
 // IsConnected reports whether the broker connection is up. It asks paho rather
 // than tracking a flag, so it cannot drift from reality.
 func (c *Client) IsConnected() bool {
-	return c.client != nil && c.client.IsConnected()
+	client := c.handle()
+	return client != nil && client.IsConnected()
 }
 
 // Publish publishes a value, retrying with backoff.
@@ -202,10 +234,6 @@ func (c *Client) Publish(topic string, value string) error {
 }
 
 func (c *Client) publishRetained(topic string, value string, retain bool) error {
-	if c.client == nil {
-		return fmt.Errorf("publish to %s: MQTT client not initialised", topic)
-	}
-
 	attempts := c.config.PublishRetryCount
 	if attempts <= 0 {
 		attempts = 3
@@ -216,12 +244,13 @@ func (c *Client) publishRetained(topic string, value string, retain bool) error 
 		if attempt > 1 {
 			time.Sleep(time.Duration(attempt-1) * 250 * time.Millisecond)
 		}
-		if !c.IsConnected() {
+		client := c.handle()
+		if client == nil || !client.IsConnected() {
 			lastErr = fmt.Errorf("publish to %s: not connected", topic)
 			continue
 		}
 
-		token := c.client.Publish(topic, byte(c.config.QOS), retain, value)
+		token := client.Publish(topic, byte(c.config.QOS), retain, value)
 		if !token.WaitTimeout(c.config.OpTimeout) {
 			// Retained state publishes are last-write-wins, so a retry after
 			// an unacknowledged publish is safe.
@@ -239,7 +268,7 @@ func (c *Client) publishRetained(topic string, value string, retain bool) error 
 
 // Subscribe subscribes to a topic and tracks it for recovery on reconnect.
 func (c *Client) Subscribe(topic string, handler MessageHandler) error {
-	if c.client == nil {
+	if c.handle() == nil {
 		return fmt.Errorf("subscribe to %s: MQTT client not initialised", topic)
 	}
 
@@ -251,11 +280,16 @@ func (c *Client) Subscribe(topic string, handler MessageHandler) error {
 }
 
 func (c *Client) subscribe(topic string, handler MessageHandler) error {
+	client := c.handle()
+	if client == nil {
+		return fmt.Errorf("subscribe to %s: no MQTT client", topic)
+	}
+
 	callback := func(_ paho.Client, msg paho.Message) {
 		handler(msg.Topic(), string(msg.Payload()))
 	}
 
-	token := c.client.Subscribe(topic, byte(c.config.QOS), callback)
+	token := client.Subscribe(topic, byte(c.config.QOS), callback)
 	if !token.WaitTimeout(c.config.OpTimeout) {
 		return fmt.Errorf("subscribe to %s timed out after %v", topic, c.config.OpTimeout)
 	}

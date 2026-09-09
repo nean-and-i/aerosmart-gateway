@@ -121,3 +121,30 @@ func TestPollLoopWaitsIntervalAfterCycleEnds(t *testing.T) {
 		t.Errorf("gap between cycle completions = %v, want at least the %v interval", gap, interval)
 	}
 }
+
+// A write preempting a read cycle cancels that cycle's context, which must not
+// be mistaken for shutdown: doing so stopped periodic polling permanently
+// after the first MQTT command.
+func TestPollLoopContinuesAfterPreemptedCycle(t *testing.T) {
+	c := &countingCycler{err: context.Canceled}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() { pollLoop(ctx, c, 10*time.Millisecond, testMainLogger()); close(done) }()
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) && c.count() < 3 {
+		time.Sleep(2 * time.Millisecond)
+	}
+	if c.count() < 3 {
+		t.Fatalf("cycles run = %d, want at least 3; a preempted cycle ended the loop", c.count())
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("pollLoop did not return after the parent context was cancelled")
+	}
+}

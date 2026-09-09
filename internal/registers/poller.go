@@ -26,12 +26,18 @@ func NewPoller(reader *Reader, derived *DerivedCalculator, gate *ReadGate, log *
 // some registers from this cycle and leave others stale, and derived values
 // would be computed from sources that were never read.
 func (p *Poller) RunCycle(ctx context.Context) error {
-	if p.gate.Suppressed() {
-		p.logger.Info("=== Write in progress, skipping this read cycle ===")
+	// Reading 30+ registers through their retries against a port the
+	// supervisor is still reopening would burn the whole interval.
+	if !p.reader.DeviceHealthy() {
+		p.logger.Warn("=== Serial port unhealthy, skipping this read cycle ===")
 		return nil
 	}
 
-	cycleCtx, cancel := p.gate.BeginCycle(ctx)
+	cycleCtx, cancel, ok := p.gate.TryBeginCycle(ctx)
+	if !ok {
+		p.logger.Info("=== Write in progress, skipping this read cycle ===")
+		return nil
+	}
 	defer cancel()
 
 	values, err := p.reader.ReadAll(cycleCtx)

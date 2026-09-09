@@ -166,7 +166,7 @@ func run() error {
 		PublishRetryCount: appConfig.MQTT.PublishRetryCount,
 		AvailabilityTopic: appConfig.MQTT.AvailabilityTopic,
 		OpTimeout:         msDuration(appConfig.MQTT.OpTimeout),
-	}, appConfig.DeviceID, appConfig.HADiscovery.Prefix, log)
+	}, log)
 
 	log.Info("Connecting to MQTT broker %s:%d...", appConfig.MQTT.Broker, appConfig.MQTT.Port)
 	if err := connectMQTTWithRetry(ctx, mqttClient, log, 10,
@@ -198,6 +198,10 @@ func run() error {
 		log.Info("Subscribing to command topics: %v", topics)
 		for _, topic := range topics {
 			handler := func(t string, msg string) {
+				if ctx.Err() != nil {
+					log.Warn("Ignoring command on %s during shutdown", t)
+					return
+				}
 				log.Debug("MQTT message on %s: %s", t, msg)
 				if err := writer.HandleMessage(ctx, t, msg); err != nil {
 					log.Error("Command on %s failed: %v", t, err)
@@ -218,11 +222,13 @@ func run() error {
 
 	<-ctx.Done()
 
-	// Let in-flight work finish before tearing down the resources it uses.
+	// Disconnect first so no further commands are delivered, then wait for the
+	// loops, then close the port. Close takes the transaction lock, so a write
+	// already on the wire completes before the device is released.
 	log.Info("Shutdown initiated, waiting for in-flight work...")
+	mqttClient.Disconnect()
 	wg.Wait()
 
-	mqttClient.Disconnect()
 	if err := serialPort.Close(); err != nil {
 		log.Error("Error closing serial port: %v", err)
 	}
@@ -252,6 +258,9 @@ func loadConfig() (*config.AppConfig, *config.RegistersConfig, error) {
 	if err := registersConfig.Validate(); err != nil {
 		return nil, nil, err
 	}
+	if err := appConfig.ValidateCycleBudget(len(registersConfig.ReadRegisters)); err != nil {
+		return nil, nil, err
+	}
 
 	return appConfig, registersConfig, nil
 }
@@ -272,11 +281,20 @@ func pollLoop(ctx context.Context, c cycler, interval time.Duration, log *logger
 	}
 
 	for {
-		if err := c.RunCycle(ctx); err != nil {
-			if errors.Is(err, context.Canceled) {
-				log.Info("Read loop stopped")
-				return
-			}
+		err := c.RunCycle(ctx)
+
+		// Only the parent context ending means shutdown. A cycle preempted by
+		// an incoming write also reports context.Canceled, and must not end
+		// the loop.
+		if ctx.Err() != nil {
+			log.Info("Read loop stopped")
+			return
+		}
+		switch {
+		case err == nil:
+		case errors.Is(err, context.Canceled):
+			log.Debug("Read cycle preempted by a write")
+		default:
 			log.Error("Read cycle failed: %v", err)
 		}
 
