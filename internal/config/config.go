@@ -1,77 +1,137 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
 
-// SerialConfig holds serial port configuration
+// ErrInvalidConfig wraps every configuration validation failure.
+var ErrInvalidConfig = errors.New("invalid configuration")
+
+// SerialConfig holds serial port configuration.
+//
+// Timeouts are milliseconds. Note that the kernel expresses a serial read
+// timeout in deciseconds, so ReadTimeout is rounded up to a multiple of 100ms
+// by the serial layer.
 type SerialConfig struct {
-	Port                       string `yaml:"port"`
-	BaudRate                   int    `yaml:"baudrate"`
-	ByteSize                   int    `yaml:"bytesize"`                       // 8
-	Parity                     string `yaml:"parity"`                         // N
-	StopBits                   int    `yaml:"stopbits"`                       // 1
-	Timeout                    int    `yaml:"timeout"`                        // 0 (non-blocking)
-	XonXoff                    bool   `yaml:"xonxoff"`                        // false
-	DsrDtr                     bool   `yaml:"dsrdtr"`                         // false
-	WriteTimeout               int    `yaml:"write_timeout"`                  // 10
-	ReadTimeout                int    `yaml:"read_timeout"`                   // 2 (milliseconds; 0 falls back to 200ms in the serial layer)
-	MaxReopens                 int    `yaml:"max_reopens"`                    // 10
-	DeadlineTimeout            int    `yaml:"deadline_timeout"`               // 150 (milliseconds)
-	WriteWithRetryDelay        int    `yaml:"write_with_retry_delay"`         // 10 (milliseconds)
-	DeviceResponseDelay        int    `yaml:"device_response_delay"`          // 40 (milliseconds)
-	ReadWithRetryDelay         int    `yaml:"read_with_retry_delay"`          // 100 (milliseconds)
-	ReadMaxRetries             int    `yaml:"read_max_retries"`               // 10
-	WriteMaxRetries            int    `yaml:"write_max_retries"`              // 10
-	MaxRetries                 int    `yaml:"max_retries"`                    // 10 (max retries for register read/write operations)
-	ConnectRetryInitialDelayMs int    `yaml:"connect_retry_initial_delay_ms"` // 100 (ms)
-	ConnectRetryMaxDelayMs     int    `yaml:"connect_retry_max_delay_ms"`     // 10000 (ms)
-	ConnectRetryJitterPercent  int    `yaml:"connect_retry_jitter_percent"`   // 25 (%)
+	Port     string `yaml:"port"`
+	BaudRate int    `yaml:"baudrate"`
+	ByteSize int    `yaml:"bytesize"` // 5-8
+	Parity   string `yaml:"parity"`   // N, O or E
+	StopBits int    `yaml:"stopbits"` // 1 or 2
+
+	// ReadTimeout is how long a single read may block, in milliseconds.
+	// Rounded up to a multiple of 100 (kernel VTIME granularity).
+	ReadTimeout int `yaml:"read_timeout"`
+
+	// ResponseTimeout is the budget for one command/response exchange, in
+	// milliseconds.
+	ResponseTimeout int `yaml:"response_timeout"`
+
+	// Retries is the total number of attempts per register operation. This is
+	// the only retry level: nesting retries multiplies the worst case.
+	Retries int `yaml:"retries"`
+
+	// RetryBackoff is the delay between attempts, in milliseconds.
+	RetryBackoff int `yaml:"retry_backoff"`
+
+	// ReopenBackoff and ReopenMaxBackoff bound how fast the supervisor
+	// reopens a failed port, in milliseconds.
+	ReopenBackoff    int `yaml:"reopen_backoff"`
+	ReopenMaxBackoff int `yaml:"reopen_max_backoff"`
+
+	// HealthCheckInterval is how often port health is polled, in milliseconds.
+	HealthCheckInterval int `yaml:"health_check_interval"`
+
+	// WritePriorityTimeout bounds how long an in-flight write may hold reads
+	// off, in milliseconds.
+	WritePriorityTimeout int `yaml:"write_priority_timeout"`
+
+	// Flow control. The tarm/serial driver supports neither, so a true value
+	// is rejected by Validate rather than silently ignored.
+	XonXoff bool `yaml:"xonxoff"`
+	DsrDtr  bool `yaml:"dsrdtr"`
+
+	// Deprecated: retained only so their presence can be reported. They were
+	// part of a nested retry scheme that could stall a cycle for hours.
+	DeprecatedTimeout             *int `yaml:"timeout"`
+	DeprecatedWriteTimeout        *int `yaml:"write_timeout"`
+	DeprecatedMaxReopens          *int `yaml:"max_reopens"`
+	DeprecatedDeadlineTimeout     *int `yaml:"deadline_timeout"`
+	DeprecatedWriteWithRetryDelay *int `yaml:"write_with_retry_delay"`
+	DeprecatedDeviceResponseDelay *int `yaml:"device_response_delay"`
+	DeprecatedReadWithRetryDelay  *int `yaml:"read_with_retry_delay"`
+	DeprecatedReadMaxRetries      *int `yaml:"read_max_retries"`
+	DeprecatedWriteMaxRetries     *int `yaml:"write_max_retries"`
+	DeprecatedMaxRetries          *int `yaml:"max_retries"`
+	DeprecatedConnectInitialDelay *int `yaml:"connect_retry_initial_delay_ms"`
+	DeprecatedConnectMaxDelay     *int `yaml:"connect_retry_max_delay_ms"`
+	DeprecatedConnectJitter       *int `yaml:"connect_retry_jitter_percent"`
 }
 
-// MQTTConfig holds MQTT broker configuration
+// MQTTConfig holds MQTT broker configuration.
 type MQTTConfig struct {
-	Broker                     string `yaml:"broker"`
-	Port                       int    `yaml:"port"`
-	Username                   string `yaml:"username"`
-	Password                   string `yaml:"password"`
-	ClientID                   string `yaml:"client_id"`
-	QOS                        int    `yaml:"qos"`
-	Retain                     bool   `yaml:"retain"`
-	ConnectRetryInitialDelayMs int    `yaml:"connect_retry_initial_delay_ms"` // 500 (ms)
-	ConnectRetryMaxDelayMs     int    `yaml:"connect_retry_max_delay_ms"`     // 30000 (ms)
-	ConnectRetryJitterPercent  int    `yaml:"connect_retry_jitter_percent"`   // 25 (%)
-	// Publish retry configuration
-	PublishRetryCount int `yaml:"publish_retry_count"` // Number of retries for failed publishes
+	Broker   string `yaml:"broker"`
+	Port     int    `yaml:"port"`
+	Username string `yaml:"username"`
+	Password string `yaml:"password"`
+	ClientID string `yaml:"client_id"`
+	QOS      int    `yaml:"qos"`
+	Retain   bool   `yaml:"retain"`
+
+	// AvailabilityTopic carries online/offline and is registered as the last
+	// will, so Home Assistant shows entities unavailable instead of stale.
+	AvailabilityTopic string `yaml:"availability_topic"`
+
+	// OpTimeout bounds every broker interaction, in milliseconds. Publishes
+	// happen on the serial read path, so an unbounded wait stalls polling.
+	OpTimeout int `yaml:"op_timeout"`
+
+	PublishRetryCount          int `yaml:"publish_retry_count"`
+	ConnectRetryInitialDelayMs int `yaml:"connect_retry_initial_delay_ms"`
+	ConnectRetryMaxDelayMs     int `yaml:"connect_retry_max_delay_ms"`
+	ConnectRetryJitterPercent  int `yaml:"connect_retry_jitter_percent"`
 }
 
-// DeviceInfoConfig holds MQTT device info for HA discovery
+// DeviceInfoConfig holds MQTT device info for HA discovery.
 type DeviceInfoConfig struct {
-	Name         string `yaml:"name"`         // "Aerosmart Gateway"
-	Manufacturer string `yaml:"manufacturer"` // "Drexel und Weiss"
-	Model        string `yaml:"model"`        // "aerosmartPI"
-	SWVersion    string `yaml:"sw_version"`   // set from build version if empty
+	Name         string `yaml:"name"`
+	Manufacturer string `yaml:"manufacturer"`
+	Model        string `yaml:"model"`
+	SWVersion    string `yaml:"sw_version"`
 }
 
-// HADiscoveryConfig holds Home Assistant discovery configuration
+// HADiscoveryConfig holds Home Assistant discovery configuration.
 type HADiscoveryConfig struct {
 	Enabled    bool             `yaml:"enabled"`
-	Prefix     string           `yaml:"prefix"` // "homeassistant"
+	Prefix     string           `yaml:"prefix"`
 	DeviceInfo DeviceInfoConfig `yaml:"device_info"`
+
+	// ExpireAfter marks an entity unavailable after this many seconds without
+	// an update. Defaults to 2.5x the read interval.
+	ExpireAfter int `yaml:"expire_after"`
 }
 
-// LoggingConfig holds logging configuration
+// LoggingConfig holds logging configuration.
+//
+// ConsoleLogging is resolved from ConsoleLoggingSet, which is a pointer so an
+// omitted key can be told apart from an explicit false. Defaulting it to false
+// would make a config without a logging section run silently.
 type LoggingConfig struct {
-	LogFile        string `yaml:"log_file"`        // path to log file (empty to disable file logging)
-	FileLogging    bool   `yaml:"file_logging"`    // enable/disable file logging
-	ConsoleLogging bool   `yaml:"console_logging"` // enable/disable console logging
+	LogFile           string `yaml:"log_file"`
+	FileLogging       bool   `yaml:"file_logging"`
+	ConsoleLoggingSet *bool  `yaml:"console_logging"`
+
+	// ConsoleLogging is the resolved value, filled in by applyDefaults.
+	ConsoleLogging bool `yaml:"-"`
 }
 
-// AppConfig holds the main application configuration
+// AppConfig holds the main application configuration.
 type AppConfig struct {
 	Serial       SerialConfig      `yaml:"serial"`
 	MQTT         MQTTConfig        `yaml:"mqtt"`
@@ -82,7 +142,7 @@ type AppConfig struct {
 	HADiscovery  HADiscoveryConfig `yaml:"ha_discovery"`
 }
 
-// ReadRegisterConfig holds configuration for a read register
+// ReadRegisterConfig holds configuration for a read register.
 type ReadRegisterConfig struct {
 	Name     string `yaml:"name"`
 	Command  string `yaml:"command"`
@@ -98,7 +158,7 @@ type ReadRegisterConfig struct {
 	} `yaml:"ha"`
 }
 
-// WriteRegisterConfig holds configuration for a write register
+// WriteRegisterConfig holds configuration for a write register.
 type WriteRegisterConfig struct {
 	Name            string   `yaml:"name"`
 	CommandTemplate string   `yaml:"command_template"`
@@ -108,12 +168,14 @@ type WriteRegisterConfig struct {
 	MaxValue        int      `yaml:"max_value"`
 	VerifyRegisters []string `yaml:"verify_registers"`
 	HA              struct {
-		Name         string `yaml:"name"`
-		CommandTopic string `yaml:"command_topic"`
+		Name string `yaml:"name"`
+		// Deprecated: the command topic is always SubscribeTopic, so the two
+		// cannot drift apart and leave commands unhandled.
+		DeprecatedCommandTopic string `yaml:"command_topic"`
 	} `yaml:"ha"`
 }
 
-// DerivedRegisterConfig holds configuration for a derived register
+// DerivedRegisterConfig holds configuration for a derived register.
 type DerivedRegisterConfig struct {
 	Name    string   `yaml:"name"`
 	Topic   string   `yaml:"topic"`
@@ -126,14 +188,14 @@ type DerivedRegisterConfig struct {
 	} `yaml:"ha"`
 }
 
-// RegistersConfig holds all register configurations
+// RegistersConfig holds all register configurations.
 type RegistersConfig struct {
 	ReadRegisters    []ReadRegisterConfig    `yaml:"read_registers"`
 	WriteRegisters   []WriteRegisterConfig   `yaml:"write_registers"`
 	DerivedRegisters []DerivedRegisterConfig `yaml:"derived_registers"`
 }
 
-// LoadAppConfig loads the application configuration from a YAML file
+// LoadAppConfig loads the application configuration from a YAML file.
 func LoadAppConfig(path string) (*AppConfig, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -145,115 +207,202 @@ func LoadAppConfig(path string) (*AppConfig, error) {
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
 	}
 
-	// Set defaults
-	if cfg.Serial.Port == "" {
-		cfg.Serial.Port = "/dev/ttyUSB0"
-	}
-	if cfg.Serial.BaudRate == 0 {
-		cfg.Serial.BaudRate = 115200
-	}
-	if cfg.Serial.ByteSize == 0 {
-		cfg.Serial.ByteSize = 8
-	}
-	if cfg.Serial.Parity == "" {
-		cfg.Serial.Parity = "N"
-	}
-	if cfg.Serial.StopBits == 0 {
-		cfg.Serial.StopBits = 1
-	}
-	if cfg.Serial.Timeout == 0 {
-		cfg.Serial.Timeout = 0
-	}
-	if cfg.Serial.WriteTimeout == 0 {
-		cfg.Serial.WriteTimeout = 10
-	}
-	if cfg.Serial.ReadTimeout == 0 {
-		cfg.Serial.ReadTimeout = 2
-	}
-	if cfg.Serial.MaxReopens == 0 {
-		cfg.Serial.MaxReopens = 10
-	}
-	if cfg.Serial.DeadlineTimeout == 0 {
-		cfg.Serial.DeadlineTimeout = 150
-	}
-	if cfg.Serial.WriteWithRetryDelay == 0 {
-		cfg.Serial.WriteWithRetryDelay = 10
-	}
-	if cfg.Serial.DeviceResponseDelay == 0 {
-		cfg.Serial.DeviceResponseDelay = 40
-	}
-	if cfg.Serial.ReadWithRetryDelay == 0 {
-		cfg.Serial.ReadWithRetryDelay = 100
-	}
-	if cfg.Serial.ReadMaxRetries == 0 {
-		cfg.Serial.ReadMaxRetries = 10
-	}
-	if cfg.Serial.WriteMaxRetries == 0 {
-		cfg.Serial.WriteMaxRetries = 10
-	}
-	if cfg.Serial.MaxRetries == 0 {
-		cfg.Serial.MaxRetries = 10
-	}
-	if cfg.Serial.ConnectRetryInitialDelayMs == 0 {
-		cfg.Serial.ConnectRetryInitialDelayMs = 100
-	}
-	if cfg.Serial.ConnectRetryMaxDelayMs == 0 {
-		cfg.Serial.ConnectRetryMaxDelayMs = 10000
-	}
-	if cfg.Serial.ConnectRetryJitterPercent == 0 {
-		cfg.Serial.ConnectRetryJitterPercent = 25
-	}
-	// XonXoff defaults to false (no flow control) - no explicit default needed
-	if cfg.DeviceID == "" {
-		cfg.DeviceID = "aerosmart"
-	}
-	if cfg.LogLevel == "" {
-		cfg.LogLevel = "info"
-	}
-	if cfg.ReadInterval == 0 {
-		cfg.ReadInterval = 60
-	}
-	if cfg.HADiscovery.Prefix == "" {
-		cfg.HADiscovery.Prefix = "homeassistant"
-	}
-	if cfg.HADiscovery.DeviceInfo.Name == "" {
-		cfg.HADiscovery.DeviceInfo.Name = "Aerosmart Gateway"
-	}
-	if cfg.HADiscovery.DeviceInfo.Manufacturer == "" {
-		cfg.HADiscovery.DeviceInfo.Manufacturer = "Drexel und Weiss"
-	}
-	if cfg.HADiscovery.DeviceInfo.Model == "" {
-		cfg.HADiscovery.DeviceInfo.Model = "aerosmartPI"
-	}
-
-	// Set logging defaults
-	// Only apply defaults if the user hasn't specified a log file path
-	// If log_file is explicitly set to empty or "-", disable file logging
-	if cfg.Logging.LogFile == "" {
-		cfg.Logging.LogFile = "/var/log/aerosmart.log"
-	}
-	// If log_file is set to "-" or empty string, disable file logging
-	if cfg.Logging.LogFile == "-" || cfg.Logging.LogFile == "" {
-		cfg.Logging.FileLogging = false
-	}
-	// If file_logging is explicitly set to false, respect that choice
-	// (don't override user's explicit setting)
-
-	// Set MQTT defaults
-	if cfg.MQTT.ConnectRetryInitialDelayMs == 0 {
-		cfg.MQTT.ConnectRetryInitialDelayMs = 500
-	}
-	if cfg.MQTT.ConnectRetryMaxDelayMs == 0 {
-		cfg.MQTT.ConnectRetryMaxDelayMs = 30000
-	}
-	if cfg.MQTT.ConnectRetryJitterPercent == 0 {
-		cfg.MQTT.ConnectRetryJitterPercent = 25
-	}
-
+	cfg.applyDefaults()
 	return &cfg, nil
 }
 
-// LoadRegistersConfig loads the registers configuration from a YAML file
+func (c *AppConfig) applyDefaults() {
+	if c.Serial.Port == "" {
+		c.Serial.Port = "/dev/ttyUSB0"
+	}
+	if c.Serial.BaudRate == 0 {
+		c.Serial.BaudRate = 115200
+	}
+	if c.Serial.ByteSize == 0 {
+		c.Serial.ByteSize = 8
+	}
+	if c.Serial.Parity == "" {
+		c.Serial.Parity = "N"
+	}
+	if c.Serial.StopBits == 0 {
+		c.Serial.StopBits = 1
+	}
+	// 200ms is two VTIME ticks: enough for the unit to answer without the
+	// caller waiting a full second on a silent link.
+	if c.Serial.ReadTimeout == 0 {
+		c.Serial.ReadTimeout = 200
+	}
+	if c.Serial.ResponseTimeout == 0 {
+		c.Serial.ResponseTimeout = 300
+	}
+	if c.Serial.Retries == 0 {
+		c.Serial.Retries = 3
+	}
+	if c.Serial.RetryBackoff == 0 {
+		c.Serial.RetryBackoff = 100
+	}
+	if c.Serial.ReopenBackoff == 0 {
+		c.Serial.ReopenBackoff = 500
+	}
+	if c.Serial.ReopenMaxBackoff == 0 {
+		c.Serial.ReopenMaxBackoff = 30000
+	}
+	if c.Serial.HealthCheckInterval == 0 {
+		c.Serial.HealthCheckInterval = 1000
+	}
+	if c.Serial.WritePriorityTimeout == 0 {
+		c.Serial.WritePriorityTimeout = 10000
+	}
+
+	if c.DeviceID == "" {
+		c.DeviceID = "aerosmart"
+	}
+	if c.LogLevel == "" {
+		c.LogLevel = "info"
+	}
+	if c.ReadInterval == 0 {
+		c.ReadInterval = 60
+	}
+
+	if c.MQTT.Port == 0 {
+		c.MQTT.Port = 1883
+	}
+	if c.MQTT.ClientID == "" {
+		c.MQTT.ClientID = "aerosmart-gateway"
+	}
+	if c.MQTT.AvailabilityTopic == "" {
+		c.MQTT.AvailabilityTopic = c.DeviceID + "/status"
+	}
+	if c.MQTT.OpTimeout == 0 {
+		c.MQTT.OpTimeout = 5000
+	}
+	if c.MQTT.PublishRetryCount == 0 {
+		c.MQTT.PublishRetryCount = 3
+	}
+	if c.MQTT.ConnectRetryInitialDelayMs == 0 {
+		c.MQTT.ConnectRetryInitialDelayMs = 500
+	}
+	if c.MQTT.ConnectRetryMaxDelayMs == 0 {
+		c.MQTT.ConnectRetryMaxDelayMs = 30000
+	}
+	if c.MQTT.ConnectRetryJitterPercent == 0 {
+		c.MQTT.ConnectRetryJitterPercent = 25
+	}
+
+	if c.HADiscovery.Prefix == "" {
+		c.HADiscovery.Prefix = "homeassistant"
+	}
+	if c.HADiscovery.DeviceInfo.Name == "" {
+		c.HADiscovery.DeviceInfo.Name = "Aerosmart Gateway"
+	}
+	if c.HADiscovery.DeviceInfo.Manufacturer == "" {
+		c.HADiscovery.DeviceInfo.Manufacturer = "Drexel und Weiss"
+	}
+	if c.HADiscovery.DeviceInfo.Model == "" {
+		c.HADiscovery.DeviceInfo.Model = "aerosmartPI"
+	}
+	// Allow a couple of missed cycles before an entity is called stale, so a
+	// single failed readout does not flap every sensor to unavailable.
+	if c.HADiscovery.ExpireAfter == 0 && c.ReadInterval > 0 {
+		c.HADiscovery.ExpireAfter = c.ReadInterval * 5 / 2
+	}
+
+	// An empty or "-" log file means console only.
+	if c.Logging.LogFile == "" || c.Logging.LogFile == "-" {
+		c.Logging.FileLogging = false
+	}
+	if c.Logging.ConsoleLoggingSet != nil {
+		c.Logging.ConsoleLogging = *c.Logging.ConsoleLoggingSet
+	} else {
+		c.Logging.ConsoleLogging = true
+	}
+}
+
+// Validate reports configuration that cannot work, so the process fails at
+// startup instead of misbehaving silently.
+func (c *AppConfig) Validate() error {
+	var problems []string
+
+	if c.Serial.XonXoff {
+		problems = append(problems, "serial.xonxoff: software flow control is not supported by the serial driver; "+
+			"leave it false or switch to a driver that implements IXON/IXOFF")
+	}
+	if c.Serial.DsrDtr {
+		problems = append(problems, "serial.dsrdtr: hardware flow control is not supported by the serial driver")
+	}
+	switch strings.ToUpper(c.Serial.Parity) {
+	case "N", "O", "E":
+	default:
+		problems = append(problems, fmt.Sprintf("serial.parity: %q is not one of N, O, E", c.Serial.Parity))
+	}
+	if c.Serial.ByteSize < 5 || c.Serial.ByteSize > 8 {
+		problems = append(problems, fmt.Sprintf("serial.bytesize: %d is not in 5..8", c.Serial.ByteSize))
+	}
+	if c.Serial.StopBits != 1 && c.Serial.StopBits != 2 {
+		problems = append(problems, fmt.Sprintf("serial.stopbits: %d is not 1 or 2", c.Serial.StopBits))
+	}
+	if c.Serial.Retries < 1 {
+		problems = append(problems, fmt.Sprintf("serial.retries: %d must be at least 1", c.Serial.Retries))
+	}
+	if c.ReadInterval <= 0 {
+		problems = append(problems, fmt.Sprintf("read_interval: %d must be positive", c.ReadInterval))
+	}
+	if c.MQTT.Broker == "" {
+		problems = append(problems, "mqtt.broker: must be set")
+	}
+	if c.MQTT.QOS < 0 || c.MQTT.QOS > 2 {
+		problems = append(problems, fmt.Sprintf("mqtt.qos: %d is not 0, 1 or 2", c.MQTT.QOS))
+	}
+	if !c.Logging.ConsoleLogging && !c.Logging.FileLogging {
+		problems = append(problems, "logging: both console_logging and file_logging are disabled, "+
+			"so nothing would be logged anywhere")
+	}
+
+	// A cycle that cannot finish within its interval never idles, giving the
+	// device no gap between readouts.
+	worstCycle := c.Serial.Retries * (c.Serial.ResponseTimeout + c.Serial.RetryBackoff)
+	if worstCycle > c.ReadInterval*1000 {
+		problems = append(problems, fmt.Sprintf(
+			"serial retry budget (%d attempts x %dms = %dms) exceeds read_interval (%ds); "+
+				"lower serial.retries or raise read_interval",
+			c.Serial.Retries, c.Serial.ResponseTimeout+c.Serial.RetryBackoff, worstCycle, c.ReadInterval))
+	}
+
+	if len(problems) > 0 {
+		return fmt.Errorf("%w:\n  - %s", ErrInvalidConfig, strings.Join(problems, "\n  - "))
+	}
+	return nil
+}
+
+// DeprecatedKeys returns human-readable notes for configuration keys that are
+// present but no longer used, so a stale setting is never silently ignored.
+func (c *AppConfig) DeprecatedKeys() []string {
+	var notes []string
+	add := func(set bool, key, replacement string) {
+		if set {
+			notes = append(notes, fmt.Sprintf("serial.%s is no longer used (%s)", key, replacement))
+		}
+	}
+
+	s := &c.Serial
+	add(s.DeprecatedTimeout != nil, "timeout", "never had an effect")
+	add(s.DeprecatedWriteTimeout != nil, "write_timeout", "the driver has no write timeout")
+	add(s.DeprecatedMaxReopens != nil, "max_reopens", "reopens are now supervised with backoff and not capped")
+	add(s.DeprecatedDeadlineTimeout != nil, "deadline_timeout", "input is discarded with a flush ioctl instead of timed reads")
+	add(s.DeprecatedWriteWithRetryDelay != nil, "write_with_retry_delay", "replaced by serial.retry_backoff")
+	add(s.DeprecatedDeviceResponseDelay != nil, "device_response_delay", "replaced by serial.response_timeout")
+	add(s.DeprecatedReadWithRetryDelay != nil, "read_with_retry_delay", "replaced by serial.retry_backoff")
+	add(s.DeprecatedReadMaxRetries != nil, "read_max_retries", "replaced by serial.retries")
+	add(s.DeprecatedWriteMaxRetries != nil, "write_max_retries", "replaced by serial.retries")
+	add(s.DeprecatedMaxRetries != nil, "max_retries", "replaced by serial.retries")
+	add(s.DeprecatedConnectInitialDelay != nil, "connect_retry_initial_delay_ms", "the serial supervisor uses reopen_backoff")
+	add(s.DeprecatedConnectMaxDelay != nil, "connect_retry_max_delay_ms", "the serial supervisor uses reopen_max_backoff")
+	add(s.DeprecatedConnectJitter != nil, "connect_retry_jitter_percent", "no longer applied to serial reconnects")
+
+	return notes
+}
+
+// LoadRegistersConfig loads the registers configuration from a YAML file.
 func LoadRegistersConfig(path string) (*RegistersConfig, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -268,23 +417,123 @@ func LoadRegistersConfig(path string) (*RegistersConfig, error) {
 	return &cfg, nil
 }
 
-// GetConfigPaths returns the default config file paths
+// Validate reports register definitions that cannot work.
+func (c *RegistersConfig) Validate() error {
+	var problems []string
+
+	readNames := make(map[string]bool, len(c.ReadRegisters))
+	for _, reg := range c.ReadRegisters {
+		switch {
+		case reg.Name == "":
+			problems = append(problems, "read_registers: an entry has no name")
+			continue
+		case readNames[reg.Name]:
+			problems = append(problems, fmt.Sprintf("read_registers: duplicate name %q", reg.Name))
+			continue
+		}
+		readNames[reg.Name] = true
+
+		if reg.Command == "" {
+			problems = append(problems, fmt.Sprintf("read_registers[%s]: command is required", reg.Name))
+		}
+		if reg.Topic == "" {
+			problems = append(problems, fmt.Sprintf("read_registers[%s]: topic is required, or the value can never be published", reg.Name))
+		}
+		if reg.MinValue > reg.MaxValue {
+			problems = append(problems, fmt.Sprintf("read_registers[%s]: min_value %d exceeds max_value %d", reg.Name, reg.MinValue, reg.MaxValue))
+		}
+		if reg.MinValue == 0 && reg.MaxValue == 0 {
+			problems = append(problems, fmt.Sprintf("read_registers[%s]: min_value and max_value are both 0, so every reading is rejected", reg.Name))
+		}
+	}
+
+	writeNames := make(map[string]bool, len(c.WriteRegisters))
+	subscribeTopics := make(map[string]string, len(c.WriteRegisters))
+	for _, reg := range c.WriteRegisters {
+		if reg.Name == "" {
+			problems = append(problems, "write_registers: an entry has no name")
+			continue
+		}
+		if writeNames[reg.Name] {
+			problems = append(problems, fmt.Sprintf("write_registers: duplicate name %q", reg.Name))
+			continue
+		}
+		writeNames[reg.Name] = true
+
+		if !strings.Contains(reg.CommandTemplate, "{value}") {
+			problems = append(problems, fmt.Sprintf("write_registers[%s]: command_template %q has no {value} placeholder", reg.Name, reg.CommandTemplate))
+		}
+		if reg.SubscribeTopic == "" {
+			problems = append(problems, fmt.Sprintf("write_registers[%s]: subscribe_topic is required", reg.Name))
+		} else if other, clash := subscribeTopics[reg.SubscribeTopic]; clash {
+			problems = append(problems, fmt.Sprintf("write_registers[%s]: subscribe_topic %q is already used by %q", reg.Name, reg.SubscribeTopic, other))
+		} else {
+			subscribeTopics[reg.SubscribeTopic] = reg.Name
+		}
+		if reg.MinValue > reg.MaxValue {
+			problems = append(problems, fmt.Sprintf("write_registers[%s]: min_value %d exceeds max_value %d", reg.Name, reg.MinValue, reg.MaxValue))
+		}
+		for _, verify := range reg.VerifyRegisters {
+			if !readNames[verify] {
+				problems = append(problems, fmt.Sprintf("write_registers[%s]: verify_registers references unknown read register %q", reg.Name, verify))
+			}
+		}
+		if reg.HA.DeprecatedCommandTopic != "" && reg.HA.DeprecatedCommandTopic != reg.SubscribeTopic {
+			problems = append(problems, fmt.Sprintf(
+				"write_registers[%s]: ha.command_topic %q differs from subscribe_topic %q; "+
+					"ha.command_topic is no longer used and commands would be lost",
+				reg.Name, reg.HA.DeprecatedCommandTopic, reg.SubscribeTopic))
+		}
+	}
+
+	// A write register publishing state to a read register's topic makes two
+	// Home Assistant entities fight over one topic.
+	readTopics := make(map[string]string, len(c.ReadRegisters))
+	for _, reg := range c.ReadRegisters {
+		readTopics[reg.Topic] = reg.Name
+	}
+	for _, reg := range c.WriteRegisters {
+		if owner, clash := readTopics[reg.Topic]; clash {
+			problems = append(problems, fmt.Sprintf(
+				"write_registers[%s]: topic %q is also the state topic of read register %q; "+
+					"give the write register its own state topic",
+				reg.Name, reg.Topic, owner))
+		}
+	}
+
+	derivedNames := make(map[string]bool, len(c.DerivedRegisters))
+	for _, reg := range c.DerivedRegisters {
+		if derivedNames[reg.Name] {
+			problems = append(problems, fmt.Sprintf("derived_registers: duplicate name %q", reg.Name))
+			continue
+		}
+		derivedNames[reg.Name] = true
+
+		if reg.Topic == "" {
+			problems = append(problems, fmt.Sprintf("derived_registers[%s]: topic is required", reg.Name))
+		}
+		for _, source := range reg.Sources {
+			if !readNames[source] {
+				problems = append(problems, fmt.Sprintf("derived_registers[%s]: source %q is not a read register", reg.Name, source))
+			}
+		}
+	}
+
+	if len(problems) > 0 {
+		return fmt.Errorf("%w:\n  - %s", ErrInvalidConfig, strings.Join(problems, "\n  - "))
+	}
+	return nil
+}
+
+// GetConfigPaths returns the default config file paths.
 func GetConfigPaths() (appConfigPath, registersConfigPath string) {
-	// Check for config directory in current working directory
 	cwd, _ := os.Getwd()
-	configDir := filepath.Join(cwd, "config")
 
-	// Check if config files exist in config directory
-	appConfigPath = filepath.Join(configDir, "config.yaml")
-	registersConfigPath = filepath.Join(cwd, "registers.yaml")
-
-	// If not found, try current directory
+	appConfigPath = filepath.Join(cwd, "config", "config.yaml")
 	if _, err := os.Stat(appConfigPath); os.IsNotExist(err) {
 		appConfigPath = filepath.Join(cwd, "config.yaml")
 	}
-	if _, err := os.Stat(registersConfigPath); os.IsNotExist(err) {
-		registersConfigPath = filepath.Join(cwd, "registers.yaml")
-	}
+	registersConfigPath = filepath.Join(cwd, "registers.yaml")
 
 	return appConfigPath, registersConfigPath
 }

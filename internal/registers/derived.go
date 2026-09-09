@@ -1,9 +1,11 @@
 package registers
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"strconv"
+	"strings"
 
 	"github.com/nean/aerosmart-gateway/internal/config"
 	"github.com/nean/aerosmart-gateway/internal/logger"
@@ -12,17 +14,23 @@ import (
 
 // DerivedCalculator handles derived register calculations
 type DerivedCalculator struct {
-	mqtt      *mqtt.Client
+	pub       Publisher
 	logger    *logger.Logger
 	registers []config.DerivedRegisterConfig
+	topics    map[string]string
 }
 
 // NewDerivedCalculator creates a new derived register calculator
-func NewDerivedCalculator(mqttClient *mqtt.Client, log *logger.Logger, registers []config.DerivedRegisterConfig) *DerivedCalculator {
+func NewDerivedCalculator(pub Publisher, log *logger.Logger, registers []config.DerivedRegisterConfig) *DerivedCalculator {
+	topics := make(map[string]string, len(registers))
+	for _, reg := range registers {
+		topics[reg.Name] = reg.Topic
+	}
 	return &DerivedCalculator{
-		mqtt:      mqttClient,
+		pub:       pub,
 		logger:    log,
 		registers: registers,
+		topics:    topics,
 	}
 }
 
@@ -70,97 +78,85 @@ func (d *DerivedCalculator) calculateSingle(derived config.DerivedRegisterConfig
 		}
 	}
 
-	// Calculate based on formula
-	var result float64
-	var err error
-
-	switch derived.Name {
-	case "zuluftabluftprozent":
-		// formula: round((zuluftumin / abluftumin) * 100, 1)
-		zuluftumin := sources["zuluftumin"]
-		abluftumin := sources["abluftumin"]
-		if abluftumin == 0 {
-			result = 100
-		} else {
-			result = math.Round((zuluftumin/abluftumin)*100*10) / 10
-		}
-
-	case "co2luefterstufe4":
-		// formula: round(co2luefterstufe3 * 1.2)
-		co2luefterstufe3 := sources["co2luefterstufe3"]
-		result = math.Round(co2luefterstufe3 * 1.2)
-
-	case "beschattungtemp_adjusted":
-		// formula: beschattungtemp - 0.5 if beschattungaussentemp < aussentemp else beschattungtemp + 1
-		beschattungtemp := sources["beschattungtemp"]
-		beschattungaussentemp := sources["beschattungaussentemp"]
-		aussentemp := sources["aussentemp"]
-
-		if beschattungaussentemp < aussentemp {
-			result = math.Round((beschattungtemp-0.5)*10) / 10
-		} else {
-			result = math.Round((beschattungtemp+1)*10) / 10
-		}
-
-	default:
-		// For any other formula, try to evaluate generically
-		result, err = d.evaluateFormula(derived.Formula, sources)
-		if err != nil {
-			return "", err
-		}
+	fn, ok := derivedFormulas[derived.Name]
+	if !ok {
+		return "", fmt.Errorf("%w: %s", ErrNoFormula, derived.Name)
 	}
+	result := fn(sources)
 
 	// Format result
 	return fmt.Sprintf("%.1f", result), nil
 }
 
-// evaluateFormula evaluates a generic formula (simplified implementation)
-func (d *DerivedCalculator) evaluateFormula(formula string, sources map[string]float64) (float64, error) {
-	// This is a simplified formula evaluator
-	// For more complex formulas, consider using a proper expression parser
+// ErrNoFormula means a configured derived register has no implementation.
+var ErrNoFormula = errors.New("derived register has no formula implementation")
 
-	// Replace source names with values in formula
-	expr := formula
-	for name, value := range sources {
-		expr = replaceVar(expr, name, value)
+// derivedFormulas holds the arithmetic for each derived register.
+//
+// The formula string in registers.yaml documents the intent; the code here is
+// what runs. Adding a derived register to the config therefore requires adding
+// it here too, which Validate enforces at startup.
+var derivedFormulas = map[string]func(src map[string]float64) float64{
+	// round((zuluftumin / abluftumin) * 100, 1)
+	"zuluftabluftprozent": func(src map[string]float64) float64 {
+		abluft := src["abluftumin"]
+		if abluft == 0 {
+			// Both fans idle: report balanced rather than dividing by zero.
+			return 100
+		}
+		return math.Round((src["zuluftumin"]/abluft)*100*10) / 10
+	},
+
+	// round(co2luefterstufe3 * 1.2)
+	"co2luefterstufe4": func(src map[string]float64) float64 {
+		return math.Round(src["co2luefterstufe3"] * 1.2)
+	},
+
+	// beschattungtemp - 0.5 if beschattungaussentemp < aussentemp else beschattungtemp + 1
+	"beschattungtemp_adjusted": func(src map[string]float64) float64 {
+		if src["beschattungaussentemp"] < src["aussentemp"] {
+			return math.Round((src["beschattungtemp"]-0.5)*10) / 10
+		}
+		return math.Round((src["beschattungtemp"]+1)*10) / 10
+	},
+}
+
+// Validate reports configured derived registers that have no implementation,
+// so the mistake surfaces at startup instead of as a warning every cycle.
+func (d *DerivedCalculator) Validate() error {
+	var missing []string
+	for _, reg := range d.registers {
+		if _, ok := derivedFormulas[reg.Name]; !ok {
+			missing = append(missing, reg.Name)
+		}
 	}
-
-	// For now, return error for unknown formulas
-	return 0, fmt.Errorf("unsupported formula: %s", formula)
+	if len(missing) > 0 {
+		return fmt.Errorf("%w: %s", ErrNoFormula, strings.Join(missing, ", "))
+	}
+	return nil
 }
 
-// replaceVar replaces a variable name with its value in the formula
-func replaceVar(expr string, name string, value float64) string {
-	// Simple string replacement
-	return expr
-}
-
-// PublishAll publishes all derived register values to MQTT
+// PublishAll publishes valid derived register values.
 func (d *DerivedCalculator) PublishAll(values map[string]*RegisterValue) error {
+	var firstErr error
 	for name, regVal := range values {
-		if !regVal.Valid {
+		if regVal == nil || !regVal.Valid {
 			continue
 		}
-
-		// Find the topic for this register
-		var topic string
-		for _, reg := range d.registers {
-			if reg.Name == name {
-				topic = reg.Topic
-				break
-			}
+		topic, ok := d.topics[name]
+		if !ok || topic == "" {
+			continue
 		}
-
-		if topic != "" {
-			if err := d.mqtt.Publish(topic, regVal.Value); err != nil {
-				d.logger.Error("Failed to publish derived %s to MQTT: %v", topic, err)
-			} else {
-				d.logger.Debug("Published derived %s = %s to %s", name, regVal.Value, topic)
+		if err := d.pub.Publish(topic, regVal.Value); err != nil {
+			d.logger.Error("Failed to publish derived %s to %s: %v", name, topic, err)
+			if firstErr == nil {
+				firstErr = err
 			}
+			continue
 		}
+		d.logger.Debug("Published derived %s = %s to %s", name, regVal.Value, topic)
 	}
-
-	return nil
+	return firstErr
 }
 
 // GetDerivedHAConfig returns HA discovery configs for derived registers

@@ -56,8 +56,8 @@ ha_discovery:
 	if cfg.Serial.BaudRate != 57600 {
 		t.Errorf("Expected baudrate 57600, got %d", cfg.Serial.BaudRate)
 	}
-	if cfg.Serial.Timeout != 5 {
-		t.Errorf("Expected timeout 5, got %d", cfg.Serial.Timeout)
+	if cfg.Serial.DeprecatedTimeout == nil || *cfg.Serial.DeprecatedTimeout != 5 {
+		t.Errorf("Expected deprecated timeout 5, got %v", cfg.Serial.DeprecatedTimeout)
 	}
 	if !cfg.Serial.XonXoff {
 		t.Error("Expected xonxoff to be true")

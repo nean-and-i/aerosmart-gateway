@@ -5,7 +5,6 @@ import (
 
 	"github.com/nean/aerosmart-gateway/internal/config"
 	"github.com/nean/aerosmart-gateway/internal/logger"
-	"github.com/nean/aerosmart-gateway/internal/mqtt"
 )
 
 func TestDerivedCalculator_Calculate(t *testing.T) {
@@ -34,11 +33,11 @@ func TestDerivedCalculator_Calculate(t *testing.T) {
 		},
 	}
 
-	// Create a mock MQTT client (nil is fine for testing calculations)
-	mqttClient := mqtt.NewClient(nil, "test", "homeassistant")
+	// Calculations do not need a broker; record publishes in memory.
+	pub := newFakePublisher()
 
 	// Create the derived calculator
-	calc := NewDerivedCalculator(mqttClient, log, derivedRegisters)
+	calc := NewDerivedCalculator(pub, log, derivedRegisters)
 
 	// Test case 1: zuluftabluftprozent
 	sourceValues := map[string]*RegisterValue{
@@ -123,8 +122,8 @@ func TestDerivedCalculator_MissingSource(t *testing.T) {
 		},
 	}
 
-	mqttClient := mqtt.NewClient(nil, "test", "homeassistant")
-	calc := NewDerivedCalculator(mqttClient, log, derivedRegisters)
+	pub := newFakePublisher()
+	calc := NewDerivedCalculator(pub, log, derivedRegisters)
 
 	sourceValues := map[string]*RegisterValue{}
 
@@ -153,8 +152,8 @@ func TestDerivedCalculator_DivisionByZero(t *testing.T) {
 		},
 	}
 
-	mqttClient := mqtt.NewClient(nil, "test", "homeassistant")
-	calc := NewDerivedCalculator(mqttClient, log, derivedRegisters)
+	pub := newFakePublisher()
+	calc := NewDerivedCalculator(pub, log, derivedRegisters)
 
 	// Test with abluftumin = 0
 	sourceValues := map[string]*RegisterValue{

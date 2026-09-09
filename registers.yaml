@@ -351,27 +351,30 @@ write_registers:
   - name: "luefterstufe"
     command_template: "130 5002 {value}"
     subscribe_topic: "dw/aerosmart/luefterstufe"
-    topic: "aerosmart/lueftermode"
+    # Own state topic: sharing "aerosmart/lueftermode" with the read register
+    # of the same name made two HA entities fight over one topic.
+    topic: "aerosmart/luefterstufe"
     min_value: 0
     max_value: 5
     verify_registers:
       - "luefterstatus"
       - "lueftermode"
     ha:
+      # Published as a number entity (0-5), not a switch: a switch would send
+      # "ON"/"OFF", which the device rejects.
       name: "Aerosmart Lüfterstufe"
-      command_topic: "dw/aerosmart/luefterstufe"
 
   - name: "boilerheizstab"
     command_template: "140 5036 {value}"
     subscribe_topic: "dw/aerosmart/boilerheizstab"
-    topic: "aerosmart/boilerheizstabanforderungstatus"
+    topic: "aerosmart/boilerheizstab"
     min_value: 0
     max_value: 1
     verify_registers:
       - "badplusstatus"
     ha:
+      # 0/1 range, so this becomes a switch with explicit numeric payloads.
       name: "Aerosmart Boiler Heizstab"
-      command_topic: "dw/aerosmart/boilerheizstab"
 
 derived_registers:
   - name: "zuluftabluftprozent"
