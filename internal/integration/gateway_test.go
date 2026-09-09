@@ -5,6 +5,7 @@ package integration
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
@@ -340,10 +341,11 @@ func TestPollingSurvivesAWritePreemption(t *testing.T) {
 		t.Fatalf("first RunCycle() error = %v", err)
 	}
 
-	// A write arrives and preempts.
+	// A write arrives and preempts; the skipped cycle is reported as such so
+	// the caller retries sooner than a whole interval.
 	gate.Preempt()
-	if err := poller.RunCycle(context.Background()); err != nil {
-		t.Fatalf("suppressed RunCycle() error = %v, want nil", err)
+	if err := poller.RunCycle(context.Background()); !errors.Is(err, registers.ErrCycleSkipped) {
+		t.Fatalf("suppressed RunCycle() error = %v, want ErrCycleSkipped", err)
 	}
 	gate.Release()
 

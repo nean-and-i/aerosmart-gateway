@@ -2,9 +2,15 @@ package registers
 
 import (
 	"context"
+	"errors"
 
 	"github.com/nean/aerosmart-gateway/internal/logger"
 )
+
+// ErrCycleSkipped means no readout happened: a write was in flight or the port
+// was being recovered. Callers should retry sooner than a full interval rather
+// than treating it as a completed cycle.
+var ErrCycleSkipped = errors.New("read cycle skipped")
 
 // Poller runs one read/publish cycle: read every register, publish the valid
 // ones, then compute and publish derived values from that same snapshot.
@@ -30,13 +36,13 @@ func (p *Poller) RunCycle(ctx context.Context) error {
 	// supervisor is still reopening would burn the whole interval.
 	if !p.reader.DeviceHealthy() {
 		p.logger.Warn("=== Serial port unhealthy, skipping this read cycle ===")
-		return nil
+		return ErrCycleSkipped
 	}
 
 	cycleCtx, cancel, ok := p.gate.TryBeginCycle(ctx)
 	if !ok {
 		p.logger.Info("=== Write in progress, skipping this read cycle ===")
-		return nil
+		return ErrCycleSkipped
 	}
 	defer cancel()
 

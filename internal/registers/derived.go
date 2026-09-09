@@ -9,7 +9,6 @@ import (
 
 	"github.com/nean/aerosmart-gateway/internal/config"
 	"github.com/nean/aerosmart-gateway/internal/logger"
-	"github.com/nean/aerosmart-gateway/internal/mqtt"
 )
 
 // DerivedCalculator handles derived register calculations
@@ -157,25 +156,4 @@ func (d *DerivedCalculator) PublishAll(values map[string]*RegisterValue) error {
 		d.logger.Debug("Published derived %s = %s to %s", name, regVal.Value, topic)
 	}
 	return firstErr
-}
-
-// GetDerivedHAConfig returns HA discovery configs for derived registers
-func (d *DerivedCalculator) GetDerivedHAConfig(deviceID, name, manufacturer, model, swVersion string) []mqtt.HASensorConfig {
-	configs := make([]mqtt.HASensorConfig, 0, len(d.registers))
-
-	deviceInfo := mqtt.CreateDeviceInfo(deviceID, name, manufacturer, model, swVersion)
-
-	for _, reg := range d.registers {
-		config := mqtt.HASensorConfig{
-			Name:        reg.HA.Name,
-			StateTopic:  reg.Topic,
-			Unit:        reg.HA.Unit,
-			DeviceClass: reg.HA.DeviceClass,
-			UniqueID:    fmt.Sprintf("%s_%s", deviceID, reg.Name),
-			Device:      deviceInfo,
-		}
-		configs = append(configs, config)
-	}
-
-	return configs
 }

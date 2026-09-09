@@ -19,9 +19,8 @@ type Transactor interface {
 	// Transact writes a command and returns the value from the matching
 	// response frame.
 	Transact(ctx context.Context, command string) (string, error)
-	// ResponseTimeout is the budget one exchange is allowed.
-	ResponseTimeout() time.Duration
-	// IsHealthy reports whether the port is usable.
+	// IsHealthy reports whether the port is usable, so a cycle can be skipped
+	// while the port is being recovered.
 	IsHealthy() bool
 }
 
@@ -92,14 +91,22 @@ func (r *Reader) Register(name string) (config.ReadRegisterConfig, bool) {
 // a port-level error (the supervisor owns reconnection; retrying here would
 // only burn the cycle budget against a dead port).
 func (r *Reader) ReadSingle(ctx context.Context, register config.ReadRegisterConfig) (string, error) {
+	processed, _, err := r.readSingleRaw(ctx, register)
+	return processed, err
+}
+
+// readSingleRaw reads one register and returns both the processed value and
+// the value the device actually reported, which is what makes a suspicious
+// reading traceable.
+func (r *Reader) readSingleRaw(ctx context.Context, register config.ReadRegisterConfig) (string, string, error) {
 	var lastErr error
 
 	for attempt := 1; attempt <= r.retries; attempt++ {
 		if err := ctx.Err(); err != nil {
-			return "", err
+			return "", "", err
 		}
 		if attempt > 1 && !sleepCtx(ctx, r.backoff) {
-			return "", ctx.Err()
+			return "", "", ctx.Err()
 		}
 
 		start := time.Now()
@@ -108,14 +115,14 @@ func (r *Reader) ReadSingle(ctx context.Context, register config.ReadRegisterCon
 
 		if err == nil {
 			r.logger.SerialOperation("READ", register.Command, value, duration, nil)
-			return r.processValue(value, register), nil
+			return r.processValue(value, register), value, nil
 		}
 
 		lastErr = err
 		r.logger.SerialOperation("READ", register.Command, "", duration, err)
 
 		if ctx.Err() != nil {
-			return "", ctx.Err()
+			return "", "", ctx.Err()
 		}
 		if serial.IsPortError(err) {
 			break
@@ -123,7 +130,7 @@ func (r *Reader) ReadSingle(ctx context.Context, register config.ReadRegisterCon
 		r.logger.Debug("Read of %s failed (attempt %d/%d): %v", register.Name, attempt, r.retries, err)
 	}
 
-	return "", fmt.Errorf("read register %s (%s): %w", register.Name, register.Command, lastErr)
+	return "", "", fmt.Errorf("read register %s (%s): %w", register.Name, register.Command, lastErr)
 }
 
 // ReadAll reads every configured register.
@@ -144,7 +151,7 @@ func (r *Reader) ReadAll(ctx context.Context) (map[string]*RegisterValue, error)
 			return results, err
 		}
 
-		value, err := r.ReadSingle(ctx, register)
+		value, raw, err := r.readSingleRaw(ctx, register)
 		if err != nil {
 			if isCancellation(err) {
 				r.logger.Info("=== SERIAL: read cycle cancelled after %v (write priority) ===", time.Since(cycleStart))
@@ -159,7 +166,7 @@ func (r *Reader) ReadAll(ctx context.Context) (map[string]*RegisterValue, error)
 		results[register.Name] = &RegisterValue{
 			Name:     register.Name,
 			Value:    processed,
-			RawValue: value,
+			RawValue: raw,
 			Valid:    valid,
 		}
 		r.logger.Debug("Register %s = %s (valid: %v)", register.Name, processed, valid)
@@ -204,19 +211,6 @@ func (r *Reader) PublishAll(values map[string]*RegisterValue) error {
 		r.logger.Warn("Skipped publishing %d/%d register(s) that could not be read", skipped, len(values))
 	}
 	return firstErr
-}
-
-// Values returns a snapshot of the most recent read cycle.
-func (r *Reader) Values() map[string]*RegisterValue {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
-	out := make(map[string]*RegisterValue, len(r.values))
-	for k, v := range r.values {
-		copied := *v
-		out[k] = &copied
-	}
-	return out
 }
 
 // processValue applies the divisor and formats according to the register type.

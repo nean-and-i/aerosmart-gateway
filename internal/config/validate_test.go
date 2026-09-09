@@ -290,3 +290,54 @@ func TestValidateCycleBudgetIgnoresZeroRegisters(t *testing.T) {
 		t.Errorf("ValidateCycleBudget(0) error = %v, want nil", err)
 	}
 }
+
+// The serial layer raises response_timeout to read_timeout when it is smaller,
+// so the budget must be computed from the effective value, not the configured
+// one, or a large read_timeout slips past the check.
+func TestValidateCycleBudgetUsesEffectiveResponseTimeout(t *testing.T) {
+	cfg, err := LoadAppConfig(writeConfig(t, `
+mqtt:
+  broker: "x"
+read_interval: 120
+serial:
+  retries: 3
+  read_timeout: 3000
+  response_timeout: 300
+  retry_backoff: 100
+`))
+	if err != nil {
+		t.Fatalf("LoadAppConfig() error = %v", err)
+	}
+
+	// Effective response timeout is 3000ms, so 29 x 3 x 3100ms = 269s > 120s.
+	if err := cfg.ValidateCycleBudget(29); err == nil {
+		t.Fatal("ValidateCycleBudget(29) = nil; read_timeout 3000ms makes the real cycle 269s")
+	}
+}
+
+// Negative millisecond settings make the retry and reopen loops spin.
+func TestValidateRejectsNegativeDurations(t *testing.T) {
+	for _, body := range []string{
+		"serial:\n  reopen_backoff: -1\n",
+		"serial:\n  retry_backoff: -5\n",
+		"serial:\n  response_timeout: -100\n",
+		"serial:\n  read_timeout: -100\n",
+		"serial:\n  health_check_interval: -1\n",
+		"serial:\n  write_priority_timeout: -1\n",
+		"mqtt:\n  broker: \"x\"\n  op_timeout: -1\n",
+	} {
+		t.Run(body, func(t *testing.T) {
+			prefix := ""
+			if !strings.Contains(body, "broker") {
+				prefix = "mqtt:\n  broker: \"x\"\n"
+			}
+			cfg, err := LoadAppConfig(writeConfig(t, prefix+body))
+			if err != nil {
+				t.Fatalf("LoadAppConfig() error = %v", err)
+			}
+			if err := cfg.Validate(); err == nil {
+				t.Errorf("Validate() = nil for %q, want a rejection", body)
+			}
+		})
+	}
+}

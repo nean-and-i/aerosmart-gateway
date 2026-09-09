@@ -200,11 +200,7 @@ func (l *Logger) Close() error {
 
 // SignalReceived logs when a signal is received
 func (l *Logger) SignalReceived(sig os.Signal) {
-	msg := fmt.Sprintf("Received signal %v, initiating immediate shutdown...", sig)
-	if l.consoleLogging && l.consoleLogger != nil {
-		_ = l.consoleLogger.Output(2, msg)
-	}
-	if l.fileLogging && l.fileLogger != nil {
-		_ = l.fileLogger.Output(2, msg)
-	}
+	// Goes through emit so the sinks stay guarded by mu; reading them directly
+	// races with Close during shutdown.
+	l.emit(ERROR, "", "Received signal %v, shutting down...", sig)
 }
