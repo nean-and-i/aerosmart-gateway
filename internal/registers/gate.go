@@ -13,8 +13,12 @@ import (
 // carries a deadline: a release that never happens must not wedge reads
 // permanently.
 type ReadGate struct {
-	mu      sync.Mutex
+	mu sync.Mutex
+	// cancel belongs to the cycle currently running, and is cleared when that
+	// cycle ends so a later Preempt cannot cancel an already-finished one.
+	// cycleID identifies which cycle owns it.
 	cancel  context.CancelFunc
+	cycleID uint64
 	until   time.Time
 	timeout time.Duration
 }
@@ -27,14 +31,35 @@ func NewReadGate(timeout time.Duration) *ReadGate {
 	return &ReadGate{timeout: timeout}
 }
 
-// BeginCycle derives the context for a read cycle and registers it so an
-// incoming write can cancel it. The caller must still call the returned cancel.
-func (g *ReadGate) BeginCycle(parent context.Context) (context.Context, context.CancelFunc) {
-	ctx, cancel := context.WithCancel(parent)
+// TryBeginCycle starts a read cycle unless a write is pending.
+//
+// Testing suppression and registering the cycle happen under one lock: done
+// separately, a write arriving in between would preempt a cycle that had not
+// started yet and then let it run unimpeded.
+//
+// The returned cancel also deregisters the cycle, and must always be called.
+func (g *ReadGate) TryBeginCycle(parent context.Context) (context.Context, context.CancelFunc, bool) {
 	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	if g.suppressedLocked() {
+		return nil, nil, false
+	}
+
+	ctx, cancel := context.WithCancel(parent)
+	g.cycleID++
+	id := g.cycleID
 	g.cancel = cancel
-	g.mu.Unlock()
-	return ctx, cancel
+
+	return ctx, func() {
+		cancel()
+		g.mu.Lock()
+		// Only deregister if this cycle is still the current one.
+		if g.cycleID == id {
+			g.cancel = nil
+		}
+		g.mu.Unlock()
+	}, true
 }
 
 // Preempt cancels the in-flight read cycle and suppresses further cycles until
@@ -58,11 +83,15 @@ func (g *ReadGate) Release() {
 	g.mu.Unlock()
 }
 
-// Suppressed reports whether reads are currently held off. Expired
-// suppression is cleared as a side effect.
+// Suppressed reports whether reads are currently held off.
 func (g *ReadGate) Suppressed() bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	return g.suppressedLocked()
+}
+
+// suppressedLocked clears expired suppression as a side effect.
+func (g *ReadGate) suppressedLocked() bool {
 	if g.until.IsZero() {
 		return false
 	}
@@ -71,6 +100,13 @@ func (g *ReadGate) Suppressed() bool {
 		return false
 	}
 	return true
+}
+
+// hasActiveCycle reports whether a cycle is registered. Used in tests.
+func (g *ReadGate) hasActiveCycle() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.cancel != nil
 }
 
 // sleepCtx waits for d, reporting false if ctx finished first.

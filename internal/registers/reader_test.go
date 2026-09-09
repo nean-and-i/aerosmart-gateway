@@ -20,6 +20,7 @@ type fakeDevice struct {
 	responses map[string]string
 	err       error
 	failFirst int // fail this many calls before answering
+	unhealthy bool
 	calls     []string
 	block     chan struct{} // if set, Transact waits on it (or on ctx)
 }
@@ -60,7 +61,7 @@ func (f *fakeDevice) callCount() int {
 }
 
 func (f *fakeDevice) ResponseTimeout() time.Duration { return 50 * time.Millisecond }
-func (f *fakeDevice) IsHealthy() bool                { return true }
+func (f *fakeDevice) IsHealthy() bool                { return !f.unhealthy }
 
 // fakePublisher records what was published.
 type fakePublisher struct {
@@ -108,7 +109,10 @@ var tempReg = config.ReadRegisterConfig{
 
 func TestReadGatePreemptCancelsCycle(t *testing.T) {
 	g := NewReadGate(time.Second)
-	ctx, cancel := g.BeginCycle(context.Background())
+	ctx, cancel, ok := g.TryBeginCycle(context.Background())
+	if !ok {
+		t.Fatal("TryBeginCycle() refused on a fresh gate")
+	}
 	defer cancel()
 
 	if ctx.Err() != nil {
@@ -422,7 +426,10 @@ func TestHandleMessagePreemptsReadCycle(t *testing.T) {
 	gate := NewReadGate(time.Second)
 	w := testWriter(dev, newFakePublisher(), gate)
 
-	cycleCtx, cancel := gate.BeginCycle(context.Background())
+	cycleCtx, cancel, ok := gate.TryBeginCycle(context.Background())
+	if !ok {
+		t.Fatal("TryBeginCycle() refused on a fresh gate")
+	}
 	defer cancel()
 
 	if err := w.HandleMessage(context.Background(), fanWrite.SubscribeTopic, "3"); err != nil {
@@ -571,5 +578,92 @@ func TestDerivedDivisionByZeroGuard(t *testing.T) {
 	}
 	if v := values["zuluftabluftprozent"]; v == nil || !v.Valid || v.Value != "100.0" {
 		t.Errorf("zuluftabluftprozent = %+v, want valid 100.0", v)
+	}
+}
+
+// ---------- review follow-ups ----------
+
+// Checking suppression and starting a cycle must be one atomic step, or a
+// write that arrives in between is preempting a cycle that has not begun.
+func TestReadGateTryBeginCycleRefusesWhileSuppressed(t *testing.T) {
+	g := NewReadGate(time.Hour)
+	g.Preempt()
+
+	if _, _, ok := g.TryBeginCycle(context.Background()); ok {
+		t.Fatal("TryBeginCycle() succeeded while a write was pending, want refusal")
+	}
+
+	g.Release()
+	ctx, cancel, ok := g.TryBeginCycle(context.Background())
+	if !ok {
+		t.Fatal("TryBeginCycle() refused after Release(), want success")
+	}
+	defer cancel()
+	if ctx.Err() != nil {
+		t.Errorf("cycle context already done: %v", ctx.Err())
+	}
+}
+
+// Once a cycle has finished, its cancel must not be retained: preempting then
+// would cancel a completed cycle and leave the next one unprotected.
+func TestReadGateForgetsFinishedCycle(t *testing.T) {
+	g := NewReadGate(time.Hour)
+
+	_, cancel, ok := g.TryBeginCycle(context.Background())
+	if !ok {
+		t.Fatal("TryBeginCycle() refused on a fresh gate")
+	}
+	cancel() // cycle finished
+
+	if g.hasActiveCycle() {
+		t.Error("gate still holds a cancel for a finished cycle")
+	}
+}
+
+// Grinding 30+ registers through their retries against a port the supervisor
+// is already reopening wastes the whole interval.
+func TestPollerSkipsCycleWhilePortUnhealthy(t *testing.T) {
+	dev := &fakeDevice{responses: map[string]string{"130 1067": "3"}, unhealthy: true}
+	pub := newFakePublisher()
+	p := NewPoller(NewReader(dev, pub, testLogger(), []config.ReadRegisterConfig{fanReg}, 3, time.Millisecond),
+		nil, NewReadGate(time.Second), testLogger())
+
+	if err := p.RunCycle(context.Background()); err != nil {
+		t.Fatalf("RunCycle() error = %v, want nil", err)
+	}
+	if dev.callCount() != 0 {
+		t.Errorf("device called %d times while the port was unhealthy, want 0", dev.callCount())
+	}
+}
+
+// Deduplication must only suppress a genuine redelivery of the last command,
+// not a real change and change-back inside the window.
+func TestHandleMessageAllowsValueChangeAndBack(t *testing.T) {
+	dev := &fakeDevice{responses: map[string]string{
+		"130 5002 3": "3", "130 5002 0": "0", "130 1067": "3",
+	}}
+	pub := newFakePublisher()
+	w := testWriter(dev, pub, NewReadGate(time.Second))
+
+	for _, v := range []string{"3", "0", "3"} {
+		if err := w.HandleMessage(context.Background(), fanWrite.SubscribeTopic, v); err != nil {
+			t.Fatalf("HandleMessage(%s) error = %v", v, err)
+		}
+	}
+
+	// The device must have ended on 3, not on the intermediate 0.
+	if got, _ := pub.get(fanWrite.Topic); got != "3" {
+		t.Errorf("state topic = %q, want 3; the final command was dropped as a duplicate", got)
+	}
+	writes := 0
+	dev.mu.Lock()
+	for _, c := range dev.calls {
+		if strings.HasPrefix(c, "130 5002") {
+			writes++
+		}
+	}
+	dev.mu.Unlock()
+	if writes != 3 {
+		t.Errorf("write commands sent = %d, want 3 (3, 0, 3)", writes)
 	}
 }

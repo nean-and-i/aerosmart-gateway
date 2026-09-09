@@ -358,20 +358,35 @@ func (c *AppConfig) Validate() error {
 			"so nothing would be logged anywhere")
 	}
 
-	// A cycle that cannot finish within its interval never idles, giving the
-	// device no gap between readouts.
-	worstCycle := c.Serial.Retries * (c.Serial.ResponseTimeout + c.Serial.RetryBackoff)
-	if worstCycle > c.ReadInterval*1000 {
-		problems = append(problems, fmt.Sprintf(
-			"serial retry budget (%d attempts x %dms = %dms) exceeds read_interval (%ds); "+
-				"lower serial.retries or raise read_interval",
-			c.Serial.Retries, c.Serial.ResponseTimeout+c.Serial.RetryBackoff, worstCycle, c.ReadInterval))
-	}
-
 	if len(problems) > 0 {
 		return fmt.Errorf("%w:\n  - %s", ErrInvalidConfig, strings.Join(problems, "\n  - "))
 	}
 	return nil
+}
+
+// ValidateCycleBudget reports a retry budget that cannot finish a full readout
+// within one read interval.
+//
+// The check needs the register count, which lives in the registers file, so it
+// is separate from Validate. A cycle that overruns its interval never idles,
+// leaving the device no gap between readouts.
+func (c *AppConfig) ValidateCycleBudget(registerCount int) error {
+	if registerCount <= 0 {
+		return nil
+	}
+
+	perRegisterMs := c.Serial.Retries * (c.Serial.ResponseTimeout + c.Serial.RetryBackoff)
+	worstCycleMs := perRegisterMs * registerCount
+	if worstCycleMs <= c.ReadInterval*1000 {
+		return nil
+	}
+
+	return fmt.Errorf("%w: worst-case read cycle is %d registers x %d attempts x %dms = %.1fs, "+
+		"which exceeds read_interval (%ds); lower serial.retries or serial.response_timeout, "+
+		"or raise read_interval",
+		ErrInvalidConfig, registerCount, c.Serial.Retries,
+		c.Serial.ResponseTimeout+c.Serial.RetryBackoff,
+		float64(worstCycleMs)/1000, c.ReadInterval)
 }
 
 // DeprecatedKeys returns human-readable notes for configuration keys that are

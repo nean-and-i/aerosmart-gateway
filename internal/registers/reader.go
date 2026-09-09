@@ -77,6 +77,9 @@ func NewReader(dev Transactor, pub Publisher, log *logger.Logger, registers []co
 	}
 }
 
+// DeviceHealthy reports whether the underlying port is usable.
+func (r *Reader) DeviceHealthy() bool { return r.dev.IsHealthy() }
+
 // Register returns the configuration for a register by name.
 func (r *Reader) Register(name string) (config.ReadRegisterConfig, bool) {
 	reg, ok := r.byName[name]

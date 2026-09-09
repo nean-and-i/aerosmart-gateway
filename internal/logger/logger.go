@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sync"
 	"time"
 )
 
@@ -49,6 +50,10 @@ type Logger struct {
 	fileLogging    bool
 	consoleLogging bool
 	file           *os.File
+
+	// mu guards the sinks so Close, which runs during shutdown while other
+	// goroutines are still logging, cannot swap them mid-write.
+	mu sync.Mutex
 }
 
 // New creates a new Logger with the specified level
@@ -112,67 +117,48 @@ func NewWithConfig(config Config) *Logger {
 	return l
 }
 
-// Debug logs a debug message
-func (l *Logger) Debug(format string, args ...interface{}) {
-	if l.level <= DEBUG {
-		msg := fmt.Sprintf("[%s] "+format, append([]interface{}{time.Now().Format("2006-01-02 15:04:05")}, args...)...)
-		if l.consoleLogging && l.consoleLogger != nil {
-			_ = l.consoleLogger.Output(2, msg)
-		}
-		if l.fileLogging && l.fileLogger != nil {
-			_ = l.fileLogger.Output(2, msg)
-		}
+// emit formats and writes one line to every enabled sink.
+func (l *Logger) emit(level Level, prefix, format string, args ...interface{}) {
+	if l.level > level {
+		return
 	}
-}
+	msg := fmt.Sprintf("[%s] %s%s",
+		time.Now().Format("2006-01-02 15:04:05"), prefix, fmt.Sprintf(format, args...))
 
-// Info logs an info message
-func (l *Logger) Info(format string, args ...interface{}) {
-	if l.level <= INFO {
-		msg := fmt.Sprintf("[%s] "+format, append([]interface{}{time.Now().Format("2006-01-02 15:04:05")}, args...)...)
-		if l.consoleLogging && l.consoleLogger != nil {
-			_ = l.consoleLogger.Output(2, msg)
-		}
-		if l.fileLogging && l.fileLogger != nil {
-			_ = l.fileLogger.Output(2, msg)
-		}
-	}
-}
-
-// Warn logs a warning message
-func (l *Logger) Warn(format string, args ...interface{}) {
-	if l.level <= WARN {
-		msg := fmt.Sprintf("[%s] WARNING: "+format, append([]interface{}{time.Now().Format("2006-01-02 15:04:05")}, args...)...)
-		if l.consoleLogging && l.consoleLogger != nil {
-			_ = l.consoleLogger.Output(2, msg)
-		}
-		if l.fileLogging && l.fileLogger != nil {
-			_ = l.fileLogger.Output(2, msg)
-		}
-	}
-}
-
-// Error logs an error message
-func (l *Logger) Error(format string, args ...interface{}) {
-	if l.level <= ERROR {
-		msg := fmt.Sprintf("[%s] ERROR: "+format, append([]interface{}{time.Now().Format("2006-01-02 15:04:05")}, args...)...)
-		if l.consoleLogging && l.consoleLogger != nil {
-			_ = l.consoleLogger.Output(2, msg)
-		}
-		if l.fileLogging && l.fileLogger != nil {
-			_ = l.fileLogger.Output(2, msg)
-		}
-	}
-}
-
-// Fatal logs a fatal message and exits
-func (l *Logger) Fatal(format string, args ...interface{}) {
-	msg := fmt.Sprintf("[%s] FATAL: "+format, append([]interface{}{time.Now().Format("2006-01-02 15:04:05")}, args...)...)
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	if l.consoleLogging && l.consoleLogger != nil {
 		_ = l.consoleLogger.Output(2, msg)
 	}
 	if l.fileLogging && l.fileLogger != nil {
 		_ = l.fileLogger.Output(2, msg)
 	}
+}
+
+// Debug logs a debug message.
+func (l *Logger) Debug(format string, args ...interface{}) {
+	l.emit(DEBUG, "", format, args...)
+}
+
+// Info logs an info message.
+func (l *Logger) Info(format string, args ...interface{}) {
+	l.emit(INFO, "", format, args...)
+}
+
+// Warn logs a warning message.
+func (l *Logger) Warn(format string, args ...interface{}) {
+	l.emit(WARN, "WARNING: ", format, args...)
+}
+
+// Error logs an error message.
+func (l *Logger) Error(format string, args ...interface{}) {
+	l.emit(ERROR, "ERROR: ", format, args...)
+}
+
+// Fatal logs a fatal message and exits.
+func (l *Logger) Fatal(format string, args ...interface{}) {
+	l.emit(ERROR, "FATAL: ", format, args...)
+	_ = l.Close()
 	os.Exit(1)
 }
 
@@ -195,14 +181,20 @@ func (l *Logger) SerialOperation(operation string, command string, response stri
 	l.Debug("SERIAL %s (took %v): cmd=%q response=%q", operation, duration, command, response)
 }
 
-// Close releases the log file, if one is open.
+// Close releases the log file, if one is open. It is idempotent, and safe to
+// call while other goroutines are still logging.
 func (l *Logger) Close() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
 	if l.file == nil {
 		return nil
 	}
+	// Stop writing to the file before closing its descriptor.
+	l.fileLogging = false
+	l.fileLogger = nil
 	err := l.file.Close()
 	l.file = nil
-	l.fileLogging = false
 	return err
 }
 

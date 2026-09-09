@@ -26,10 +26,11 @@ type Writer struct {
 	retries int
 	backoff time.Duration
 
-	// dedupe remembers commands that actually reached the device, so a
-	// broker redelivery is dropped but a retry after a failure is not.
+	// lastCommand remembers the last command per topic that actually reached
+	// the device, so a broker redelivery is dropped while a retry after a
+	// failure, and a change back to an earlier value, both go through.
 	dedupeMu     sync.Mutex
-	dedupe       map[string]time.Time
+	lastCommand  map[string]lastWrite
 	dedupeWindow time.Duration
 }
 
@@ -54,7 +55,7 @@ func NewWriter(dev Transactor, pub Publisher, log *logger.Logger, registers []co
 		gate:         gate,
 		retries:      retries,
 		backoff:      backoff,
-		dedupe:       make(map[string]time.Time),
+		lastCommand:  make(map[string]lastWrite),
 		dedupeWindow: time.Second,
 	}
 }
@@ -204,31 +205,32 @@ func (w *Writer) verifyWrite(ctx context.Context, register config.WriteRegisterC
 	}
 }
 
-// isDuplicate reports whether an identical command recently succeeded.
-func (w *Writer) isDuplicate(topic, value string) bool {
-	key := topic + "=" + value
+// lastWrite records the most recent command accepted for a topic.
+type lastWrite struct {
+	value string
+	at    time.Time
+}
 
+// isDuplicate reports whether this is a redelivery of the last command
+// accepted for the topic, within the dedupe window.
+//
+// Only the most recent value is compared: keying on every recent (topic,value)
+// pair meant a real 3 -> 0 -> 3 sequence inside one second left the device on
+// 0, because the final command looked like a duplicate.
+func (w *Writer) isDuplicate(topic, value string) bool {
 	w.dedupeMu.Lock()
 	defer w.dedupeMu.Unlock()
 
-	w.pruneLocked()
-	_, exists := w.dedupe[key]
-	return exists
+	last, ok := w.lastCommand[topic]
+	if !ok || last.value != value {
+		return false
+	}
+	return time.Since(last.at) < w.dedupeWindow
 }
 
 // rememberSuccess records a command that reached the device.
 func (w *Writer) rememberSuccess(topic, value string) {
 	w.dedupeMu.Lock()
 	defer w.dedupeMu.Unlock()
-	w.pruneLocked()
-	w.dedupe[topic+"="+value] = time.Now()
-}
-
-func (w *Writer) pruneLocked() {
-	cutoff := time.Now().Add(-w.dedupeWindow)
-	for key, at := range w.dedupe {
-		if at.Before(cutoff) {
-			delete(w.dedupe, key)
-		}
-	}
+	w.lastCommand[topic] = lastWrite{value: value, at: time.Now()}
 }
