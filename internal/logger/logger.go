@@ -48,6 +48,7 @@ type Logger struct {
 	fileLogger     *log.Logger
 	fileLogging    bool
 	consoleLogging bool
+	file           *os.File
 }
 
 // New creates a new Logger with the specified level
@@ -63,6 +64,7 @@ func New(level string) *Logger {
 // NewWithConfig creates a new Logger with the specified configuration
 func NewWithConfig(config Config) *Logger {
 	var consoleLogger, fileLogger *log.Logger
+	var logFileHandle *os.File
 
 	// Setup console logging
 	if config.ConsoleLogging {
@@ -82,6 +84,7 @@ func NewWithConfig(config Config) *Logger {
 			}
 		} else {
 			fileLogger = log.New(logFile, "", 0)
+			logFileHandle = logFile
 		}
 	}
 
@@ -90,6 +93,7 @@ func NewWithConfig(config Config) *Logger {
 		fileLogger:     fileLogger,
 		fileLogging:    config.FileLogging && config.LogFile != "",
 		consoleLogging: config.ConsoleLogging,
+		file:           logFileHandle,
 	}
 
 	switch config.Level {
@@ -112,19 +116,6 @@ func NewWithConfig(config Config) *Logger {
 func (l *Logger) Debug(format string, args ...interface{}) {
 	if l.level <= DEBUG {
 		msg := fmt.Sprintf("[%s] "+format, append([]interface{}{time.Now().Format("2006-01-02 15:04:05")}, args...)...)
-		if l.consoleLogging && l.consoleLogger != nil {
-			_ = l.consoleLogger.Output(2, msg)
-		}
-		if l.fileLogging && l.fileLogger != nil {
-			_ = l.fileLogger.Output(2, msg)
-		}
-	}
-}
-
-// DebugWithTiming logs a debug message with timing information
-func (l *Logger) DebugWithTiming(operation string, duration time.Duration, format string, args ...interface{}) {
-	if l.level <= DEBUG {
-		msg := fmt.Sprintf("[%s] %s (took %v): "+format, append([]interface{}{time.Now().Format("2006-01-02 15:04:05"), operation, duration}, args...)...)
 		if l.consoleLogging && l.consoleLogger != nil {
 			_ = l.consoleLogger.Output(2, msg)
 		}
@@ -190,112 +181,29 @@ func (l *Logger) IsDebug() bool {
 	return l.level <= DEBUG
 }
 
-// SerialOperation logs serial port operations with full details
+// SerialOperation logs one serial exchange.
+//
+// Failures log at warning level: on a flaky link they are the primary
+// diagnostic, and hiding them behind debug meant a silent device looked
+// like a healthy one. Successes stay at debug, since there is one per
+// register per cycle.
 func (l *Logger) SerialOperation(operation string, command string, response string, duration time.Duration, err error) {
-	if l.level <= DEBUG {
-		var msg string
-		if err != nil {
-			msg = fmt.Sprintf("[%s] SERIAL %s FAILED (took %v): cmd=%q error=%v",
-				time.Now().Format("2006-01-02 15:04:05"), operation, duration, command, err)
-		} else {
-			msg = fmt.Sprintf("[%s] SERIAL %s (took %v): cmd=%q response=%q",
-				time.Now().Format("2006-01-02 15:04:05"), operation, duration, command, response)
-		}
-		if l.consoleLogging && l.consoleLogger != nil {
-			_ = l.consoleLogger.Output(2, msg)
-		}
-		if l.fileLogging && l.fileLogger != nil {
-			_ = l.fileLogger.Output(2, msg)
-		}
-	}
-}
-
-// SerialConnection logs serial connection state changes
-func (l *Logger) SerialConnection(action string, port string, baudRate int, err error) {
-	var msg string
 	if err != nil {
-		msg = fmt.Sprintf("[%s] SERIAL %s FAILED: port=%s baudrate=%d error=%v",
-			time.Now().Format("2006-01-02 15:04:05"), action, port, baudRate, err)
-	} else {
-		msg = fmt.Sprintf("[%s] SERIAL %s: port=%s baudrate=%d",
-			time.Now().Format("2006-01-02 15:04:05"), action, port, baudRate)
+		l.Warn("SERIAL %s FAILED (took %v): cmd=%q error=%v", operation, duration, command, err)
+		return
 	}
-	if l.consoleLogging && l.consoleLogger != nil {
-		_ = l.consoleLogger.Output(2, msg)
-	}
-	if l.fileLogging && l.fileLogger != nil {
-		_ = l.fileLogger.Output(2, msg)
-	}
+	l.Debug("SERIAL %s (took %v): cmd=%q response=%q", operation, duration, command, response)
 }
 
-// SerialReopen logs serial port reopen attempts
-func (l *Logger) SerialReopen(attempt int, maxAttempts int, success bool) {
-	if success {
-		l.Info("Serial port reopened successfully (attempt %d/%d)", attempt, maxAttempts)
-	} else {
-		l.Warn("Serial port reopen failed (attempt %d/%d)", attempt, maxAttempts)
+// Close releases the log file, if one is open.
+func (l *Logger) Close() error {
+	if l.file == nil {
+		return nil
 	}
-}
-
-// MQTTOperation logs MQTT operations with full details
-func (l *Logger) MQTTOperation(operation string, topic string, payload string, qos int, retain bool, err error) {
-	if l.level <= DEBUG {
-		var msg string
-		if err != nil {
-			msg = fmt.Sprintf("[%s] MQTT %s FAILED: topic=%q payload=%q qos=%d retain=%t error=%v",
-				time.Now().Format("2006-01-02 15:04:05"), operation, topic, payload, qos, retain, err)
-		} else {
-			msg = fmt.Sprintf("[%s] MQTT %s: topic=%q payload=%q qos=%d retain=%t",
-				time.Now().Format("2006-01-02 15:04:05"), operation, topic, payload, qos, retain)
-		}
-		if l.consoleLogging && l.consoleLogger != nil {
-			_ = l.consoleLogger.Output(2, msg)
-		}
-		if l.fileLogging && l.fileLogger != nil {
-			_ = l.fileLogger.Output(2, msg)
-		}
-	}
-}
-
-// MQTTConnection logs MQTT connection state changes
-func (l *Logger) MQTTConnection(action string, broker string, port int, err error) {
-	var msg string
-	if err != nil {
-		msg = fmt.Sprintf("[%s] MQTT %s FAILED: broker=%s port=%d error=%v",
-			time.Now().Format("2006-01-02 15:04:05"), action, broker, port, err)
-	} else {
-		msg = fmt.Sprintf("[%s] MQTT %s: broker=%s port=%d",
-			time.Now().Format("2006-01-02 15:04:05"), action, broker, port)
-	}
-	if l.consoleLogging && l.consoleLogger != nil {
-		_ = l.consoleLogger.Output(2, msg)
-	}
-	if l.fileLogging && l.fileLogger != nil {
-		_ = l.fileLogger.Output(2, msg)
-	}
-}
-
-// RegisterOperation logs register read/write operations
-func (l *Logger) RegisterOperation(operation string, register string, command string, value string, valid bool, err error) {
-	if err != nil {
-		msg := fmt.Sprintf("[%s] REGISTER %s FAILED: register=%s cmd=%q error=%v",
-			time.Now().Format("2006-01-02 15:04:05"), operation, register, command, err)
-		if l.consoleLogging && l.consoleLogger != nil {
-			_ = l.consoleLogger.Output(2, msg)
-		}
-		if l.fileLogging && l.fileLogger != nil {
-			_ = l.fileLogger.Output(2, msg)
-		}
-	} else if l.level <= DEBUG {
-		msg := fmt.Sprintf("[%s] REGISTER %s: register=%s cmd=%q value=%q valid=%t",
-			time.Now().Format("2006-01-02 15:04:05"), operation, register, command, value, valid)
-		if l.consoleLogging && l.consoleLogger != nil {
-			_ = l.consoleLogger.Output(2, msg)
-		}
-		if l.fileLogging && l.fileLogger != nil {
-			_ = l.fileLogger.Output(2, msg)
-		}
-	}
+	err := l.file.Close()
+	l.file = nil
+	l.fileLogging = false
+	return err
 }
 
 // SignalReceived logs when a signal is received

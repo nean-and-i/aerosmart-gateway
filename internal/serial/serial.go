@@ -1,513 +1,442 @@
+// Package serial implements framed request/response communication with an
+// Aerosmart unit over a serial link.
+//
+// The link is assumed to be lossy: frames arrive split across reads, stale or
+// unsolicited frames appear on the wire, and the USB adapter can disappear
+// entirely. Three rules keep it stable:
+//
+//  1. Received bytes are buffered persistently, so a frame interrupted by a
+//     timeout is completed rather than discarded (discarding it desyncs the
+//     stream permanently).
+//  2. One transaction reads until it sees the frame matching its own command,
+//     discarding anything else, and never re-sends the command to resync.
+//  3. Closing and reopening the port is reserved for genuine port failures and
+//     performed by a single supervisor, because a reopen toggles DTR/RTS and
+//     can reset the attached device.
 package serial
 
 import (
+	"context"
+	"errors"
 	"fmt"
-	"net"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/tarm/serial"
 )
 
-// SerialPort represents a serial connection to the device
+// ErrPortNotOpen is returned when an operation needs an open port and has none.
+var ErrPortNotOpen = errors.New("serial: port not open")
+
+// ErrUnsupportedOption is returned at construction for a configured option the
+// driver cannot honour, rather than silently ignoring it.
+var ErrUnsupportedOption = errors.New("serial: unsupported option")
+
+// Logger is the subset of logging this package needs.
+type Logger interface {
+	Debug(format string, args ...interface{})
+	Info(format string, args ...interface{})
+	Warn(format string, args ...interface{})
+	Error(format string, args ...interface{})
+}
+
+// Config holds serial link settings. It is passed as a struct rather than as
+// positional arguments so an option cannot be silently dropped.
+type Config struct {
+	Port     string
+	BaudRate int
+	DataBits int
+	Parity   string // "N", "O", "E"
+	StopBits int    // 1 or 2
+
+	// ReadTimeout is the per-syscall block time. The driver programs this into
+	// termios VTIME, which has 100ms granularity, so it is rounded up to a
+	// multiple of 100ms.
+	ReadTimeout time.Duration
+
+	// ResponseTimeout is the total budget for one transaction: how long to
+	// wait for the matching response frame after writing a command.
+	ResponseTimeout time.Duration
+
+	// ReopenBackoff is the initial delay between reopen attempts, doubling up
+	// to MaxReopenBackoff.
+	ReopenBackoff    time.Duration
+	MaxReopenBackoff time.Duration
+
+	// HealthCheckInterval is how often the supervisor polls port health.
+	HealthCheckInterval time.Duration
+
+	// XonXoff and DsrDtr are rejected at construction: the driver has no flow
+	// control support, and pretending otherwise corrupts frames.
+	XonXoff bool
+	DsrDtr  bool
+
+	// Opener overrides how the port is opened. When nil the configured serial
+	// device is opened with the settings above.
+	Opener func() (Port, error)
+}
+
+// vtimeGranularity is the resolution of termios VTIME (one decisecond).
+const vtimeGranularity = 100 * time.Millisecond
+
+func (c *Config) applyDefaults(log Logger) {
+	if c.BaudRate == 0 {
+		c.BaudRate = 115200
+	}
+	if c.DataBits == 0 {
+		c.DataBits = 8
+	}
+	if c.Parity == "" {
+		c.Parity = "N"
+	}
+	if c.StopBits == 0 {
+		c.StopBits = 1
+	}
+	if c.ResponseTimeout <= 0 {
+		c.ResponseTimeout = 500 * time.Millisecond
+	}
+	if c.ReopenBackoff <= 0 {
+		c.ReopenBackoff = 500 * time.Millisecond
+	}
+	if c.MaxReopenBackoff < c.ReopenBackoff {
+		c.MaxReopenBackoff = 30 * time.Second
+	}
+	if c.HealthCheckInterval <= 0 {
+		c.HealthCheckInterval = time.Second
+	}
+
+	// The kernel cannot express a read timeout finer than 100ms, so a smaller
+	// value would silently become 100ms while the caller budgeted for less.
+	if c.ReadTimeout < vtimeGranularity {
+		if c.ReadTimeout > 0 {
+			log.Warn("serial: read_timeout %v is below the %v kernel granularity, using %v",
+				c.ReadTimeout, vtimeGranularity, vtimeGranularity)
+		}
+		c.ReadTimeout = vtimeGranularity
+	} else if r := c.ReadTimeout % vtimeGranularity; r != 0 {
+		rounded := c.ReadTimeout - r + vtimeGranularity
+		log.Warn("serial: read_timeout %v is not a multiple of %v, rounding up to %v",
+			c.ReadTimeout, vtimeGranularity, rounded)
+		c.ReadTimeout = rounded
+	}
+
+	// A response can never arrive faster than one read cycle.
+	if c.ResponseTimeout < c.ReadTimeout {
+		log.Warn("serial: response timeout %v is below read_timeout %v, raising it",
+			c.ResponseTimeout, c.ReadTimeout)
+		c.ResponseTimeout = c.ReadTimeout
+	}
+}
+
+// SerialPort is a framed, request/response serial connection. It is safe for
+// concurrent use: transactions are serialised, so only one command is on the
+// wire at a time.
 type SerialPort struct {
-	port                *serial.Port
-	config              *serial.Config
-	mu                  sync.Mutex
-	writeMu             sync.Mutex  // Dedicated mutex for write operations (ensures write priority)
-	readInProgress      atomic.Bool // Flag to track if a read is in progress
-	open                bool
-	portName            string
-	baudRate            int
-	reopenCount         int
-	maxReopens          int
-	readTimeout         time.Duration
-	deadlineTimeout     time.Duration
-	writeWithRetryDelay time.Duration
-	deviceResponseDelay time.Duration
-	readWithRetryDelay  time.Duration
-	readMaxRetries      int
-	writeMaxRetries     int
-	maxRetries          int
+	cfg Config
+	log Logger
+
+	// opener creates the underlying port; replaced in tests.
+	opener func() (Port, error)
+
+	// txMu serialises whole transactions and excludes the supervisor's
+	// close/reopen, so the port is never swapped mid-transaction.
+	txMu sync.Mutex
+
+	mu      sync.Mutex
+	port    Port
+	fr      *frameReader
+	open    bool
+	healthy bool
 }
 
-// NewSerialPort creates a new serial port instance
-func NewSerialPort(port string, baudrate int, timeout int, writeTimeout int, xonxoff bool, readTimeoutSec int, maxReopens int, deadlineTimeoutMs int, writeWithRetryDelayMs int, deviceResponseDelayMs int, readWithRetryDelayMs int, readMaxRetries int, writeMaxRetries int, maxRetries int) *SerialPort {
-	// Set default timeout to 200ms if not specified (prevents blocking forever)
-	// Use milliseconds for faster response
-	readTimeout := time.Duration(readTimeoutSec) * time.Millisecond
-	if readTimeout == 0 {
-		readTimeout = 200 * time.Millisecond // Default from config
+// New creates a serial port from cfg. It returns an error for options the
+// driver cannot honour, instead of ignoring them.
+func New(cfg Config, log Logger) *SerialPort {
+	cfg.applyDefaults(log)
+	s := &SerialPort{cfg: cfg, log: log}
+	s.opener = cfg.Opener
+	if s.opener == nil {
+		s.opener = s.openTarm
 	}
-
-	return &SerialPort{
-		portName:            port,
-		baudRate:            baudrate,
-		readTimeout:         readTimeout,
-		maxReopens:          maxReopens,
-		deadlineTimeout:     time.Duration(deadlineTimeoutMs) * time.Millisecond,
-		writeWithRetryDelay: time.Duration(writeWithRetryDelayMs) * time.Millisecond,
-		deviceResponseDelay: time.Duration(deviceResponseDelayMs) * time.Millisecond,
-		readWithRetryDelay:  time.Duration(readWithRetryDelayMs) * time.Millisecond,
-		readMaxRetries:      readMaxRetries,
-		writeMaxRetries:     writeMaxRetries,
-		maxRetries:          maxRetries,
-		config: &serial.Config{
-			Name:        port,
-			Baud:        baudrate,
-			ReadTimeout: readTimeout,
-			Parity:      serial.ParityNone,
-			StopBits:    serial.Stop1,
-			Size:        8,
-		},
-		open:        false,
-		reopenCount: 0,
-	}
+	return s
 }
 
-// Open opens the serial port connection
+// Validate reports configured options this driver cannot honour. Callers
+// should treat a non-nil result as fatal: silently ignoring flow control means
+// XON/XOFF bytes are parsed as frame data.
+func (c *Config) Validate() error {
+	if c.XonXoff {
+		return fmt.Errorf("%w: xonxoff (software flow control) is not supported by the tarm/serial driver", ErrUnsupportedOption)
+	}
+	if c.DsrDtr {
+		return fmt.Errorf("%w: dsrdtr (hardware flow control) is not supported by the tarm/serial driver", ErrUnsupportedOption)
+	}
+	switch strings.ToUpper(c.Parity) {
+	case "N", "O", "E":
+	default:
+		return fmt.Errorf("%w: parity %q", ErrUnsupportedOption, c.Parity)
+	}
+	if c.DataBits < 5 || c.DataBits > 8 {
+		return fmt.Errorf("%w: bytesize %d", ErrUnsupportedOption, c.DataBits)
+	}
+	if c.StopBits != 1 && c.StopBits != 2 {
+		return fmt.Errorf("%w: stopbits %d", ErrUnsupportedOption, c.StopBits)
+	}
+	return nil
+}
+
+// openTarm opens the real device with every configured line setting applied.
+func (s *SerialPort) openTarm() (Port, error) {
+	var parity serial.Parity
+	switch strings.ToUpper(s.cfg.Parity) {
+	case "O":
+		parity = serial.ParityOdd
+	case "E":
+		parity = serial.ParityEven
+	default:
+		parity = serial.ParityNone
+	}
+	stop := serial.Stop1
+	if s.cfg.StopBits == 2 {
+		stop = serial.Stop2
+	}
+	return serial.OpenPort(&serial.Config{
+		Name:        s.cfg.Port,
+		Baud:        s.cfg.BaudRate,
+		ReadTimeout: s.cfg.ReadTimeout,
+		Size:        byte(s.cfg.DataBits),
+		Parity:      parity,
+		StopBits:    stop,
+	})
+}
+
+// Open opens the port. It is idempotent.
 func (s *SerialPort) Open() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.openLocked()
+}
 
+func (s *SerialPort) openLocked() error {
 	if s.open {
 		return nil
 	}
-
-	port, err := serial.OpenPort(s.config)
+	port, err := s.opener()
 	if err != nil {
-		return fmt.Errorf("failed to open serial port: %w", err)
+		// The driver error already names the device path.
+		return err
 	}
-
 	s.port = port
+	s.fr = newFrameReader(port)
 	s.open = true
-	s.reopenCount = 0
+	s.healthy = true
 	return nil
 }
 
-// Close closes the serial port connection
+// Close closes the port. It is idempotent.
 func (s *SerialPort) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	if !s.open {
-		return nil
-	}
-
-	if s.port != nil {
-		err := s.port.Close()
-		s.port = nil
-		s.open = false
-		return err
-	}
-
-	s.open = false
-	return nil
+	return s.closeLocked()
 }
 
-// IsOpen returns true if the serial port is open
+func (s *SerialPort) closeLocked() error {
+	s.open = false
+	s.healthy = false
+	port := s.port
+	s.port = nil
+	s.fr = nil
+	if port == nil {
+		return nil
+	}
+	return port.Close()
+}
+
+// IsOpen reports whether the port is open.
 func (s *SerialPort) IsOpen() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.open
 }
 
-// GetReopenCount returns the number of times the port has been reopened
-func (s *SerialPort) GetReopenCount() int {
+// IsHealthy reports whether the port is open and has not hit a port-level
+// error. A read timeout does not make a port unhealthy.
+func (s *SerialPort) IsHealthy() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.reopenCount
+	return s.open && s.healthy
 }
 
-// ResetReopenCount resets the reopen counter
-func (s *SerialPort) ResetReopenCount() {
+// markUnhealthy records that the port needs to be reopened by the supervisor.
+func (s *SerialPort) markUnhealthy(cause error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.reopenCount = 0
-}
-
-// GetPortName returns the serial port name
-func (s *SerialPort) GetPortName() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.portName
-}
-
-// GetBaudRate returns the baud rate
-func (s *SerialPort) GetBaudRate() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.baudRate
-}
-
-// GetMaxRetries returns the max retries for register operations
-func (s *SerialPort) GetMaxRetries() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.maxRetries
-}
-
-// GetDeviceResponseDelay returns the device response delay in milliseconds
-func (s *SerialPort) GetDeviceResponseDelay() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return int(s.deviceResponseDelay.Milliseconds())
-}
-
-// FlushBuffer flushes the serial input buffer multiple times to clear stale data
-// This is useful after write operations to ensure clean state for subsequent reads
-func (s *SerialPort) FlushBuffer() {
-	s.FlushInputMultiple(5)
-}
-
-// WaitForReadComplete waits for any ongoing read operation to complete
-// Returns immediately if no read is in progress
-// This is used by write operations to ensure exclusive access
-func (s *SerialPort) WaitForReadComplete() {
-	// Check if a read is in progress
-	for s.readInProgress.Load() {
-		// Wait a short time before checking again
-		time.Sleep(10 * time.Millisecond)
-	}
-}
-
-// Reopen closes and reopens the serial port (hybrid approach - step 2)
-func (s *SerialPort) Reopen() error {
-	s.mu.Lock()
-
-	// Close existing port
-	if s.port != nil {
-		_ = s.port.Close()
-		s.port = nil
-	}
-	s.open = false
-
-	// Increment counter BEFORE attempting reopen
-	s.reopenCount++
-	currentReopenCount := s.reopenCount
-
+	wasHealthy := s.healthy
+	s.healthy = false
 	s.mu.Unlock()
+	if wasHealthy {
+		s.log.Error("serial: port %s marked unhealthy: %v", s.cfg.Port, cause)
+	}
+}
 
-	// Small delay before reopening
-	time.Sleep(2 * time.Millisecond)
+// GetPortName returns the configured device path.
+func (s *SerialPort) GetPortName() string { return s.cfg.Port }
 
+// GetBaudRate returns the configured baud rate.
+func (s *SerialPort) GetBaudRate() int { return s.cfg.BaudRate }
+
+// ResponseTimeout returns the per-transaction budget.
+func (s *SerialPort) ResponseTimeout() time.Duration { return s.cfg.ResponseTimeout }
+
+// session returns the current port and frame reader. Callers must hold txMu,
+// which guarantees the port is not swapped while they use it.
+func (s *SerialPort) session() (Port, *frameReader, error) {
 	s.mu.Lock()
-	port, err := serial.OpenPort(s.config)
+	defer s.mu.Unlock()
+	if !s.open || s.port == nil || s.fr == nil {
+		return nil, nil, ErrPortNotOpen
+	}
+	return s.port, s.fr, nil
+}
+
+// Transact writes command and returns the value from the response frame whose
+// "<node> <register>" prefix matches it.
+//
+// Frames that do not match are discarded and reading continues until the
+// response timeout: the device may have queued a stale reply or an unsolicited
+// message, and re-sending the command to resync would re-apply writes.
+func (s *SerialPort) Transact(ctx context.Context, command string) (string, error) {
+	s.txMu.Lock()
+	defer s.txMu.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+
+	port, fr, err := s.session()
 	if err != nil {
-		s.mu.Unlock()
-		return fmt.Errorf("failed to reopen serial port (attempt %d/%d): %w", currentReopenCount, s.maxReopens, err)
+		return "", err
 	}
 
-	s.port = port
-	s.open = true
-	s.mu.Unlock()
-
-	return nil
-}
-
-// FlushInput flushes the input buffer by reading all available data
-func (s *SerialPort) FlushInput() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if !s.open || s.port == nil {
-		return fmt.Errorf("serial port not open")
-	}
-
-	// Set a short timeout for flushing (configurable)
-	deadline := time.Now().Add(s.deadlineTimeout)
-
-	// Use reflection or type assertion to set deadline if possible
-	// Since SetReadDeadline may not be available, we'll read with timeout
-	buf := make([]byte, 1024)
-	flushed := 0
-	for time.Now().Before(deadline) {
-		// Try to read - this is a best-effort flush
-		// The tarm/serial library doesn't support SetReadDeadline,
-		// so we rely on the ReadTimeout in the config
-		n, err := s.port.Read(buf)
-		if err != nil || n == 0 {
-			break
+	// Discard anything stale before asking a question, so the first frame back
+	// belongs to this command.
+	fr.reset()
+	if err := port.Flush(); err != nil {
+		if IsPortError(err) {
+			s.markUnhealthy(err)
 		}
-		flushed += n
-	}
-	return nil
-}
-
-// FlushInputMultiple times to ensure buffer is clear
-func (s *SerialPort) FlushInputMultiple(times int) {
-	for i := 0; i < times; i++ {
-		_ = s.FlushInput()
-		time.Sleep(10 * time.Millisecond)
-	}
-}
-
-// FlushOutput flushes the output buffer
-func (s *SerialPort) FlushOutput() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if !s.open || s.port == nil {
-		return fmt.Errorf("serial port not open")
+		return "", fmt.Errorf("flush before %q: %w", command, err)
 	}
 
-	// In Go serial library, we don't have direct flush
-	return nil
-}
-
-// Write writes data to the serial port
-func (s *SerialPort) Write(data string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if !s.open || s.port == nil {
-		return fmt.Errorf("serial port not open")
+	if _, err := port.Write([]byte(command + "\r\n")); err != nil {
+		if IsPortError(err) {
+			s.markUnhealthy(err)
+		}
+		return "", fmt.Errorf("write %q: %w", command, err)
 	}
 
-	_, err := s.port.Write([]byte(data))
-	return err
-}
-
-// WriteCommand writes a command with CRLF terminator
-func (s *SerialPort) WriteCommand(command string) error {
-	return s.Write(command + "\r\n")
-}
-
-// Read reads a line from the serial port with proper timeout handling
-func (s *SerialPort) Read() (string, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if !s.open || s.port == nil {
-		return "", fmt.Errorf("serial port not open")
-	}
-
-	// Mark that a read is in progress
-	s.readInProgress.Store(true)
-	defer s.readInProgress.Store(false)
-
-	// Use larger buffer and read with timeout
-	buf := make([]byte, 256)
-	var result []byte
-
-	// Set deadline for the entire read operation
-	deadline := time.Now().Add(s.readTimeout)
-
+	want := commandPrefix(command)
+	deadline := time.Now().Add(s.cfg.ResponseTimeout)
 	for {
-		// Check if we've exceeded deadline
-		if time.Now().After(deadline) {
-			if len(result) > 0 {
-				return string(result), fmt.Errorf("read timeout after %d bytes", len(result))
-			}
-			return "", fmt.Errorf("read timeout")
+		if err := ctx.Err(); err != nil {
+			return "", err
 		}
-
-		// Set read deadline for each read operation
-		// Note: tarm/serial doesn't support SetReadDeadline,
-		// so we rely on the config ReadTimeout
-		n, err := s.port.Read(buf)
+		frame, err := fr.readFrame(deadline)
 		if err != nil {
-			// Check for timeout error
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				if len(result) > 0 {
-					return string(result), nil // Return partial data on timeout
-				}
-				return "", fmt.Errorf("read timeout")
+			if IsPortError(err) {
+				s.markUnhealthy(err)
 			}
-			return string(result), err
+			return "", fmt.Errorf("read response to %q: %w", command, err)
 		}
-		if n > 0 {
-			result = append(result, buf[:n]...)
-			// Check for newline in the accumulated result
-			for i := len(result) - 1; i >= 0; i-- {
-				if result[i] == '\n' {
-					// Remove trailing CR if present
-					if i > 0 && result[i-1] == '\r' {
-						result = result[:i-1]
-					} else {
-						result = result[:i]
-					}
-					return string(result), nil
-				}
-			}
+		if value, ok := ParseResponse(frame, want); ok {
+			return value, nil
 		}
-
-		// No data available - add small delay to prevent CPU spinning
-		// This helps with non-blocking reads when device hasn't responded yet
-		// Reduced from 2ms to 1ms for faster response to write priority
-		time.Sleep(1 * time.Millisecond)
-
-		// Check if we've exceeded a reasonable buffer size
-		if len(result) > 256 {
-			break
-		}
+		s.log.Debug("serial: discarding frame %q while waiting for %q", frame, want)
 	}
-
-	return string(result), nil
 }
 
-// ReadWithRetry reads from serial with retry logic
-func (s *SerialPort) ReadWithRetry(maxRetries int, delay time.Duration) (string, error) {
-	for i := 0; i < maxRetries; i++ {
-		response, err := s.Read()
-		if err == nil && len(response) > 0 {
-			return response, nil
+// Supervise reopens the port whenever it becomes unhealthy, with exponential
+// backoff, until ctx is done. It is the only place that reopens the port, so a
+// transient read failure cannot trigger a device-resetting reopen.
+func (s *SerialPort) Supervise(ctx context.Context) {
+	backoff := s.cfg.ReopenBackoff
+	for {
+		if ctx.Err() != nil {
+			return
 		}
-		if i < maxRetries-1 {
-			time.Sleep(delay)
-		}
-	}
-	return "", fmt.Errorf("failed to read after %d retries", maxRetries)
-}
-
-// WriteWithRetry writes to serial with retry logic
-func (s *SerialPort) WriteWithRetry(command string, maxRetries int, delay time.Duration) error {
-	for i := 0; i < maxRetries; i++ {
-		err := s.WriteCommand(command)
-		if err == nil {
-			return nil
-		}
-		if i < maxRetries-1 {
-			time.Sleep(delay)
-		}
-	}
-	return fmt.Errorf("failed to write after %d retries", maxRetries)
-}
-
-// SendAndReceive sends a command and reads the response with hybrid retry approach
-// Step 1: Flush input, write command, try to read
-// Step 2: If write fails, retry with delay
-// Step 3: If read fails, retry with delay
-// Step 4: If still failing, reopen port and retry
-// Uses write lock to ensure write operations have priority and can preempt reads
-func (s *SerialPort) SendAndReceive(command string, maxRetries int) (string, error) {
-	// Acquire write lock to ensure exclusive access for write operations
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-
-	// Try up to maxRetries with hybrid approach
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		// Wait for any ongoing read to complete before attempting write
-		// This ensures write operations have priority by waiting for reads to finish
-		s.WaitForReadComplete()
-
-		// Only force reopen on retry attempts (not first attempt) to avoid unnecessary delays
-		// This was causing significant delays (5ms + port reopen time) on every write
-		if attempt > 0 {
-			_ = s.ForceReopen()
-		}
-
-		// Flush input before sending (multiple times for thorough cleaning)
-		s.FlushInputMultiple(3)
-
-		// Write command with retry
-		err := s.WriteWithRetry(command, s.writeMaxRetries, s.writeWithRetryDelay)
-		if err != nil {
-			// Try to reopen and retry
-			if s.tryReopen() {
-				continue
+		if s.IsHealthy() {
+			backoff = s.cfg.ReopenBackoff
+			if !sleepCtx(ctx, s.cfg.HealthCheckInterval) {
+				return
 			}
-			return "", fmt.Errorf("write error (attempt %d/%d): %w", attempt+1, maxRetries, err)
-		}
-
-		// Small delay to allow device to respond (configurable)
-		time.Sleep(s.deviceResponseDelay)
-
-		// Read response with retry
-		response, err := s.ReadWithRetry(s.readMaxRetries, s.readWithRetryDelay)
-		if err == nil && len(response) > 0 {
-			return response, nil
-		}
-
-		// If read failed, try to reopen and retry
-		if s.tryReopen() {
 			continue
 		}
-	}
 
-	return "", fmt.Errorf("failed to communicate after %d attempts", maxRetries)
-}
-
-// tryReopen attempts to reopen the serial port (part of hybrid approach)
-func (s *SerialPort) tryReopen() bool {
-	s.mu.Lock()
-	canReopen := s.open && s.reopenCount < s.maxReopens
-	s.mu.Unlock()
-
-	if !canReopen {
-		return false
-	}
-
-	if err := s.Reopen(); err != nil {
-		return false
-	}
-	return true
-}
-
-// ForceReopen forces a reopen of the serial port, ignoring the reopen count limit
-// This is used for write priority operations to ensure clean state
-func (s *SerialPort) ForceReopen() error {
-	s.mu.Lock()
-
-	// Close existing port
-	if s.port != nil {
-		_ = s.port.Close()
-		s.port = nil
-	}
-	s.open = false
-
-	s.mu.Unlock()
-
-	// Small delay before reopening
-	time.Sleep(5 * time.Millisecond)
-
-	s.mu.Lock()
-	port, err := serial.OpenPort(s.config)
-	if err != nil {
-		s.mu.Unlock()
-		return fmt.Errorf("failed to force reopen serial port: %w", err)
-	}
-
-	s.port = port
-	s.open = true
-	s.reopenCount = 0 // Reset counter for forced reopen
-	s.mu.Unlock()
-
-	return nil
-}
-
-// SendAndReceiveWithTiming sends a command and reads the response with timing info
-func (s *SerialPort) SendAndReceiveWithTiming(command string, maxRetries int) (string, time.Duration, error) {
-	startTime := time.Now()
-
-	response, err := s.SendAndReceive(command, maxRetries)
-	duration := time.Since(startTime)
-
-	return response, duration, err
-}
-
-// ParseResponse parses a serial response and extracts the value
-// Expected format: "command value" (e.g., "130 1067 3")
-// It checks the register address in the response matches the expected register
-func ParseResponse(response string, expectedCommand string) (string, bool) {
-	// Split response into lines (device may send multiple responses)
-	lines := strings.Split(response, "\n")
-
-	for _, line := range lines {
-		parts := strings.Fields(line)
-
-		// Expected format: command response_value
-		// e.g., "130 1067 3" -> parts[0]=130, parts[1]=1067, parts[2]=3
-		if len(parts) >= 3 {
-			// Check if the command matches (both device address and register address)
-			cmd := parts[0] + " " + parts[1]
-			if cmd == expectedCommand {
-				return parts[2], true
+		if err := s.reopen(); err != nil {
+			s.log.Warn("serial: reopen of %s failed, retrying in %v: %v", s.cfg.Port, backoff, err)
+			if !sleepCtx(ctx, backoff) {
+				return
 			}
+			if backoff *= 2; backoff > s.cfg.MaxReopenBackoff {
+				backoff = s.cfg.MaxReopenBackoff
+			}
+			continue
+		}
+		s.log.Info("serial: port %s reopened", s.cfg.Port)
+		backoff = s.cfg.ReopenBackoff
+	}
+}
+
+// reopen closes and reopens the port. It takes txMu so it never runs while a
+// transaction is using the port.
+func (s *SerialPort) reopen() error {
+	s.txMu.Lock()
+	defer s.txMu.Unlock()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := s.closeLocked(); err != nil {
+		s.log.Debug("serial: close during reopen: %v", err)
+	}
+	return s.openLocked()
+}
+
+// sleepCtx waits for d, reporting false if ctx finished first.
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
+}
+
+// commandPrefix returns the "<node> <register>" part of a command, which is
+// what a response frame echoes back.
+func commandPrefix(command string) string {
+	fields := strings.Fields(command)
+	if len(fields) < 2 {
+		return strings.TrimSpace(command)
+	}
+	return fields[0] + " " + fields[1]
+}
+
+// ParseResponse extracts the value from a response frame, verifying that the
+// frame answers the expected command.
+//
+// Frames look like "130 1067 3": node address, register address, value.
+func ParseResponse(response string, expectedCommand string) (string, bool) {
+	for _, line := range strings.Split(response, "\n") {
+		parts := strings.Fields(line)
+		if len(parts) < 3 {
+			continue
+		}
+		if parts[0]+" "+parts[1] == expectedCommand {
+			return parts[2], true
 		}
 	}
-
 	return "", false
 }

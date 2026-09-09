@@ -7,27 +7,18 @@ import (
 	"sync"
 	"time"
 
-	"github.com/eclipse/paho.mqtt.golang"
+	paho "github.com/eclipse/paho.mqtt.golang"
 )
 
-// Client represents an MQTT client for communicating with Home Assistant
-type Client struct {
-	client          mqtt.Client
-	config          *MQTTConfig
-	connected       bool
-	mu              sync.RWMutex
-	deviceID        string
-	discoveryPrefix string
-
-	// Subscription tracking for resilience
-	subscribedTopics map[string]MessageHandler // topic -> handler
-	subMu            sync.RWMutex
+// Logger is the subset of logging this package needs.
+type Logger interface {
+	Debug(format string, args ...interface{})
+	Info(format string, args ...interface{})
+	Warn(format string, args ...interface{})
+	Error(format string, args ...interface{})
 }
 
-// ConnectionHandler is a callback for connection state changes
-type ConnectionHandler func(connected bool)
-
-// MQTTConfig holds MQTT connection configuration
+// MQTTConfig holds MQTT connection configuration.
 type MQTTConfig struct {
 	Broker            string
 	Port              int
@@ -37,335 +28,252 @@ type MQTTConfig struct {
 	QOS               int
 	Retain            bool
 	PublishRetryCount int
+
+	// AvailabilityTopic carries online/offline for Home Assistant. It is also
+	// registered as the last will, so an unclean disconnect marks the gateway
+	// offline instead of leaving stale retained values looking live.
+	AvailabilityTopic string
+
+	// OpTimeout bounds every broker interaction. Without it a broker that
+	// holds the TCP connection open but stops acknowledging wedges the caller
+	// forever, and publishes happen on the serial read path.
+	OpTimeout time.Duration
 }
 
-// MessageHandler is a function type for handling incoming MQTT messages
+const (
+	payloadOnline  = "online"
+	payloadOffline = "offline"
+)
+
+// MessageHandler handles an incoming MQTT message.
 type MessageHandler func(topic string, message string)
 
-// NewClient creates a new MQTT client
-func NewClient(config *MQTTConfig, deviceID string, discoveryPrefix string) *Client {
+// Client is an MQTT client for talking to Home Assistant.
+type Client struct {
+	client paho.Client
+	config *MQTTConfig
+	logger Logger
+
+	deviceID        string
+	discoveryPrefix string
+
+	subMu            sync.RWMutex
+	subscribedTopics map[string]MessageHandler
+}
+
+// NewClient creates a new MQTT client.
+func NewClient(config *MQTTConfig, deviceID string, discoveryPrefix string, log Logger) *Client {
+	if config != nil && config.OpTimeout <= 0 {
+		config.OpTimeout = 5 * time.Second
+	}
 	return &Client{
 		config:           config,
+		logger:           log,
 		deviceID:         deviceID,
 		discoveryPrefix:  discoveryPrefix,
-		connected:        false,
 		subscribedTopics: make(map[string]MessageHandler),
 	}
 }
 
-// Connect connects to the MQTT broker with resilience features
+// Connect connects to the broker.
+//
+// Automatic connect-retry is deliberately left off: with it enabled paho's
+// Connect token never completes while the broker is down, which makes the
+// caller's own retry, backoff and cancellation unreachable. Reconnection after
+// an established session is still handled by paho.
 func (c *Client) Connect() error {
 	broker := fmt.Sprintf("tcp://%s:%d", c.config.Broker, c.config.Port)
 
-	opts := mqtt.NewClientOptions()
+	opts := paho.NewClientOptions()
 	opts.AddBroker(broker)
 	opts.SetClientID(c.config.ClientID)
 	opts.SetUsername(c.config.Username)
 	opts.SetPassword(c.config.Password)
 
-	// Enable persistent session for subscription recovery
-	// This preserves subscriptions across reconnects
-	opts.SetCleanSession(false)
+	// A clean session avoids the broker queueing commands while the gateway is
+	// offline and replaying them on reconnect: an hours-old fan command must
+	// not be applied at startup. Subscriptions are restored by OnConnect.
+	opts.SetCleanSession(true)
 
-	// Enable auto-reconnect with configurable interval
 	opts.SetAutoReconnect(true)
-	opts.SetConnectRetry(true)
-	opts.SetConnectRetryInterval(5 * time.Second)
 	opts.SetMaxReconnectInterval(60 * time.Second)
-
-	// Set KeepAlive to detect network failures within 30 seconds
-	// This ensures faster disconnect detection compared to default
 	opts.SetKeepAlive(30 * time.Second)
+	opts.SetConnectTimeout(c.config.OpTimeout)
 
-	// Set reconnection handler for visibility into reconnection progress
-	opts.SetReconnectingHandler(func(client mqtt.Client, opts *mqtt.ClientOptions) {
-		fmt.Println("MQTT attempting to reconnect...")
+	if c.config.AvailabilityTopic != "" {
+		opts.SetWill(c.config.AvailabilityTopic, payloadOffline, byte(c.config.QOS), true)
+	}
+
+	opts.SetConnectionLostHandler(func(_ paho.Client, err error) {
+		c.logger.Warn("MQTT connection lost: %v", err)
 	})
 
-	// Set connection notification handler for state change visibility
-	opts.SetConnectionNotificationHandler(func(client mqtt.Client, notification mqtt.ConnectionNotification) {
-		fmt.Printf("MQTT connection state: %v\n", notification.Type())
+	opts.SetReconnectingHandler(func(_ paho.Client, _ *paho.ClientOptions) {
+		c.logger.Info("MQTT reconnecting to %s...", broker)
 	})
 
-	// Set connection handlers
-	opts.OnConnectionLost = func(client mqtt.Client, err error) {
-		c.mu.Lock()
-		c.connected = false
-		c.mu.Unlock()
-		fmt.Printf("MQTT connection lost: %v\n", err)
+	opts.SetOnConnectHandler(func(_ paho.Client) {
+		c.logger.Info("MQTT connected to %s", broker)
+		// This runs on paho's connection goroutine, which must not block, so
+		// recovery happens separately.
+		go c.onConnected()
+	})
+
+	c.client = paho.NewClient(opts)
+
+	token := c.client.Connect()
+	if !token.WaitTimeout(c.config.OpTimeout) {
+		return fmt.Errorf("connect to %s timed out after %v", broker, c.config.OpTimeout)
 	}
-
-	opts.OnConnect = func(client mqtt.Client) {
-		c.mu.Lock()
-		c.connected = true
-		c.mu.Unlock()
-		fmt.Printf("MQTT connected to %s\n", broker)
-
-		// Auto-recover subscriptions after reconnect
-		// This ensures we re-subscribe to all topics even with persistent session
-		if err := c.resubscribeAll(); err != nil {
-			fmt.Printf("MQTT failed to recover subscriptions: %v\n", err)
-		}
+	if err := token.Error(); err != nil {
+		return fmt.Errorf("connect to %s: %w", broker, err)
 	}
-
-	c.client = mqtt.NewClient(opts)
-
-	if token := c.client.Connect(); token.Wait() && token.Error() != nil {
-		return fmt.Errorf("failed to connect to MQTT broker: %w", token.Error())
-	}
-
-	c.mu.Lock()
-	c.connected = true
-	c.mu.Unlock()
-
 	return nil
 }
 
-// resubscribeAll re-subscribes to all previously subscribed topics
-func (c *Client) resubscribeAll() error {
-	c.subMu.RLock()
-	topicCount := len(c.subscribedTopics)
-	c.subMu.RUnlock()
+// onConnected restores subscriptions and announces availability.
+func (c *Client) onConnected() {
+	if err := c.publishAvailability(payloadOnline); err != nil {
+		c.logger.Error("MQTT failed to announce availability: %v", err)
+	}
+	c.resubscribeAll()
+}
 
-	if topicCount == 0 {
+// publishAvailability marks the gateway online or offline.
+func (c *Client) publishAvailability(state string) error {
+	if c.config.AvailabilityTopic == "" {
 		return nil
 	}
+	return c.publishRetained(c.config.AvailabilityTopic, state, true)
+}
 
-	fmt.Printf("MQTT recovering %d subscriptions...\n", topicCount)
-
+// resubscribeAll re-subscribes to every tracked topic, continuing past
+// individual failures so one bad topic cannot leave the rest unsubscribed.
+func (c *Client) resubscribeAll() {
 	c.subMu.RLock()
-	topics := make(map[string]MessageHandler)
+	topics := make(map[string]MessageHandler, len(c.subscribedTopics))
 	for topic, handler := range c.subscribedTopics {
 		topics[topic] = handler
 	}
 	c.subMu.RUnlock()
 
+	if len(topics) == 0 {
+		return
+	}
+
+	c.logger.Info("MQTT restoring %d subscription(s)...", len(topics))
+	failed := 0
 	for topic, handler := range topics {
-		if err := c.subscribeTopic(topic, handler); err != nil {
-			return fmt.Errorf("failed to subscribe to %s: %w", topic, err)
+		if err := c.subscribe(topic, handler); err != nil {
+			c.logger.Error("MQTT failed to restore subscription to %s: %v", topic, err)
+			failed++
 		}
 	}
-
-	fmt.Printf("MQTT all subscriptions recovered\n")
-	return nil
+	if failed > 0 {
+		c.logger.Error("MQTT restored %d/%d subscription(s); commands on the rest will be missed",
+			len(topics)-failed, len(topics))
+		return
+	}
+	c.logger.Info("MQTT all subscriptions restored")
 }
 
-// subscribeTopic subscribes to a single topic
-func (c *Client) subscribeTopic(topic string, handler MessageHandler) error {
-	callback := func(client mqtt.Client, msg mqtt.Message) {
-		handler(msg.Topic(), string(msg.Payload()))
-	}
-
-	token := c.client.Subscribe(topic, byte(c.config.QOS), callback)
-	if token.Wait() && token.Error() != nil {
-		return token.Error()
-	}
-
-	return nil
-}
-
-// Disconnect disconnects from the MQTT broker
+// Disconnect marks the gateway offline and closes the connection.
 func (c *Client) Disconnect() {
-	if c.client != nil {
-		c.client.Disconnect(250)
+	if c.client == nil {
+		return
 	}
-	c.mu.Lock()
-	c.connected = false
-	c.mu.Unlock()
+	if c.IsConnected() {
+		if err := c.publishAvailability(payloadOffline); err != nil {
+			c.logger.Warn("MQTT failed to publish offline state: %v", err)
+		}
+	}
+	c.client.Disconnect(250)
 }
 
-// IsConnected returns true if the MQTT client is connected
+// IsConnected reports whether the broker connection is up. It asks paho rather
+// than tracking a flag, so it cannot drift from reality.
 func (c *Client) IsConnected() bool {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.connected && c.client != nil
+	return c.client != nil && c.client.IsConnected()
 }
 
-// GetSubscriptionCount returns the number of active subscriptions
-// Useful for health monitoring and debugging
-func (c *Client) GetSubscriptionCount() int {
-	c.subMu.RLock()
-	defer c.subMu.RUnlock()
-	return len(c.subscribedTopics)
-}
-
-// GetSubscribedTopics returns a copy of currently subscribed topics
-// Useful for debugging and health checks
-func (c *Client) GetSubscribedTopics() []string {
-	c.subMu.RLock()
-	defer c.subMu.RUnlock()
-	topics := make([]string, 0, len(c.subscribedTopics))
-	for topic := range c.subscribedTopics {
-		topics = append(topics, topic)
-	}
-	return topics
-}
-
-// Publish publishes a message to a topic with retry
+// Publish publishes a value, retrying with backoff.
 func (c *Client) Publish(topic string, value string) error {
-	if !c.IsConnected() {
-		return fmt.Errorf("MQTT client not connected")
+	return c.publishRetained(topic, value, c.config.Retain)
+}
+
+func (c *Client) publishRetained(topic string, value string, retain bool) error {
+	if c.client == nil {
+		return fmt.Errorf("publish to %s: MQTT client not initialised", topic)
 	}
 
-	// Get retry count from config, default to 3
-	retryCount := c.config.PublishRetryCount
-	if retryCount <= 0 {
-		retryCount = 3
+	attempts := c.config.PublishRetryCount
+	if attempts <= 0 {
+		attempts = 3
 	}
 
 	var lastErr error
-	for attempt := 0; attempt < retryCount; attempt++ {
-		token := c.client.Publish(topic, byte(c.config.QOS), c.config.Retain, value)
-		if token.Wait() && token.Error() != nil {
-			lastErr = fmt.Errorf("failed to publish to %s: %w", topic, token.Error())
-			// Wait before retry with exponential backoff
-			if attempt < retryCount-1 {
-				delay := time.Duration(1<<attempt) * time.Second
-				time.Sleep(delay)
-				continue
-			}
-			return lastErr
+	for attempt := 1; attempt <= attempts; attempt++ {
+		if attempt > 1 {
+			time.Sleep(time.Duration(attempt-1) * 250 * time.Millisecond)
+		}
+		if !c.IsConnected() {
+			lastErr = fmt.Errorf("publish to %s: not connected", topic)
+			continue
+		}
+
+		token := c.client.Publish(topic, byte(c.config.QOS), retain, value)
+		if !token.WaitTimeout(c.config.OpTimeout) {
+			// Retained state publishes are last-write-wins, so a retry after
+			// an unacknowledged publish is safe.
+			lastErr = fmt.Errorf("publish to %s: timed out after %v", topic, c.config.OpTimeout)
+			continue
+		}
+		if err := token.Error(); err != nil {
+			lastErr = fmt.Errorf("publish to %s: %w", topic, err)
+			continue
 		}
 		return nil
 	}
-
 	return lastErr
 }
 
-// Subscribe subscribes to a topic with a message handler and tracks for auto-recovery
+// Subscribe subscribes to a topic and tracks it for recovery on reconnect.
 func (c *Client) Subscribe(topic string, handler MessageHandler) error {
-	if !c.IsConnected() {
-		return fmt.Errorf("MQTT client not connected")
+	if c.client == nil {
+		return fmt.Errorf("subscribe to %s: MQTT client not initialised", topic)
 	}
 
-	callback := func(client mqtt.Client, msg mqtt.Message) {
-		handler(msg.Topic(), string(msg.Payload()))
-	}
-
-	token := c.client.Subscribe(topic, byte(c.config.QOS), callback)
-	if token.Wait() && token.Error() != nil {
-		return fmt.Errorf("failed to subscribe to %s: %w", topic, token.Error())
-	}
-
-	// Track subscription for auto-recovery on reconnect
 	c.subMu.Lock()
 	c.subscribedTopics[topic] = handler
 	c.subMu.Unlock()
 
-	return nil
+	return c.subscribe(topic, handler)
 }
 
-// SubscribeMultiple subscribes to multiple topics
-func (c *Client) SubscribeMultiple(topics []string, handler MessageHandler) error {
-	for _, topic := range topics {
-		if err := c.Subscribe(topic, handler); err != nil {
-			return err
-		}
+func (c *Client) subscribe(topic string, handler MessageHandler) error {
+	callback := func(_ paho.Client, msg paho.Message) {
+		handler(msg.Topic(), string(msg.Payload()))
 	}
-	return nil
+
+	token := c.client.Subscribe(topic, byte(c.config.QOS), callback)
+	if !token.WaitTimeout(c.config.OpTimeout) {
+		return fmt.Errorf("subscribe to %s timed out after %v", topic, c.config.OpTimeout)
+	}
+	return token.Error()
 }
 
-// HASensorConfig holds Home Assistant sensor discovery configuration
-type HASensorConfig struct {
-	Name        string                 `json:"name"`
-	StateTopic  string                 `json:"state_topic"`
-	Unit        string                 `json:"unit_of_measurement,omitempty"`
-	DeviceClass string                 `json:"device_class,omitempty"`
-	UniqueID    string                 `json:"unique_id"`
-	Device      map[string]interface{} `json:"device"`
-}
-
-// HASwitchConfig holds Home Assistant switch discovery configuration
-type HASwitchConfig struct {
-	Name         string                 `json:"name"`
-	CommandTopic string                 `json:"command_topic"`
-	StateTopic   string                 `json:"state_topic,omitempty"`
-	UniqueID     string                 `json:"unique_id"`
-	Device       map[string]interface{} `json:"device"`
-}
-
-// PublishSensorDiscovery publishes sensor discovery config to HA
-func (c *Client) PublishSensorDiscovery(sensor *HASensorConfig) error {
-	topic := fmt.Sprintf("%s/sensor/%s/%s/config", c.discoveryPrefix, c.deviceID, sensor.UniqueID)
-
-	data, err := json.Marshal(sensor)
+// PublishDiscovery publishes one discovery payload.
+func (c *Client) PublishDiscovery(topic string, payload interface{}) error {
+	data, err := json.Marshal(payload)
 	if err != nil {
-		return fmt.Errorf("failed to marshal sensor config: %w", err)
+		return fmt.Errorf("marshal discovery payload for %s: %w", topic, err)
 	}
-
-	return c.Publish(topic, string(data))
+	// Discovery is always retained so Home Assistant rediscovers the entities
+	// after a restart without the gateway republishing.
+	return c.publishRetained(topic, string(data), true)
 }
 
-// PublishSwitchDiscovery publishes switch discovery config to HA
-func (c *Client) PublishSwitchDiscovery(switchCfg *HASwitchConfig) error {
-	topic := fmt.Sprintf("%s/switch/%s/%s/config", c.discoveryPrefix, c.deviceID, switchCfg.UniqueID)
-
-	data, err := json.Marshal(switchCfg)
-	if err != nil {
-		return fmt.Errorf("failed to marshal switch config: %w", err)
-	}
-
-	return c.Publish(topic, string(data))
-}
-
-// CreateDeviceInfo creates device info for HA discovery
-func CreateDeviceInfo(deviceID, name, manufacturer, model, swVersion string) map[string]interface{} {
-	info := map[string]interface{}{
-		"identifiers":  []string{deviceID},
-		"name":         name,
-		"manufacturer": manufacturer,
-		"model":        model,
-	}
-	if swVersion != "" {
-		info["sw_version"] = swVersion
-	}
-	return info
-}
-
-// PublishAllSensorDiscovery publishes discovery configs for all sensors
-func (c *Client) PublishAllSensorDiscovery(sensors []HASensorConfig) error {
-	for _, sensor := range sensors {
-		if err := c.PublishSensorDiscovery(&sensor); err != nil {
-			return err
-		}
-		time.Sleep(2 * time.Millisecond) // Small delay between publishes
-	}
-	return nil
-}
-
-// PublishAllSwitchDiscovery publishes discovery configs for all switches
-func (c *Client) PublishAllSwitchDiscovery(switches []HASwitchConfig) error {
-	for _, sw := range switches {
-		if err := c.PublishSwitchDiscovery(&sw); err != nil {
-			return err
-		}
-		time.Sleep(2 * time.Millisecond) // Small delay between publishes
-	}
-	return nil
-}
-
-// GetTopicsFromConfig extracts subscribe topics from write register config
-func GetTopicsFromConfig(writeRegisters []WriteRegisterConfig) []string {
-	topics := make([]string, 0, len(writeRegisters))
-	for _, reg := range writeRegisters {
-		if reg.SubscribeTopic != "" {
-			topics = append(topics, reg.SubscribeTopic)
-		}
-	}
-	return topics
-}
-
-// WriteRegisterConfig holds configuration for a write register
-type WriteRegisterConfig struct {
-	Name            string
-	SubscribeTopic  string
-	CommandTemplate string
-	Topic           string
-	MinValue        int
-	MaxValue        int
-}
-
-// ParseWriteRegisterCommand parses a command template with a value
+// ParseWriteRegisterCommand fills a command template with a value.
 func ParseWriteRegisterCommand(template string, value string) string {
 	return strings.Replace(template, "{value}", value, 1)
 }
