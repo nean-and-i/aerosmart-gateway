@@ -172,7 +172,16 @@ type WriteRegisterConfig struct {
 	MinValue        int      `yaml:"min_value"`
 	MaxValue        int      `yaml:"max_value"`
 	VerifyRegisters []string `yaml:"verify_registers"`
-	HA              struct {
+
+	// StateFrom names the read register that carries this register's real
+	// value. The unit reports a setpoint on a different address than the one
+	// it is written to (luefterstufe is written on 5002 and read back on
+	// 5003), so reading it back is the only way to publish what the unit
+	// actually did rather than what was asked of it.
+	//
+	// Optional: without it the commanded value is published instead.
+	StateFrom string `yaml:"state_from"`
+	HA        struct {
 		Name string `yaml:"name"`
 		// Deprecated: the command topic is always SubscribeTopic, so the two
 		// cannot drift apart and leave commands unhandled.
@@ -578,6 +587,9 @@ func (c *RegistersConfig) Validate() error {
 			if !readNames[verify] {
 				problems = append(problems, fmt.Sprintf("write_registers[%s]: verify_registers references unknown read register %q", reg.Name, verify))
 			}
+		}
+		if reg.StateFrom != "" && !readNames[reg.StateFrom] {
+			problems = append(problems, fmt.Sprintf("write_registers[%s]: state_from references unknown read register %q", reg.Name, reg.StateFrom))
 		}
 		if reg.HA.DeprecatedCommandTopic != "" && reg.HA.DeprecatedCommandTopic != reg.SubscribeTopic {
 			problems = append(problems, fmt.Sprintf(

@@ -356,6 +356,9 @@ write_registers:
     topic: "aerosmart/luefterstufe"
     min_value: 0
     max_value: 5
+    # lueftermode (130 5003) is where the unit reports this setpoint back,
+    # within ~30ms of the write, so it is the authoritative state.
+    state_from: "lueftermode"
     verify_registers:
       - "luefterstatus"
       - "lueftermode"
@@ -370,8 +373,11 @@ write_registers:
     topic: "aerosmart/boilerheizstab"
     min_value: 0
     max_value: 1
+    # boilerheizstabanforderungstatus (140 1039) is the read-back for this
+    # register; the unit was observed broadcasting its twin (140 1038) on write.
+    state_from: "boilerheizstabanforderungstatus"
     verify_registers:
-      - "badplusstatus"
+      - "boilerheizstabanforderungstatus"
     ha:
       # 0/1 range, so this becomes a switch with explicit numeric payloads.
       name: "Aerosmart Boiler Heizstab"
