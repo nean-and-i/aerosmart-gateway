@@ -100,6 +100,10 @@ cp config/config.yaml.example config.yaml
 serial:
   port: "/dev/ttyUSB0"
   baudrate: 115200
+  # Rounded up to a multiple of 100ms (kernel VTIME granularity)
+  read_timeout: 200
+  response_timeout: 300
+  retries: 3
 
 mqtt:
   broker: "192.168.1.20"
@@ -107,19 +111,30 @@ mqtt:
   username: "mqtt"
   password: "your_password"
   client_id: "aerosmart-gateway"
+  # Home Assistant marks entities unavailable when this says "offline"
+  availability_topic: "aerosmart/status"
 
 device_id: "aerosmart"
 log_level: "info"
-read_interval: 60
+read_interval: 120
 
 ha_discovery:
   enabled: true
   prefix: "homeassistant"
+  # Seconds without an update before an entity is shown unavailable
+  # rather than displaying a stale retained value
+  expire_after: 300
   device_info:
     name: "Aerosmart Gateway"
     manufacturer: "Drexel und Weiss"
     model: "aerosmartPI"
     # sw_version: defaults to the application version if not set
+```
+
+Validate a configuration without starting the gateway:
+
+```bash
+./aerosmart-gateway -validate -config config.yaml -registers registers.yaml
 ```
 
 ### Running the Application
@@ -150,14 +165,34 @@ For detailed information about the application flow and timing diagrams, see:
 
 ### Serial Configuration
 
+All timeouts are in milliseconds.
+
 | Option | Description | Default |
 |--------|-------------|---------|
 | `serial.port` | Serial device path | `/dev/ttyUSB0` |
 | `serial.baudrate` | Baud rate | `115200` |
-| `serial.read_timeout` | Read timeout (ms, 0=200ms fallback) | `2` |
-| `serial.device_response_delay` | Wait after write (ms) | `40` |
-| `serial.max_retries` | Max operation retries | `10` |
-| `serial.max_reopens` | Max port reopen attempts | `10` |
+| `serial.bytesize` | Data bits (5-8) | `8` |
+| `serial.parity` | Parity: `N`, `O` or `E` | `N` |
+| `serial.stopbits` | Stop bits (1 or 2) | `1` |
+| `serial.read_timeout` | How long one read may block. The kernel expresses this as termios `VTIME` in deciseconds, so it is rounded up to a multiple of 100 | `200` |
+| `serial.response_timeout` | Budget for one command/response exchange. Stale or unmatched frames are discarded within this window | `300` |
+| `serial.retries` | Attempts per register operation. This is the only retry level in the stack | `3` |
+| `serial.retry_backoff` | Delay between attempts | `100` |
+| `serial.reopen_backoff` | Initial delay between port reopen attempts | `500` |
+| `serial.reopen_max_backoff` | Maximum reopen delay | `30000` |
+| `serial.health_check_interval` | How often port health is polled | `1000` |
+| `serial.write_priority_timeout` | Upper bound on how long a write may hold reads off | `10000` |
+| `serial.xonxoff` | Software flow control. **Not supported by the driver**; `true` is rejected at startup | `false` |
+| `serial.dsrdtr` | Hardware flow control. **Not supported by the driver** | `false` |
+
+Worst-case time for one register is `retries x (response_timeout + retry_backoff)`, so with the
+defaults 3 x 400ms = 1.2s. Startup rejects a configuration whose worst-case full cycle
+(that figure times the number of read registers) does not fit inside `read_interval`.
+
+Options from earlier versions (`max_retries`, `read_max_retries`, `write_max_retries`,
+`device_response_delay`, `read_with_retry_delay`, `write_with_retry_delay`, `deadline_timeout`,
+`max_reopens`, `timeout`, `write_timeout`, and the `serial.connect_retry_*` settings) are no
+longer used. They are reported as warnings at startup rather than being silently ignored.
 
 ### MQTT Configuration
 
@@ -171,6 +206,8 @@ For detailed information about the application flow and timing diagrams, see:
 | `mqtt.qos` | Quality of Service (0, 1, or 2) | `1` |
 | `mqtt.retain` | Retain messages | `true` |
 | `mqtt.publish_retry_count` | Number of retries for failed publishes | `3` |
+| `mqtt.availability_topic` | Online/offline topic, also registered as the MQTT last will | `<device_id>/status` |
+| `mqtt.op_timeout` | Bounds every broker interaction (ms). Publishes run on the serial read path, so an unbounded wait would stall polling | `5000` |
 | `mqtt.connect_retry_initial_delay_ms` | Initial delay for exponential backoff | `500ms` |
 | `mqtt.connect_retry_max_delay_ms` | Maximum delay for exponential backoff | `30000ms` |
 | `mqtt.connect_retry_jitter_percent` | Jitter percentage for backoff | `25%` |
@@ -256,32 +293,50 @@ Example of Home Assistant dashboard:
 
 ### Periodic Read Cycle
 
-1. Timer fires every N seconds (configurable)
-2. Writer checks for write priority (if write pending, skip read)
-3. Reader reads all configured registers sequentially
-4. Each register: Send command → Read response → Parse → Validate → Publish to MQTT
-5. Wait for next timer interval
+1. A cycle runs at startup, then once per `read_interval`, measured from the end of the
+   previous cycle so an overrunning readout still leaves the device an idle gap
+2. The cycle is skipped if a write is in flight or the port is being recovered, and retried
+   shortly afterwards rather than after a full interval
+3. Registers are read sequentially: send command → read matching frame → apply divisor →
+   validate range → publish
+4. Derived values are computed from that same snapshot and published
+5. A cancelled cycle publishes nothing, so partial results cannot mix with stale ones
 
 ### Write Operation
 
-1. MQTT message received on write topic
-2. Writer signals write priority, preempting the periodic read cycle (the in-flight single-register read finishes first; remaining registers are skipped)
-3. Parse and validate value
-4. Send command to device
-5. Read response and verify
-6. Read verify registers (if configured)
-7. Publish verified values to MQTT
+1. MQTT message received on a write register's `subscribe_topic`
+2. The value is parsed and range-checked first, so a malformed payload never disturbs the
+   read cycle
+3. A duplicate of the last command accepted for that topic, within one second, is dropped
+4. The read cycle is preempted, and released again on every exit path
+5. The command is sent and the device's echo matched
+6. The register's own state topic is published, then any `verify_registers` are read back
+   and published
 
-### Retry Logic
+### Reliability
 
-The application implements comprehensive retry logic:
+The serial link is treated as lossy throughout.
 
-- **Connection Retry**: Exponential backoff with jitter for both serial and MQTT
-- **Serial Retry**: Write and read retries with port reopening on failure
-- **Max Retries**: Configurable maximum attempts before giving up
-- **MQTT Publish Retry**: Failed publishes are retried with exponential backoff (1s, 2s, 4s)
-- **MQTT KeepAlive**: Detects network failures within 30-60 seconds for fast reconnection
-- **Subscription Recovery**: Automatically re-subscribes to all topics after connection is restored
+- **Framing**: received bytes are buffered persistently, so a frame split across reads is
+  reassembled rather than discarded. Discarding a partial frame leaves its tail to arrive
+  alone, which desyncs every later frame.
+- **Frame matching**: a transaction reads until it sees the frame whose `<node> <register>`
+  prefix matches its own command, discarding stale or unsolicited frames. The command is
+  never re-sent to resync, which keeps writes idempotent.
+- **Retries**: one level, bounded by a wall-clock budget per register.
+- **Port recovery**: closing and reopening the port is reserved for genuine port errors
+  (`EIO`, `ENODEV`, `ENXIO`) and performed by a single supervisor with exponential backoff.
+  A reopen toggles DTR/RTS, which many devices treat as a reset, so it is never used as a
+  remedy for a timeout.
+- **Write priority**: an incoming command cancels the in-flight read cycle and holds reads
+  off until it completes, with a timeout so a failure cannot wedge polling.
+- **Availability**: the gateway publishes `online`/`offline` to `mqtt.availability_topic` and
+  registers it as the MQTT last will. Combined with `expire_after`, Home Assistant shows
+  entities unavailable instead of a stale retained value. Readings that fail validation are
+  not published.
+- **MQTT**: every broker interaction is bounded by `mqtt.op_timeout`; connection loss triggers
+  automatic reconnection and re-subscription. A clean session is used so the broker does not
+  queue commands while the gateway is offline and replay them at startup.
 
 ## Running as a Service
 

@@ -44,6 +44,12 @@ type MQTTConfig struct {
 const (
 	payloadOnline  = "online"
 	payloadOffline = "offline"
+
+	// shutdownPublishTimeout bounds the offline announcement. Shutdown runs
+	// under a grace period after which the process is force-exited, so the
+	// retrying publish path (attempts x OpTimeout plus backoff) is far too
+	// slow to use here.
+	shutdownPublishTimeout = 2 * time.Second
 )
 
 // MessageHandler handles an incoming MQTT message.
@@ -178,6 +184,21 @@ func (c *Client) publishAvailability(state string) error {
 	return c.publishRetained(c.config.AvailabilityTopic, state, true)
 }
 
+// publishOnce makes a single bounded publish attempt, for use where the
+// retrying path would take too long.
+func (c *Client) publishOnce(topic, value string, timeout time.Duration) error {
+	client := c.handle()
+	if client == nil || !client.IsConnected() {
+		return fmt.Errorf("publish to %s: not connected", topic)
+	}
+
+	token := client.Publish(topic, byte(c.config.QOS), true, value)
+	if !token.WaitTimeout(timeout) {
+		return fmt.Errorf("publish to %s: timed out after %v", topic, timeout)
+	}
+	return token.Error()
+}
+
 // resubscribeAll re-subscribes to every tracked topic, continuing past
 // individual failures so one bad topic cannot leave the rest unsubscribed.
 func (c *Client) resubscribeAll() {
@@ -217,12 +238,21 @@ func (c *Client) Disconnect() {
 	if client == nil {
 		return
 	}
-	if client.IsConnected() {
-		if err := c.publishAvailability(payloadOffline); err != nil {
+
+	// Set this first so any publish already in flight elsewhere stops
+	// retrying rather than sleeping through its backoff.
+	c.shuttingDown.Store(true)
+
+	if client.IsConnected() && c.config.AvailabilityTopic != "" {
+		timeout := shutdownPublishTimeout
+		if c.config.OpTimeout > 0 && c.config.OpTimeout < timeout {
+			timeout = c.config.OpTimeout
+		}
+		if err := c.publishOnce(c.config.AvailabilityTopic, payloadOffline, timeout); err != nil {
 			c.logger.Warn("MQTT failed to publish offline state: %v", err)
 		}
 	}
-	c.shuttingDown.Store(true)
+
 	client.Disconnect(250)
 
 	c.mu.Lock()
