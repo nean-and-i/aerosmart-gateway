@@ -927,3 +927,50 @@ func TestHandleMessageFallsBackToCommandedValue(t *testing.T) {
 		t.Errorf("state topic = %q (%v), want the commanded value 3", v, ok)
 	}
 }
+
+// A verify register's value is published to its own topic; the log should say
+// so, and the register must not be read twice when it is also state_from.
+func TestVerifyRegistersArePublishedToTheirOwnTopics(t *testing.T) {
+	reg := fanWrite
+	reg.StateFrom = "lueftermode"
+	reg.VerifyRegisters = []string{"luefterstatus", "lueftermode"}
+	modeReg := config.ReadRegisterConfig{
+		Name: "lueftermode", Command: "130 5003", Topic: "aerosmart/lueftermode",
+		Divisor: 1, Type: "integer", MinValue: 0, MaxValue: 5,
+	}
+
+	dev := &fakeDevice{responses: map[string]string{"130 1067": "1", "130 5003": "4"}}
+	pub := newFakePublisher()
+	log := testLogger()
+	w := NewWriter(dev, pub, log, []config.WriteRegisterConfig{reg}, NewReadGate(time.Second), 3, time.Millisecond, time.Millisecond)
+	w.SetReader(NewReader(dev, pub, log, []config.ReadRegisterConfig{fanReg, modeReg}, 1, time.Millisecond))
+
+	if err := w.HandleMessage(context.Background(), reg.SubscribeTopic, "4"); err != nil {
+		t.Fatalf("HandleMessage() error = %v", err)
+	}
+
+	// The actual running stage reaches its own topic.
+	if v, ok := pub.get("aerosmart/luefterstatus"); !ok || v != "1" {
+		t.Errorf("aerosmart/luefterstatus = %q (%v), want 1", v, ok)
+	}
+	if v, ok := pub.get("aerosmart/lueftermode"); !ok || v != "4" {
+		t.Errorf("aerosmart/lueftermode = %q (%v), want 4", v, ok)
+	}
+	if v, ok := pub.get(reg.Topic); !ok || v != "4" {
+		t.Errorf("state topic = %q (%v), want 4", v, ok)
+	}
+
+	// lueftermode is both state_from and a verify register: reading it twice
+	// puts an avoidable extra transaction on the wire for every write.
+	dev.mu.Lock()
+	defer dev.mu.Unlock()
+	reads := 0
+	for _, c := range dev.calls {
+		if c == "130 5003" {
+			reads++
+		}
+	}
+	if reads != 1 {
+		t.Errorf("lueftermode read %d times, want 1", reads)
+	}
+}
