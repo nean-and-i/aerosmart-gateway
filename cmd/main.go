@@ -26,7 +26,11 @@ var (
 	registersPath string
 	showVersion   bool
 	validateOnly  bool
-	version       = "1.0.0"
+
+	// version is replaced at build time via -X main.version. The fallback is
+	// deliberately not a plausible release number, so an unstamped build is
+	// obvious in the startup log.
+	version = "dev (unstamped build)"
 )
 
 const (

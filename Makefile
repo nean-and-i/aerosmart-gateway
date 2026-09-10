@@ -8,7 +8,12 @@ MAIN_PATH=./cmd
 # Go build variables
 GO=go
 GOFLAGS=-v
-LDFLAGS=-ldflags "-s -w"
+
+# Stamp the build so a deployed binary can be identified. Without this every
+# build reports the hardcoded fallback version and they are indistinguishable
+# in the log, which makes "is the fix deployed?" impossible to answer.
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+LDFLAGS=-ldflags "-s -w -X main.version=$(VERSION)"
 
 # Colors for output
 RED=\033[0;31m
@@ -42,17 +47,17 @@ build:
 # Build for different platforms
 build-linux-arm:
 	@echo "$(GREEN)Building for Linux ARM...$(NC)"
-	GOOS=linux GOARCH=arm GOARM=6 $(GO) build $(GOFLAGS) -o $(BINARY_NAME)-linux-armv6 $(MAIN_PATH)
+	GOOS=linux GOARCH=arm GOARM=6 $(GO) build $(GOFLAGS) $(LDFLAGS) -o $(BINARY_NAME)-linux-armv6 $(MAIN_PATH)
 
 build-linux-armv7:
 	@echo "$(GREEN)Building for Linux ARMv7...$(NC)"
-	GOOS=linux GOARCH=arm GOARM=7 $(GO) build $(GOFLAGS) -o $(BINARY_NAME)-linux-armv7 $(MAIN_PATH)
+	GOOS=linux GOARCH=arm GOARM=7 $(GO) build $(GOFLAGS) $(LDFLAGS) -o $(BINARY_NAME)-linux-armv7 $(MAIN_PATH)
 
 build-linux-arm64:
 	@echo "$(GREEN)Building for Linux ARM64...$(NC)"
-	GOOS=linux GOARCH=arm64 $(GO) build $(GOFLAGS) -o $(BINARY_NAME)-linux-arm64 $(MAIN_PATH)
+	GOOS=linux GOARCH=arm64 $(GO) build $(GOFLAGS) $(LDFLAGS) -o $(BINARY_NAME)-linux-arm64 $(MAIN_PATH)
 
-build-all: build build-linux-arm build-linux-arm64
+build-all: build build-linux-arm build-linux-armv7 build-linux-arm64
 	@echo "$(GREEN)All builds complete$(NC)"
 
 # Run tests
