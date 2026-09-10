@@ -84,8 +84,11 @@ func run() error {
 	defer func() { _ = log.Close() }()
 
 	log.Info("Starting Aerosmart Gateway %s", version)
-	for _, note := range appConfig.DeprecatedKeys() {
+	for _, note := range appConfig.Warnings() {
 		log.Warn("Config: %s", note)
+	}
+	for _, note := range registersConfig.Warnings() {
+		log.Warn("Registers: %s", note)
 	}
 
 	derivedCalc := registers.NewDerivedCalculator(nil, log, registersConfig.DerivedRegisters)

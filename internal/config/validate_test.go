@@ -59,18 +59,23 @@ func TestExpireAfterExplicitValueKept(t *testing.T) {
 	}
 }
 
-// Silently ignoring flow control lets XON/XOFF bytes be parsed as frame data.
-func TestValidateRejectsUnsupportedFlowControl(t *testing.T) {
-	cfg, err := LoadAppConfig(writeConfig(t, "serial:\n  xonxoff: true\n"))
+// Flow control the driver cannot honour is reported, but it must not stop the
+// gateway: it was equally inert in earlier releases, so failing here would
+// break an upgrade without making anything safer.
+func TestUnsupportedFlowControlWarnsRatherThanFails(t *testing.T) {
+	cfg, err := LoadAppConfig(writeConfig(t, "mqtt:\n  broker: \"x\"\nserial:\n  xonxoff: true\n  dsrdtr: true\n"))
 	if err != nil {
 		t.Fatalf("LoadAppConfig() error = %v", err)
 	}
-	err = cfg.Validate()
-	if err == nil {
-		t.Fatal("Validate() = nil, want an error about xonxoff")
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v, want flow control to be a warning", err)
 	}
-	if !strings.Contains(err.Error(), "xonxoff") {
-		t.Errorf("Validate() error = %v, want it to mention xonxoff", err)
+
+	warnings := strings.Join(cfg.Warnings(), "\n")
+	for _, key := range []string{"xonxoff", "dsrdtr"} {
+		if !strings.Contains(warnings, key) {
+			t.Errorf("Warnings() = %q, want it to mention %s", warnings, key)
+		}
 	}
 }
 
@@ -115,7 +120,7 @@ read_interval: 120
 
 // Options that no longer exist must be reported, not silently ignored, or a
 // user keeps tuning a setting that has no effect.
-func TestDeprecatedKeysAreReported(t *testing.T) {
+func TestRemovedKeysAreReported(t *testing.T) {
 	cfg, err := LoadAppConfig(writeConfig(t, `
 serial:
   max_retries: 10
@@ -126,14 +131,14 @@ serial:
 		t.Fatalf("LoadAppConfig() error = %v", err)
 	}
 
-	warnings := cfg.DeprecatedKeys()
+	warnings := cfg.Warnings()
 	if len(warnings) == 0 {
-		t.Fatal("DeprecatedKeys() = empty, want the removed serial options listed")
+		t.Fatal("Warnings() = empty, want the removed serial options listed")
 	}
 	joined := strings.Join(warnings, " ")
 	for _, key := range []string{"max_retries", "read_max_retries", "device_response_delay"} {
 		if !strings.Contains(joined, key) {
-			t.Errorf("DeprecatedKeys() = %v, want it to mention %s", warnings, key)
+			t.Errorf("Warnings() = %v, want it to mention %s", warnings, key)
 		}
 	}
 }
@@ -205,7 +210,7 @@ func TestRegistersValidateRejectsInvertedRange(t *testing.T) {
 func TestValidateErrorsAreWrapped(t *testing.T) {
 	cfg := &AppConfig{}
 	cfg.applyDefaults()
-	cfg.Serial.XonXoff = true
+	cfg.Serial.Parity = "Z"
 	if err := cfg.Validate(); !errors.Is(err, ErrInvalidConfig) {
 		t.Errorf("Validate() error = %v, want it to wrap ErrInvalidConfig", err)
 	}
@@ -381,5 +386,113 @@ serial:
 	}
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("Validate() = nil, want a rejection of reopen_max_backoff < reopen_backoff")
+	}
+}
+
+// The configuration shipped before the serial rework must still start the
+// gateway. Every setting it carries that no longer applies is inert, so an
+// upgrade should warn, not refuse to run.
+func TestPreviousReleaseConfigStillStarts(t *testing.T) {
+	// xonxoff was silently ignored by the old code too: the driver has never
+	// implemented flow control, so the link has always run without it.
+	appBody := `
+serial:
+  port: "/dev/ttyUSB0"
+  baudrate: 115200
+  xonxoff: true
+  dsrdtr: false
+  timeout: 0
+  write_timeout: 1
+  read_timeout: 10
+  max_reopens: 3
+  deadline_timeout: 150
+  write_with_retry_delay: 10
+  device_response_delay: 40
+  read_with_retry_delay: 100
+  read_max_retries: 10
+  write_max_retries: 10
+  max_retries: 10
+  connect_retry_initial_delay_ms: 2
+  connect_retry_max_delay_ms: 400
+  connect_retry_jitter_percent: 25
+mqtt:
+  broker: "192.168.1.20"
+  port: 1883
+  qos: 1
+  retain: true
+read_interval: 120
+`
+	cfg, err := LoadAppConfig(writeConfig(t, appBody))
+	if err != nil {
+		t.Fatalf("LoadAppConfig() error = %v", err)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() rejected the previous release's config:\n%v", err)
+	}
+
+	warnings := strings.Join(cfg.Warnings(), "\n")
+	if !strings.Contains(warnings, "xonxoff") {
+		t.Errorf("Warnings() = %q, want it to flag xonxoff as having no effect", warnings)
+	}
+	for _, key := range []string{"max_retries", "device_response_delay", "max_reopens"} {
+		if !strings.Contains(warnings, key) {
+			t.Errorf("Warnings() does not mention removed option %s", key)
+		}
+	}
+}
+
+// A write register sharing a read register's state topic makes two Home
+// Assistant entities publish to one topic. That is worth fixing, but the
+// gateway runs, so it must not block an upgrade.
+func TestSharedStateTopicWarnsRatherThanFails(t *testing.T) {
+	cfg := &RegistersConfig{
+		ReadRegisters: []ReadRegisterConfig{
+			{Name: "lueftermode", Command: "130 5003", Topic: "aerosmart/lueftermode", MaxValue: 5},
+		},
+		WriteRegisters: []WriteRegisterConfig{{
+			Name: "luefterstufe", CommandTemplate: "130 5002 {value}",
+			SubscribeTopic: "dw/aerosmart/luefterstufe",
+			Topic:          "aerosmart/lueftermode", // collides
+			MaxValue:       5,
+		}},
+	}
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v, want the shared topic to be a warning", err)
+	}
+
+	warnings := strings.Join(cfg.Warnings(), "\n")
+	if !strings.Contains(warnings, "luefterstufe") || !strings.Contains(warnings, "lueftermode") {
+		t.Errorf("Warnings() = %q, want it to name both registers", warnings)
+	}
+}
+
+// Configurations that genuinely cannot work must still be refused.
+func TestValidateStillRefusesUnusableConfig(t *testing.T) {
+	cases := map[string]string{
+		"bad parity":       "serial:\n  parity: \"Z\"\nmqtt:\n  broker: \"x\"\n",
+		"no broker":        "read_interval: 60\n",
+		"zero interval":    "mqtt:\n  broker: \"x\"\nread_interval: -1\n",
+		"negative backoff": "mqtt:\n  broker: \"x\"\nserial:\n  retry_backoff: -1\n",
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			cfg, err := LoadAppConfig(writeConfig(t, body))
+			if err != nil {
+				t.Fatalf("LoadAppConfig() error = %v", err)
+			}
+			if err := cfg.Validate(); err == nil {
+				t.Error("Validate() = nil, want a rejection")
+			}
+		})
+	}
+}
+
+func TestRegistersValidateStillRefusesUnusableConfig(t *testing.T) {
+	cfg := &RegistersConfig{WriteRegisters: []WriteRegisterConfig{{
+		Name: "w", CommandTemplate: "130 2", SubscribeTopic: "", Topic: "t/w", MaxValue: 1,
+	}}}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("Validate() = nil, want rejection of a missing {value} and subscribe_topic")
 	}
 }

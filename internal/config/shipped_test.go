@@ -35,7 +35,7 @@ func TestShippedConfigsValidate(t *testing.T) {
 	}
 	t.Logf("%d read registers, worst-case cycle fits within the %ds interval",
 		len(rc.ReadRegisters), ac.ReadInterval)
-	for _, note := range ac.DeprecatedKeys() {
+	for _, note := range ac.Warnings() {
 		t.Logf("deprecated: %s", note)
 	}
 }

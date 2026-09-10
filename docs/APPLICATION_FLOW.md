@@ -84,11 +84,11 @@ against a scripted device (see `internal/integration`).
 
 ## Startup
 
-1. Load `config.yaml`, apply defaults, and validate. Options the driver cannot honour
-   (`xonxoff`, `dsrdtr`) and impossible values are rejected here.
+1. Load `config.yaml`, apply defaults, and validate. Only configurations that cannot work
+   are refused: an invalid parity or byte size, a negative timeout, a backoff maximum below
+   its initial value, no MQTT broker, no log sink.
 2. Load `registers.yaml` and validate: duplicate names, missing topics, command templates
-   without `{value}`, `verify_registers` naming registers that do not exist, and write
-   registers whose state topic collides with a read register's.
+   without `{value}`, `verify_registers` naming registers that do not exist.
 3. Check the retry budget: the worst-case full cycle
    (`retries x (response_timeout + read_timeout + retry_backoff) x read register count`)
    must fit inside `read_interval`. The `read_timeout` term matters because an attempt can
@@ -96,13 +96,18 @@ against a scripted device (see `internal/integration`).
    blocks for a full `read_timeout`.
 4. Check that every configured derived register has an implementation and lists every
    source its formula reads.
-5. Open the serial port, retrying with backoff indefinitely — on an embedded gateway the
+5. Report anything that works but should be fixed as a warning — settings the driver cannot
+   honour (`xonxoff`, `dsrdtr`), options removed with the serial rework, and write registers
+   sharing a read register's state topic. These are warnings rather than errors because each
+   was equally inert in earlier releases, so refusing to start would break an upgrade
+   without making anything safer.
+6. Open the serial port, retrying with backoff indefinitely — on an embedded gateway the
    USB adapter may appear after boot, so exiting would only crash-loop under systemd.
 6. Start the serial supervisor.
 7. Connect to MQTT with backoff and jitter, publish discovery, subscribe to command topics.
 8. Run the first read cycle, then enter the poll loop.
 
-`-validate` performs steps 1-4 and exits, so a configuration can be checked without
+`-validate` performs steps 1-5 and exits, so a configuration can be checked without
 touching hardware.
 
 ## Serial layer
@@ -333,7 +338,7 @@ told to publish to cannot drift from the one the gateway listens on.
 | `reopen_backoff` / `reopen_max_backoff` | `500` / `30000` | Supervised reopen backoff |
 | `health_check_interval` | `1000` | Port health poll interval |
 | `write_priority_timeout` | `10000` | Maximum time a write may hold reads off |
-| `xonxoff` / `dsrdtr` | `false` | Not supported by the driver; `true` is rejected at startup |
+| `xonxoff` / `dsrdtr` | `false` | Not supported by the driver; `true` is warned about and has no effect |
 
 ### MQTT
 
