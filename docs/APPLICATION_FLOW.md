@@ -230,8 +230,10 @@ HandleMessage(ctx, topic, payload):
   gate.Preempt(); defer gate.Release()         # released on EVERY exit path
   send the command ONCE                        # retried only on a write error
   wait write_settle_delay
-  read back verify_registers                   # this is what confirms the write
-  publish the read-back values and the register's own state topic
+  read state_from                              # what the unit actually holds
+  read back verify_registers
+  publish that actual value as the register's state, plus the verified values
+  report an error if the unit is holding something other than what was asked
 ```
 
 ### Why a write is not confirmed by its echo
@@ -248,8 +250,17 @@ re-applied a setting that was already in effect. A write is now sent once and
 confirmed by reading `verify_registers` back, which the unit answers reliably
 (measured 14-48ms, every read in a 58-read sample).
 
-A write register with no `verify_registers` cannot be confirmed; the command is
-still sent and a warning says so.
+A write register with no `state_from` or `verify_registers` cannot be confirmed;
+the command is still sent and a warning says so.
+
+### state_from
+
+The unit reports a setpoint on a different address than the one it is written
+to: `luefterstufe` is written on `130 5002` and read back on `130 5003`
+(`lueftermode`), which was measured updating within ~30ms of the write. Naming
+that register in `state_from` means the write register's state topic carries
+what the unit actually did. Without it the requested value is published, which
+diverges silently whenever the unit declines a value.
 
 Validation happens **before** the read cycle is disturbed, so a malformed payload cannot
 cancel a readout. Everything after `Preempt` releases the gate on the way out; leaving it

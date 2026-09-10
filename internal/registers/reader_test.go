@@ -858,3 +858,72 @@ func TestHandleMessageRetriesAFailedSend(t *testing.T) {
 		t.Fatal("HandleMessage() error = nil, want the send failure reported")
 	}
 }
+
+// The unit reports a fan setpoint on a different register than the one it is
+// written to (write 5002, read back 5003, confirmed on hardware within ~30ms).
+// Naming that register makes the write register's state topic carry what the
+// unit actually did, not what was asked of it.
+func TestHandleMessagePublishesStateFromReadBack(t *testing.T) {
+	reg := fanWrite
+	reg.StateFrom = "lueftermode"
+	modeReg := config.ReadRegisterConfig{
+		Name: "lueftermode", Command: "130 5003", Topic: "aerosmart/lueftermode",
+		Divisor: 1, Type: "integer", MinValue: 0, MaxValue: 5,
+	}
+
+	// Asked for 3; the unit reports 3.
+	dev := &fakeDevice{responses: map[string]string{"130 5003": "3", "130 1067": "3"}}
+	pub := newFakePublisher()
+	log := testLogger()
+	w := NewWriter(dev, pub, log, []config.WriteRegisterConfig{reg}, NewReadGate(time.Second), 3, time.Millisecond, time.Millisecond)
+	w.SetReader(NewReader(dev, pub, log, []config.ReadRegisterConfig{fanReg, modeReg}, 1, time.Millisecond))
+
+	if err := w.HandleMessage(context.Background(), reg.SubscribeTopic, "3"); err != nil {
+		t.Fatalf("HandleMessage() error = %v", err)
+	}
+	if v, ok := pub.get(reg.Topic); !ok || v != "3" {
+		t.Errorf("state topic = %q (%v), want 3", v, ok)
+	}
+}
+
+// If the unit refuses the value, the state topic must carry the truth rather
+// than the value that was asked for, or Home Assistant shows a stage the
+// device is not running.
+func TestHandleMessagePublishesActualValueWhenUnitRefuses(t *testing.T) {
+	reg := fanWrite
+	reg.StateFrom = "lueftermode"
+	modeReg := config.ReadRegisterConfig{
+		Name: "lueftermode", Command: "130 5003", Topic: "aerosmart/lueftermode",
+		Divisor: 1, Type: "integer", MinValue: 0, MaxValue: 5,
+	}
+
+	// Asked for 2, but the unit stays on 4.
+	dev := &fakeDevice{responses: map[string]string{"130 5003": "4", "130 1067": "4"}}
+	pub := newFakePublisher()
+	log := testLogger()
+	w := NewWriter(dev, pub, log, []config.WriteRegisterConfig{reg}, NewReadGate(time.Second), 3, time.Millisecond, time.Millisecond)
+	w.SetReader(NewReader(dev, pub, log, []config.ReadRegisterConfig{fanReg, modeReg}, 1, time.Millisecond))
+
+	err := w.HandleMessage(context.Background(), reg.SubscribeTopic, "2")
+	if err == nil {
+		t.Fatal("HandleMessage() error = nil, want the refusal reported")
+	}
+	if v, ok := pub.get(reg.Topic); !ok || v != "4" {
+		t.Errorf("state topic = %q (%v), want the actual value 4, not the requested 2", v, ok)
+	}
+}
+
+// Without state_from there is nothing authoritative to read, so the commanded
+// value is published as before.
+func TestHandleMessageFallsBackToCommandedValue(t *testing.T) {
+	dev := &fakeDevice{responses: map[string]string{"130 1067": "3"}}
+	pub := newFakePublisher()
+	w := testWriter(dev, pub, NewReadGate(time.Second))
+
+	if err := w.HandleMessage(context.Background(), fanWrite.SubscribeTopic, "3"); err != nil {
+		t.Fatalf("HandleMessage() error = %v", err)
+	}
+	if v, ok := pub.get(fanWrite.Topic); !ok || v != "3" {
+		t.Errorf("state topic = %q (%v), want the commanded value 3", v, ok)
+	}
+}

@@ -133,34 +133,68 @@ func (w *Writer) HandleMessage(ctx context.Context, topic string, message string
 		return ctx.Err()
 	}
 
+	// Establish what the unit actually holds now, so the state topic carries
+	// reality rather than the request.
+	actual, resolved := w.readState(ctx, register)
+
 	confirmed, checkable := w.verifyWrite(ctx, register)
-	if checkable && !confirmed {
+
+	state := valueStr
+	if resolved {
+		state = actual
+	}
+	if register.Topic != "" {
+		if err := w.pub.Publish(register.Topic, state); err != nil {
+			w.logger.Error("Failed to publish state for %s to %s: %v", register.Name, register.Topic, err)
+		}
+	}
+
+	switch {
+	case resolved && actual != valueStr:
+		// The command went out but the unit is holding a different value.
+		w.logger.Warn("Wrote %s = %d but %s reports %s; the unit did not take the value",
+			register.Name, value, register.StateFrom, actual)
+		return fmt.Errorf("write %s: unit reports %s, not %d", register.Name, actual, value)
+	case resolved:
+		w.rememberSuccess(topic, valueStr)
+		w.logger.Info("Wrote %s = %d, confirmed by %s", register.Name, value, register.StateFrom)
+	case checkable && !confirmed:
 		// The command went out, so it may still have taken effect; the next
 		// read cycle will show the truth.
 		w.logger.Warn("Could not confirm %s = %d by reading back %v",
 			register.Name, value, register.VerifyRegisters)
 		return fmt.Errorf("write %s: sent but could not confirm it took effect", register.Name)
-	}
-
-	w.rememberSuccess(topic, valueStr)
-
-	// Reflect the accepted command on the register's own state topic, so the
-	// Home Assistant entity does not sit in an unknown state.
-	if register.Topic != "" {
-		if err := w.pub.Publish(register.Topic, valueStr); err != nil {
-			w.logger.Error("Failed to publish state for %s to %s: %v", register.Name, register.Topic, err)
-		}
-	}
-
-	if !checkable {
-		w.logger.Warn("Wrote %s = %d; no verify_registers configured, so it cannot be confirmed",
-			register.Name, value)
-	} else {
+	case checkable:
+		w.rememberSuccess(topic, valueStr)
 		w.logger.Info("Wrote %s = %d, confirmed by read-back", register.Name, value)
+	default:
+		w.rememberSuccess(topic, valueStr)
+		w.logger.Warn("Wrote %s = %d; no state_from or verify_registers configured, "+
+			"so it cannot be confirmed", register.Name, value)
 	}
 
 	w.logger.Info("=== Write of %s completed in %v ===", register.Name, time.Since(received))
 	return nil
+}
+
+// readState reads the register that carries the write register's real value.
+func (w *Writer) readState(ctx context.Context, register config.WriteRegisterConfig) (string, bool) {
+	if w.reader == nil || register.StateFrom == "" {
+		return "", false
+	}
+
+	stateReg, ok := w.reader.Register(register.StateFrom)
+	if !ok {
+		w.logger.Warn("state_from register %s is not configured for reading", register.StateFrom)
+		return "", false
+	}
+
+	value, err := w.reader.ReadSingle(ctx, stateReg)
+	if err != nil {
+		w.logger.Warn("Failed to read %s back for %s: %v", register.StateFrom, register.Name, err)
+		return "", false
+	}
+	return value, true
 }
 
 // sendCommand writes the command, retrying only if the write itself failed.

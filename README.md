@@ -327,8 +327,11 @@ Example of Home Assistant dashboard:
 4. The read cycle is preempted, and released again on every exit path
 5. The command is sent **once**. The unit applies writes but does not reliably echo them,
    so nothing waits for an echo and a landed command is never re-sent
-6. After `write_settle_delay`, the `verify_registers` are read back. A successful read-back
-   is what confirms the write; the register's own state topic is published then
+6. After `write_settle_delay`, the register named by `state_from` is read back. Its value —
+   what the unit actually holds — is published to the write register's state topic, so Home
+   Assistant shows reality rather than the request. Any `verify_registers` are read and
+   published to their own topics too. A value differing from the request is reported as an
+   error, with the actual value published
 
 ### Reliability
 

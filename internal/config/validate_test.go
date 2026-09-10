@@ -496,3 +496,19 @@ func TestRegistersValidateStillRefusesUnusableConfig(t *testing.T) {
 		t.Fatal("Validate() = nil, want rejection of a missing {value} and subscribe_topic")
 	}
 }
+
+// state_from must name a real read register, or the write register's state
+// could never be resolved.
+func TestRegistersValidateRejectsUnknownStateFrom(t *testing.T) {
+	cfg := &RegistersConfig{
+		ReadRegisters: []ReadRegisterConfig{{Name: "a", Command: "130 1", Topic: "t/a", MaxValue: 1}},
+		WriteRegisters: []WriteRegisterConfig{{
+			Name: "w", CommandTemplate: "130 2 {value}", SubscribeTopic: "cmd/w", Topic: "t/w",
+			MaxValue: 1, StateFrom: "nonexistent",
+		}},
+	}
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "nonexistent") {
+		t.Fatalf("Validate() error = %v, want it to name the unknown state_from register", err)
+	}
+}
