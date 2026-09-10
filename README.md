@@ -190,8 +190,8 @@ All timeouts are in milliseconds.
 | `serial.reopen_max_backoff` | Maximum reopen delay | `30000` |
 | `serial.health_check_interval` | How often port health is polled | `1000` |
 | `serial.write_priority_timeout` | Upper bound on how long a write may hold reads off | `10000` |
-| `serial.xonxoff` | Software flow control. **Not supported by the driver**; `true` is rejected at startup | `false` |
-| `serial.dsrdtr` | Hardware flow control. **Not supported by the driver** | `false` |
+| `serial.xonxoff` | Software flow control. **Not supported by the driver**; `true` is reported as a warning and has no effect | `false` |
+| `serial.dsrdtr` | Hardware flow control. **Not supported by the driver**; warned about, no effect | `false` |
 
 Worst-case time for one register is
 `retries x (response_timeout + read_timeout + retry_backoff)`, so with the defaults
@@ -204,7 +204,8 @@ times the number of read registers) does not fit inside `read_interval`; with th
 Options from earlier versions (`max_retries`, `read_max_retries`, `write_max_retries`,
 `device_response_delay`, `read_with_retry_delay`, `write_with_retry_delay`, `deadline_timeout`,
 `max_reopens`, `timeout`, `write_timeout`, and the `serial.connect_retry_*` settings) are no
-longer used. They are reported as warnings at startup rather than being silently ignored.
+longer used. They are reported as warnings at startup rather than being silently ignored, so
+a configuration from an earlier release still starts — it just tells you what to clean up.
 
 ### MQTT Configuration
 

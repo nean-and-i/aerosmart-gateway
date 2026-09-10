@@ -148,9 +148,10 @@ type SerialPort struct {
 
 // New creates a serial port from cfg.
 //
-// Options this driver cannot honour (xonxoff, dsrdtr) are rejected earlier, by
-// config.AppConfig.Validate, so an unusable setting fails at startup rather
-// than being silently ignored here.
+// Options this driver cannot honour (xonxoff, dsrdtr) are reported at startup
+// by config.AppConfig.Warnings rather than ignored in silence. They are not
+// errors: the driver has never implemented flow control, so a link configured
+// that way has always run without it.
 func New(cfg Config, log Logger) *SerialPort {
 	cfg.applyDefaults(log)
 	s := &SerialPort{cfg: cfg, log: log}

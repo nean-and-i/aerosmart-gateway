@@ -323,13 +323,6 @@ func (c *AppConfig) applyDefaults() {
 func (c *AppConfig) Validate() error {
 	var problems []string
 
-	if c.Serial.XonXoff {
-		problems = append(problems, "serial.xonxoff: software flow control is not supported by the serial driver; "+
-			"leave it false or switch to a driver that implements IXON/IXOFF")
-	}
-	if c.Serial.DsrDtr {
-		problems = append(problems, "serial.dsrdtr: hardware flow control is not supported by the serial driver")
-	}
 	switch strings.ToUpper(c.Serial.Parity) {
 	case "N", "O", "E":
 	default:
@@ -457,10 +450,26 @@ func (c *AppConfig) ValidateCycleBudget(registerCount int) error {
 		float64(worstCycleMs)/1000, c.ReadInterval)
 }
 
-// DeprecatedKeys returns human-readable notes for configuration keys that are
-// present but no longer used, so a stale setting is never silently ignored.
-func (c *AppConfig) DeprecatedKeys() []string {
+// Warnings returns configuration that works but should be fixed: settings the
+// driver cannot honour, and options that no longer have any effect.
+//
+// These are deliberately not errors. Every one of them was already inert in
+// earlier releases, so refusing to start would break an upgrade without making
+// anything safer.
+func (c *AppConfig) Warnings() []string {
 	var notes []string
+
+	// The driver has never implemented flow control, so a link configured this
+	// way has always run without it.
+	if c.Serial.XonXoff {
+		notes = append(notes, "serial.xonxoff has no effect: the serial driver does not implement "+
+			"IXON/IXOFF, and never has. Set it to false to silence this.")
+	}
+	if c.Serial.DsrDtr {
+		notes = append(notes, "serial.dsrdtr has no effect: the serial driver does not implement "+
+			"hardware flow control. Set it to false to silence this.")
+	}
+
 	add := func(set bool, key, replacement string) {
 		if set {
 			notes = append(notes, fmt.Sprintf("serial.%s is no longer used (%s)", key, replacement))
@@ -569,21 +578,6 @@ func (c *RegistersConfig) Validate() error {
 		}
 	}
 
-	// A write register publishing state to a read register's topic makes two
-	// Home Assistant entities fight over one topic.
-	readTopics := make(map[string]string, len(c.ReadRegisters))
-	for _, reg := range c.ReadRegisters {
-		readTopics[reg.Topic] = reg.Name
-	}
-	for _, reg := range c.WriteRegisters {
-		if owner, clash := readTopics[reg.Topic]; clash {
-			problems = append(problems, fmt.Sprintf(
-				"write_registers[%s]: topic %q is also the state topic of read register %q; "+
-					"give the write register its own state topic",
-				reg.Name, reg.Topic, owner))
-		}
-	}
-
 	derivedNames := make(map[string]bool, len(c.DerivedRegisters))
 	for _, reg := range c.DerivedRegisters {
 		if derivedNames[reg.Name] {
@@ -606,6 +600,29 @@ func (c *RegistersConfig) Validate() error {
 		return fmt.Errorf("%w:\n  - %s", ErrInvalidConfig, strings.Join(problems, "\n  - "))
 	}
 	return nil
+}
+
+// Warnings returns register definitions that work but should be fixed.
+func (c *RegistersConfig) Warnings() []string {
+	var notes []string
+
+	// A write register publishing state to a read register's topic makes two
+	// Home Assistant entities publish to one topic; both will look wrong.
+	readTopics := make(map[string]string, len(c.ReadRegisters))
+	for _, reg := range c.ReadRegisters {
+		readTopics[reg.Topic] = reg.Name
+	}
+	for _, reg := range c.WriteRegisters {
+		if owner, clash := readTopics[reg.Topic]; clash {
+			notes = append(notes, fmt.Sprintf(
+				"write_registers[%s]: topic %q is also the state topic of read register %q; "+
+					"give the write register its own state topic so the two Home Assistant "+
+					"entities do not collide",
+				reg.Name, reg.Topic, owner))
+		}
+	}
+
+	return notes
 }
 
 // GetConfigPaths returns the default config file paths.

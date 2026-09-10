@@ -7,9 +7,9 @@ serial:
   parity: "N"
   stopbits: 1
 
-  # Software flow control is NOT supported by the tarm/serial driver. Setting
-  # this to true is rejected at startup rather than silently ignored, because
-  # XON/XOFF bytes would otherwise be parsed as frame data.
+  # Software flow control is NOT supported by the tarm/serial driver, and never
+  # has been. Setting it to true is reported as a warning at startup rather
+  # than silently ignored, but it does nothing either way.
   xonxoff: false
   dsrdtr: false
 

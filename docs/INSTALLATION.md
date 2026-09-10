@@ -88,9 +88,8 @@ serial:
   parity: "N"                    # N, O or E
   stopbits: 1                    # 1 or 2
 
-  # Flow control is NOT supported by the driver; true is rejected at startup
-  # rather than silently ignored, because XON/XOFF bytes would otherwise be
-  # parsed as frame data.
+  # Flow control is NOT supported by the driver, and never has been. Setting
+  # either to true is reported as a warning at startup; it has no effect.
   xonxoff: false
   dsrdtr: false
 
