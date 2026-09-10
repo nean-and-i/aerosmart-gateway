@@ -56,11 +56,7 @@ func (p *Poller) RunCycle(ctx context.Context) error {
 	}
 
 	if p.derived != nil {
-		derivedValues, err := p.derived.Calculate(values)
-		if err != nil {
-			p.logger.Error("Failed to calculate derived registers: %v", err)
-		}
-		if err := p.derived.PublishAll(derivedValues); err != nil {
+		if err := p.derived.PublishAll(p.derived.Calculate(values)); err != nil {
 			p.logger.Error("Failed to publish derived register values: %v", err)
 		}
 	}
