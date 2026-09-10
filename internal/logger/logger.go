@@ -198,6 +198,18 @@ func (l *Logger) FileLoggingActive() bool {
 	return l.fileLogging
 }
 
+// SerialSend logs one command written to the device.
+//
+// A register write expects no response, so no response field is logged.
+// Failures surface at warning level, successes at debug.
+func (l *Logger) SerialSend(command string, duration time.Duration, err error) {
+	if err != nil {
+		l.Warn("SERIAL SEND FAILED (took %v): cmd=%q error=%v", duration, command, err)
+		return
+	}
+	l.Debug("SERIAL SEND (took %v): cmd=%q", duration, command)
+}
+
 // Close releases the log file, if one is open. It is idempotent, and safe to
 // call while other goroutines are still logging.
 func (l *Logger) Close() error {

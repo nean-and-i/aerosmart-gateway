@@ -153,3 +153,30 @@ func TestFileOpenFailureFallsBackToConsole(t *testing.T) {
 		t.Error("consoleLogging = false, so nothing would be logged anywhere")
 	}
 }
+
+// A write expects no response, so the log line must not carry an empty
+// response field pretending one was hoped for.
+func TestSerialSendOmitsResponseField(t *testing.T) {
+	l, buf := captureLogger(DEBUG)
+
+	l.SerialSend("130 5002 4", 106*time.Microsecond, nil)
+
+	out := buf.String()
+	if !strings.Contains(out, "130 5002 4") {
+		t.Errorf("output = %q, want the command", out)
+	}
+	if strings.Contains(out, "response") {
+		t.Errorf("output = %q, want no response field for a write", out)
+	}
+}
+
+func TestSerialSendFailureVisibleAtInfoLevel(t *testing.T) {
+	l, buf := captureLogger(INFO)
+
+	l.SerialSend("130 5002 4", 0, errors.New("port not open"))
+
+	out := buf.String()
+	if !strings.Contains(out, "port not open") || !strings.Contains(out, "130 5002 4") {
+		t.Errorf("output = %q, want the command and the error at info level", out)
+	}
+}
