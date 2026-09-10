@@ -209,7 +209,8 @@ func run() error {
 	backoff := msDuration(appConfig.Serial.RetryBackoff)
 
 	reader := registers.NewReader(serialPort, mqttClient, log, registersConfig.ReadRegisters, retries, backoff)
-	writer := registers.NewWriter(serialPort, mqttClient, log, registersConfig.WriteRegisters, gate, retries, backoff)
+	writer := registers.NewWriter(serialPort, mqttClient, log, registersConfig.WriteRegisters, gate, retries, backoff,
+		msDuration(appConfig.Serial.WriteSettleDelay))
 	writer.SetReader(reader)
 	poller := registers.NewPoller(reader, derivedCalc, gate, log)
 

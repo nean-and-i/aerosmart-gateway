@@ -52,6 +52,11 @@ type SerialConfig struct {
 	// off, in milliseconds.
 	WritePriorityTimeout int `yaml:"write_priority_timeout"`
 
+	// WriteSettleDelay is how long to wait after writing a register before
+	// reading it back, in milliseconds. The unit does not reliably echo a
+	// write, so the read-back is what confirms it.
+	WriteSettleDelay int `yaml:"write_settle_delay"`
+
 	// Flow control. The tarm/serial driver supports neither, so a true value
 	// is rejected by Validate rather than silently ignored.
 	XonXoff bool `yaml:"xonxoff"`
@@ -253,6 +258,9 @@ func (c *AppConfig) applyDefaults() {
 	if c.Serial.WritePriorityTimeout == 0 {
 		c.Serial.WritePriorityTimeout = 10000
 	}
+	if c.Serial.WriteSettleDelay == 0 {
+		c.Serial.WriteSettleDelay = 50
+	}
 
 	if c.DeviceID == "" {
 		c.DeviceID = "aerosmart"
@@ -358,6 +366,7 @@ func (c *AppConfig) Validate() error {
 		{"serial.reopen_max_backoff", c.Serial.ReopenMaxBackoff},
 		{"serial.health_check_interval", c.Serial.HealthCheckInterval},
 		{"serial.write_priority_timeout", c.Serial.WritePriorityTimeout},
+		{"serial.write_settle_delay", c.Serial.WriteSettleDelay},
 		{"mqtt.op_timeout", c.MQTT.OpTimeout},
 		{"mqtt.connect_retry_initial_delay_ms", c.MQTT.ConnectRetryInitialDelayMs},
 		{"mqtt.connect_retry_max_delay_ms", c.MQTT.ConnectRetryMaxDelayMs},

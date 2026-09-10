@@ -427,3 +427,173 @@ func TestConfigResponseBudgetMatchesSerialBehaviour(t *testing.T) {
 		}
 	}
 }
+
+// aerosmartDevice models what the real unit was observed to do:
+//   - it answers reads promptly,
+//   - it applies writes but does NOT reliably echo the command,
+//   - it continuously broadcasts unsolicited status frames, including from
+//     node addresses that are not configured registers at all.
+type aerosmartDevice struct {
+	mu      sync.Mutex
+	pending []byte
+	applied map[string]string // register address -> value actually set
+	writes  []string
+}
+
+func newAerosmartDevice() *aerosmartDevice {
+	return &aerosmartDevice{applied: map[string]string{}}
+}
+
+// writeToReadRegister maps a write register's address to the address the value
+// is read back from.
+var writeToReadRegister = map[string]string{
+	"5002": "5003", // luefterstufe -> lueftermode
+	"5036": "1039", // boilerheizstab -> boilerheizstabanforderungstatus
+}
+
+func (d *aerosmartDevice) Read(p []byte) (int, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if len(d.pending) == 0 {
+		return 0, nil
+	}
+	n := copy(p, d.pending)
+	d.pending = d.pending[n:]
+	return n, nil
+}
+
+func (d *aerosmartDevice) Write(p []byte) (int, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	cmd := strings.TrimSpace(string(p))
+	d.writes = append(d.writes, cmd)
+	fields := strings.Fields(cmd)
+
+	// Unsolicited chatter always precedes whatever we do next.
+	d.pending = append(d.pending, "120 1048 1\r\n130 1066 1\r\n"...)
+
+	switch {
+	case len(fields) == 3: // a write: applied, but never echoed
+		// A setpoint written to one address reads back from another: the real
+		// unit takes luefterstufe on 5002 and reports it on 5003.
+		target := fields[1]
+		if readBack, ok := writeToReadRegister[target]; ok {
+			target = readBack
+		}
+		d.applied[target] = fields[2]
+		// The unit broadcasts the resulting change instead of an echo.
+		d.pending = append(d.pending, "130 1092 3492\r\n"...)
+	case len(fields) == 2: // a read: answered
+		value, ok := d.applied[fields[1]]
+		if !ok {
+			value = answerFor(fields[1])
+		}
+		d.pending = append(d.pending, fields[0]+" "+fields[1]+" "+value+"\r\n"...)
+	}
+	return len(p), nil
+}
+
+func (d *aerosmartDevice) Flush() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.pending = nil
+	return nil
+}
+
+func (d *aerosmartDevice) Close() error { return nil }
+
+func (d *aerosmartDevice) writeCount(command string) int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	n := 0
+	for _, w := range d.writes {
+		if w == command {
+			n++
+		}
+	}
+	return n
+}
+
+// A write against the real device's behaviour must succeed, be sent once, and
+// be confirmed by reading the register back.
+func TestWriteAgainstAnEcholessDevice(t *testing.T) {
+	dev := newAerosmartDevice()
+	log := logger.New("error")
+	sp := serial.New(serial.Config{
+		Port:            "/dev/fake",
+		ReadTimeout:     100 * time.Millisecond,
+		ResponseTimeout: 300 * time.Millisecond,
+		ReopenBackoff:   time.Millisecond,
+		Opener:          func() (serial.Port, error) { return dev, nil },
+	}, log)
+	if err := sp.Open(); err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer func() { _ = sp.Close() }()
+
+	pub := newRecordingPublisher()
+	gate := registers.NewReadGate(time.Second)
+	readRegs := []config.ReadRegisterConfig{
+		{Name: "lueftermode", Command: "130 5003", Topic: "aerosmart/lueftermode",
+			Divisor: 1, Type: "integer", MinValue: 0, MaxValue: 5},
+	}
+	writeRegs := []config.WriteRegisterConfig{{
+		Name: "luefterstufe", CommandTemplate: "130 5002 {value}",
+		SubscribeTopic: "dw/aerosmart/luefterstufe", Topic: "aerosmart/luefterstufe",
+		MinValue: 0, MaxValue: 5, VerifyRegisters: []string{"lueftermode"},
+	}}
+
+	reader := registers.NewReader(sp, pub, log, readRegs, 3, 10*time.Millisecond)
+	writer := registers.NewWriter(sp, pub, log, writeRegs, gate, 3, 10*time.Millisecond, time.Millisecond)
+	writer.SetReader(reader)
+
+	if err := writer.HandleMessage(context.Background(), "dw/aerosmart/luefterstufe", "3"); err != nil {
+		t.Fatalf("HandleMessage() error = %v, want success against an echoless device", err)
+	}
+
+	if n := dev.writeCount("130 5002 3"); n != 1 {
+		t.Errorf("command sent %d times, want 1 (a landed write must not be re-sent)", n)
+	}
+	if v, ok := pub.get("aerosmart/luefterstufe"); !ok || v != "3" {
+		t.Errorf("state topic = %q (%v), want 3", v, ok)
+	}
+	// The read-back is what confirms it, and must reflect the new value.
+	if v, ok := pub.get("aerosmart/lueftermode"); !ok || v != "3" {
+		t.Errorf("verified lueftermode = %q (%v), want 3", v, ok)
+	}
+}
+
+// Unsolicited chatter must not disturb a read cycle either.
+func TestReadCycleIgnoresUnsolicitedChatter(t *testing.T) {
+	dev := newAerosmartDevice()
+	log := logger.New("error")
+	sp := serial.New(serial.Config{
+		Port:            "/dev/fake",
+		ReadTimeout:     100 * time.Millisecond,
+		ResponseTimeout: 300 * time.Millisecond,
+		ReopenBackoff:   time.Millisecond,
+		Opener:          func() (serial.Port, error) { return dev, nil },
+	}, log)
+	if err := sp.Open(); err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer func() { _ = sp.Close() }()
+
+	pub := newRecordingPublisher()
+	reader := registers.NewReader(sp, pub, log, readRegisters, 3, 10*time.Millisecond)
+	poller := registers.NewPoller(reader, nil, registers.NewReadGate(time.Second), log)
+
+	if err := poller.RunCycle(context.Background()); err != nil {
+		t.Fatalf("RunCycle() error = %v", err)
+	}
+	for topic, want := range map[string]string{
+		"aerosmart/luefterstatus": "3",
+		"aerosmart/innentemp":     "21.5",
+		"aerosmart/co2":           "812",
+	} {
+		if got, _ := pub.get(topic); got != want {
+			t.Errorf("%s = %q, want %q despite interleaved broadcasts", topic, got, want)
+		}
+	}
+}

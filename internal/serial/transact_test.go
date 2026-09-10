@@ -238,3 +238,45 @@ func TestSuperviseLeavesHealthyPortAlone(t *testing.T) {
 		t.Errorf("opens = %d, want %d (healthy port must not be reopened)", d.opens, opensAfterSetup)
 	}
 }
+
+// Send is used for register writes, which the unit does not reliably echo.
+func TestSendWritesWithoutWaitingForAResponse(t *testing.T) {
+	d := &fakeDevice{} // never responds
+	sp := testPort(t, d)
+
+	start := time.Now()
+	if err := sp.Send(context.Background(), "130 5002 3"); err != nil {
+		t.Fatalf("Send() error = %v, want nil", err)
+	}
+	elapsed := time.Since(start)
+
+	if elapsed > 50*time.Millisecond {
+		t.Errorf("Send() took %v; it must not wait for a response", elapsed)
+	}
+	if len(d.writes) != 1 || d.writes[0] != "130 5002 3\r\n" {
+		t.Errorf("writes = %q, want exactly one %q", d.writes, "130 5002 3\r\n")
+	}
+	if d.flushes == 0 {
+		t.Error("Send() did not discard stale input before writing")
+	}
+}
+
+func TestSendOnClosedPort(t *testing.T) {
+	sp := testPort(t, &fakeDevice{})
+	if err := sp.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if err := sp.Send(context.Background(), "130 5002 3"); !errors.Is(err, ErrPortNotOpen) {
+		t.Fatalf("Send() error = %v, want ErrPortNotOpen", err)
+	}
+}
+
+func TestSendHonoursContextCancellation(t *testing.T) {
+	sp := testPort(t, &fakeDevice{})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if err := sp.Send(ctx, "130 5002 3"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Send() error = %v, want context.Canceled", err)
+	}
+}

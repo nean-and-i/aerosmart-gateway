@@ -228,10 +228,28 @@ HandleMessage(ctx, topic, payload):
   range-check it                               -> out of range: return an error
   drop it if identical to the last accepted command for this topic within 1s
   gate.Preempt(); defer gate.Release()         # released on EVERY exit path
-  send the command, bounded retries
-  publish the register's own state topic
-  read back verify_registers and publish them
+  send the command ONCE                        # retried only on a write error
+  wait write_settle_delay
+  read back verify_registers                   # this is what confirms the write
+  publish the read-back values and the register's own state topic
 ```
+
+### Why a write is not confirmed by its echo
+
+The unit applies register writes but does not reliably answer them. Measured on
+a real gateway, 4 of 6 writes produced no frame matching the command within
+three 300ms windows — while the bus carried the resulting status change, so the
+write had plainly landed. One `boilerheizstab = 1` reported three failed
+attempts and yet `140 1038 1`, the heating-element request status, appeared on
+the wire.
+
+Waiting for an echo therefore failed writes that had succeeded, and each retry
+re-applied a setting that was already in effect. A write is now sent once and
+confirmed by reading `verify_registers` back, which the unit answers reliably
+(measured 14-48ms, every read in a 58-read sample).
+
+A write register with no `verify_registers` cannot be confirmed; the command is
+still sent and a warning says so.
 
 Validation happens **before** the read cycle is disturbed, so a malformed payload cannot
 cancel a readout. Everything after `Preempt` releases the gate on the way out; leaving it
@@ -306,6 +324,9 @@ told to publish to cannot drift from the one the gateway listens on.
 | Broker unreachable | Startup retries with backoff and jitter; later drops are handled by paho with re-subscription |
 | Broker stops acknowledging | Each operation fails after `op_timeout` |
 | Command arrives mid-cycle | Cycle cancelled, command applied, cycle retried shortly after |
+| Write not echoed by the unit | Expected; the write is confirmed by reading `verify_registers` back |
+| Write cannot be confirmed | Reported as an error, but the command was sent and may have taken effect; the next cycle shows the truth |
+| Unsolicited broadcast frames | Discarded by the frame matcher, including from node addresses that are not configured registers |
 | Commands arriving faster than they can be applied | Queued up to 16, then dropped with an error; the MQTT router is never blocked |
 | Log file cannot be opened | Falls back to console logging, which is enabled for the fallback |
 | Nothing read this cycle | Reported as skipped, retried in 5s rather than a whole interval |
@@ -338,6 +359,7 @@ told to publish to cannot drift from the one the gateway listens on.
 | `reopen_backoff` / `reopen_max_backoff` | `500` / `30000` | Supervised reopen backoff |
 | `health_check_interval` | `1000` | Port health poll interval |
 | `write_priority_timeout` | `10000` | Maximum time a write may hold reads off |
+| `write_settle_delay` | `50` | Wait after a write before reading the register back |
 | `xonxoff` / `dsrdtr` | `false` | Not supported by the driver; `true` is warned about and has no effect |
 
 ### MQTT

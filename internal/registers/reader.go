@@ -17,8 +17,11 @@ import (
 // Transactor performs one request/response exchange with the device.
 type Transactor interface {
 	// Transact writes a command and returns the value from the matching
-	// response frame.
+	// response frame. Used for reads, which the unit answers reliably.
 	Transact(ctx context.Context, command string) (string, error)
+	// Send writes a command without expecting a matching response frame.
+	// Used for register writes, which the unit does not reliably echo.
+	Send(ctx context.Context, command string) error
 	// IsHealthy reports whether the port is usable, so a cycle can be skipped
 	// while the port is being recovered.
 	IsHealthy() bool
