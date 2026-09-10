@@ -122,11 +122,11 @@ func (w *Writer) HandleMessage(ctx context.Context, topic string, message string
 
 	sendStart := time.Now()
 	if err := w.sendCommand(ctx, command); err != nil {
-		w.logger.SerialOperation("WRITE", command, "", time.Since(sendStart), err)
+		w.logger.SerialSend(command, time.Since(sendStart), err)
 		w.logger.Error("Failed to send %s after %d attempt(s): %v", register.Name, w.retries, err)
 		return fmt.Errorf("write %s: %w", register.Name, err)
 	}
-	w.logger.SerialOperation("WRITE", command, "", time.Since(sendStart), nil)
+	w.logger.SerialSend(command, time.Since(sendStart), nil)
 
 	// Give the unit a moment to apply the value before reading it back.
 	if !sleepCtx(ctx, w.settleDelay) {
