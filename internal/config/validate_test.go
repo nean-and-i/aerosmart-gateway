@@ -341,3 +341,45 @@ func TestValidateRejectsNegativeDurations(t *testing.T) {
 		})
 	}
 }
+
+// One Transact attempt can start a read just before its deadline and then
+// block for a whole read_timeout, so the budget must charge for both.
+func TestValidateCycleBudgetChargesReadTimeoutPerAttempt(t *testing.T) {
+	cfg, err := LoadAppConfig(writeConfig(t, `
+mqtt:
+  broker: "x"
+read_interval: 61
+serial:
+  retries: 3
+  read_timeout: 500
+  response_timeout: 600
+  retry_backoff: 0
+`))
+	if err != nil {
+		t.Fatalf("LoadAppConfig() error = %v", err)
+	}
+
+	// Charging response_timeout alone gives 29 x 3 x 600ms = 52.2s, which fits
+	// 61s. The real cost is 3 x 1100ms per register, about 96s.
+	if err := cfg.ValidateCycleBudget(29); err == nil {
+		t.Fatal("ValidateCycleBudget(29) = nil; the real cycle overruns the 61s interval")
+	}
+}
+
+// A maximum below the initial value collapses the startup backoff to nothing
+// and hammers the device node in a tight loop.
+func TestValidateRejectsReopenMaxBelowInitial(t *testing.T) {
+	cfg, err := LoadAppConfig(writeConfig(t, `
+mqtt:
+  broker: "x"
+serial:
+  reopen_backoff: 500
+  reopen_max_backoff: 1
+`))
+	if err != nil {
+		t.Fatalf("LoadAppConfig() error = %v", err)
+	}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("Validate() = nil, want a rejection of reopen_max_backoff < reopen_backoff")
+	}
+}

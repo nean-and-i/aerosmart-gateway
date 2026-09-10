@@ -185,9 +185,13 @@ All timeouts are in milliseconds.
 | `serial.xonxoff` | Software flow control. **Not supported by the driver**; `true` is rejected at startup | `false` |
 | `serial.dsrdtr` | Hardware flow control. **Not supported by the driver** | `false` |
 
-Worst-case time for one register is `retries x (response_timeout + retry_backoff)`, so with the
-defaults 3 x 400ms = 1.2s. Startup rejects a configuration whose worst-case full cycle
-(that figure times the number of read registers) does not fit inside `read_interval`.
+Worst-case time for one register is
+`retries x (response_timeout + read_timeout + retry_backoff)`, so with the defaults
+3 x 600ms = 1.8s. The `read_timeout` term is there because an attempt can pass its response
+deadline only after a read that has already started, and that read blocks for a full
+`read_timeout`. Startup rejects a configuration whose worst-case full cycle (that figure
+times the number of read registers) does not fit inside `read_interval`; with the shipped
+29 registers that is 52.2s against a 120s interval.
 
 Options from earlier versions (`max_retries`, `read_max_retries`, `write_max_retries`,
 `device_response_delay`, `read_with_retry_delay`, `write_with_retry_delay`, `deadline_timeout`,

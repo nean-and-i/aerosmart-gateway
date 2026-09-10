@@ -90,6 +90,9 @@ Silent device:
         readFrame blocks in the kernel up to read_timeout (200ms), returns io.EOF
         readFrame again; deadline passes
  300ms  ErrReadTimeout  (any partial bytes stay buffered for the next attempt)
+
+        A read that starts just before the deadline still blocks a full
+        read_timeout, so one attempt can take up to 500ms.
 ```
 
 ## Periodic read cycle
@@ -161,11 +164,16 @@ retried in seconds rather than costing a whole interval of data.
 One unresponsive register:
 
 ```
- t=0     attempt 1 ──▶ write, wait 300ms ──▶ ErrReadTimeout
- 400ms   attempt 2 ──▶ (after 100ms backoff) ──▶ ErrReadTimeout
- 800ms   attempt 3 ──▶ ──▶ ErrReadTimeout
- 1.2s    give up: register marked invalid, nothing published, cycle continues
+ t=0     attempt 1 ──▶ write, then read until the 300ms deadline
+                        a read starting at 299ms still blocks 200ms,
+                        so one attempt costs up to 500ms
+ 600ms   attempt 2 ──▶ (after 100ms backoff) ──▶ ErrReadTimeout
+ 1.2s    attempt 3 ──▶ ──▶ ErrReadTimeout
+ 1.8s    give up: register marked invalid, nothing published, cycle continues
 ```
+
+The budget check charges `response_timeout + read_timeout + retry_backoff` per attempt for
+exactly that reason.
 
 A dead port short-circuits, because the supervisor owns recovery:
 
@@ -173,7 +181,7 @@ A dead port short-circuits, because the supervisor owns recovery:
  t=0     attempt 1 ──▶ EIO ──▶ mark unhealthy ──▶ stop immediately
 ```
 
-Whole cycle against a silent device: 29 x 1.2s ≈ 35s, inside the 120s interval. Startup
+Whole cycle against a silent device: 29 x 1.8s = 52.2s, inside the 120s interval. Startup
 rejects a configuration where that does not hold.
 
 ## Port loss and recovery
@@ -256,12 +264,12 @@ Completion is signalled *after* teardown, so the watchdog covers the real work.
 | Operation | Typical | Worst case |
 |-----------|---------|-----------|
 | One transaction (device answers) | ~40ms | `response_timeout` (300ms) |
-| One register including retries | ~40ms | `retries x (response_timeout + retry_backoff)` = 1.2s |
+| One register including retries | ~40ms | `retries x (response_timeout + read_timeout + retry_backoff)` = 1.8s |
 | Full cycle, 29 registers, healthy | ~1.2s | — |
-| Full cycle, silent device | — | ~35s (must fit `read_interval`) |
+| Full cycle, silent device | — | 52.2s (must fit `read_interval`) |
 | Write with verification | ~130ms | ~2.4s (command + one verify register) |
 | Write preempting a cycle | ~300ms to yield | one `response_timeout` |
 | Cycle skipped (write pending / port recovering) | immediate | retried after 5s |
-| MQTT publish | ~1ms | `op_timeout` x `publish_retry_count` |
+| MQTT publish | ~1ms | `op_timeout` (hand-off) + `op_timeout` (ack), x `publish_retry_count` |
 | Port reopen | ~5ms | backoff to 30s between attempts |
 | Shutdown | ~360ms | 10s, then forced exit |

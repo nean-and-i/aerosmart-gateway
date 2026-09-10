@@ -92,7 +92,36 @@ func NewClient(config *MQTTConfig, log Logger) *Client {
 // caller's own retry, backoff and cancellation unreachable. Reconnection after
 // an established session is still handled by paho.
 func (c *Client) Connect() error {
-	broker := fmt.Sprintf("tcp://%s:%d", c.config.Broker, c.config.Port)
+	// Tear down any client from a previous attempt: left running it would keep
+	// trying to connect under the same ClientID and its OnConnect could still
+	// fire against this Client.
+	c.closeExisting()
+
+	client := paho.NewClient(c.clientOptions())
+	c.mu.Lock()
+	c.client = client
+	c.mu.Unlock()
+
+	token := client.Connect()
+	if !token.WaitTimeout(c.config.OpTimeout) {
+		return fmt.Errorf("connect to %s timed out after %v", c.brokerURL(), c.config.OpTimeout)
+	}
+	if err := token.Error(); err != nil {
+		return fmt.Errorf("connect to %s: %w", c.brokerURL(), err)
+	}
+	return nil
+}
+
+// brokerURL is the broker address in paho's form.
+func (c *Client) brokerURL() string {
+	return fmt.Sprintf("tcp://%s:%d", c.config.Broker, c.config.Port)
+}
+
+// clientOptions builds the paho options. Kept separate so the choices below
+// can be asserted in tests: they are what make the connection survive a
+// flaky network without stalling the serial read loop.
+func (c *Client) clientOptions() *paho.ClientOptions {
+	broker := c.brokerURL()
 
 	opts := paho.NewClientOptions()
 	opts.AddBroker(broker)
@@ -109,6 +138,14 @@ func (c *Client) Connect() error {
 	opts.SetMaxReconnectInterval(60 * time.Second)
 	opts.SetKeepAlive(30 * time.Second)
 	opts.SetConnectTimeout(c.config.OpTimeout)
+
+	// Without this, paho leaves the socket write with no deadline and blocks
+	// the caller for a hardcoded 30s handing the packet to its unbuffered
+	// outgoing channel. That happens inside Publish, before any token is
+	// waited on, so the token timeouts below would bound nothing: a broker
+	// that keeps the socket open but stops reading would stall the serial
+	// read loop and overrun the shutdown grace period.
+	opts.SetWriteTimeout(c.config.OpTimeout)
 
 	if c.config.AvailabilityTopic != "" {
 		opts.SetWill(c.config.AvailabilityTopic, payloadOffline, byte(c.config.QOS), true)
@@ -129,24 +166,7 @@ func (c *Client) Connect() error {
 		go c.onConnected()
 	})
 
-	// Tear down any client from a previous attempt: left running it would keep
-	// trying to connect under the same ClientID and its OnConnect could still
-	// fire against this Client.
-	c.closeExisting()
-
-	client := paho.NewClient(opts)
-	c.mu.Lock()
-	c.client = client
-	c.mu.Unlock()
-
-	token := client.Connect()
-	if !token.WaitTimeout(c.config.OpTimeout) {
-		return fmt.Errorf("connect to %s timed out after %v", broker, c.config.OpTimeout)
-	}
-	if err := token.Error(); err != nil {
-		return fmt.Errorf("connect to %s: %w", broker, err)
-	}
-	return nil
+	return opts
 }
 
 // closeExisting disconnects a client left over from an earlier attempt.
@@ -170,6 +190,12 @@ func (c *Client) handle() paho.Client {
 
 // onConnected restores subscriptions and announces availability.
 func (c *Client) onConnected() {
+	// A reconnect landing as shutdown begins must not re-announce "online":
+	// a clean disconnect suppresses the last will, so a retained "online"
+	// would outlive the process and leave every entity looking available.
+	if c.shuttingDown.Load() {
+		return
+	}
 	if err := c.publishAvailability(payloadOnline); err != nil {
 		c.logger.Error("MQTT failed to announce availability: %v", err)
 	}
