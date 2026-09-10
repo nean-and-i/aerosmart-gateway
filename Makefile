@@ -3,7 +3,7 @@
 
 # Binary name
 BINARY_NAME=aerosmart-gateway
-MAIN_PATH=./cmd/main.go
+MAIN_PATH=./cmd
 
 # Go build variables
 GO=go

@@ -163,11 +163,9 @@ func run() error {
 
 	// The supervisor is the only component that reopens the port.
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		serialPort.Supervise(ctx)
-	}()
+	})
 
 	mqttClient := mqtt.NewClient(&mqtt.MQTTConfig{
 		Broker:            appConfig.MQTT.Broker,
@@ -216,11 +214,9 @@ func run() error {
 	// goroutine. The worker is joined at shutdown, so the port is never closed
 	// under a write that is mid-exchange.
 	commands := newCommandQueue(commandQueueDepth, log)
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		commands.run(ctx, writer.HandleMessage)
-	}()
+	})
 
 	if topics := writer.GetSubscribeTopics(); len(topics) > 0 {
 		log.Info("Subscribing to command topics: %v", topics)
@@ -232,11 +228,9 @@ func run() error {
 	}
 
 	log.Info("Starting periodic read loop (interval: %ds)", appConfig.ReadInterval)
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		pollLoop(ctx, poller, time.Duration(appConfig.ReadInterval)*time.Second, skipRetryDelay, log)
-	}()
+	})
 
 	<-ctx.Done()
 
@@ -373,7 +367,7 @@ func openSerialWithRetry(ctx context.Context, sp *serial.SerialPort, log *logger
 // is down.
 func connectMQTTWithRetry(ctx context.Context, client *mqtt.Client, log *logger.Logger, maxRetries int, initialDelayMs int, maxDelayMs int, jitterPercent int) error {
 	var err error
-	for attempt := 0; attempt < maxRetries; attempt++ {
+	for attempt := range maxRetries {
 		select {
 		case <-ctx.Done():
 			return fmt.Errorf("MQTT connection cancelled: %w", ctx.Err())
@@ -405,7 +399,7 @@ func connectMQTTWithRetry(ctx context.Context, client *mqtt.Client, log *logger.
 // random factor within +/- jitterPercent.
 func calculateBackoffWithJitter(attempt int, initialDelayMs int, maxDelayMs int, jitterPercent int) time.Duration {
 	delayMs := float64(initialDelayMs)
-	for i := 0; i < attempt; i++ {
+	for range attempt {
 		delayMs *= 2
 	}
 
@@ -436,7 +430,7 @@ func publishHADiscovery(client *mqtt.Client, registersConfig *config.RegistersCo
 	}
 
 	published, failed := 0, 0
-	publish := func(what, topic string, payload interface{}) {
+	publish := func(what, topic string, payload any) {
 		if err := client.PublishDiscovery(topic, payload); err != nil {
 			log.Warn("Failed to publish discovery for %s: %v", what, err)
 			failed++

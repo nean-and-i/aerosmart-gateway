@@ -8,15 +8,15 @@ import (
 
 // HASensorConfig is a Home Assistant sensor discovery payload.
 type HASensorConfig struct {
-	Name              string                 `json:"name"`
-	StateTopic        string                 `json:"state_topic"`
-	Unit              string                 `json:"unit_of_measurement,omitempty"`
-	DeviceClass       string                 `json:"device_class,omitempty"`
-	StateClass        string                 `json:"state_class,omitempty"`
-	UniqueID          string                 `json:"unique_id"`
-	AvailabilityTopic string                 `json:"availability_topic,omitempty"`
-	ExpireAfter       int                    `json:"expire_after,omitempty"`
-	Device            map[string]interface{} `json:"device"`
+	Name              string         `json:"name"`
+	StateTopic        string         `json:"state_topic"`
+	Unit              string         `json:"unit_of_measurement,omitempty"`
+	DeviceClass       string         `json:"device_class,omitempty"`
+	StateClass        string         `json:"state_class,omitempty"`
+	UniqueID          string         `json:"unique_id"`
+	AvailabilityTopic string         `json:"availability_topic,omitempty"`
+	ExpireAfter       int            `json:"expire_after,omitempty"`
+	Device            map[string]any `json:"device"`
 }
 
 // HASwitchConfig is a Home Assistant switch discovery payload.
@@ -24,38 +24,38 @@ type HASensorConfig struct {
 // PayloadOn/Off and StateOn/Off are always set explicitly: Home Assistant
 // defaults to "ON"/"OFF", which this device neither accepts nor reports.
 type HASwitchConfig struct {
-	Name              string                 `json:"name"`
-	CommandTopic      string                 `json:"command_topic"`
-	StateTopic        string                 `json:"state_topic,omitempty"`
-	PayloadOn         string                 `json:"payload_on"`
-	PayloadOff        string                 `json:"payload_off"`
-	StateOn           string                 `json:"state_on"`
-	StateOff          string                 `json:"state_off"`
-	UniqueID          string                 `json:"unique_id"`
-	AvailabilityTopic string                 `json:"availability_topic,omitempty"`
-	Device            map[string]interface{} `json:"device"`
+	Name              string         `json:"name"`
+	CommandTopic      string         `json:"command_topic"`
+	StateTopic        string         `json:"state_topic,omitempty"`
+	PayloadOn         string         `json:"payload_on"`
+	PayloadOff        string         `json:"payload_off"`
+	StateOn           string         `json:"state_on"`
+	StateOff          string         `json:"state_off"`
+	UniqueID          string         `json:"unique_id"`
+	AvailabilityTopic string         `json:"availability_topic,omitempty"`
+	Device            map[string]any `json:"device"`
 }
 
 // HANumberConfig is a Home Assistant number discovery payload, used for
 // registers that take a range of values rather than on/off.
 type HANumberConfig struct {
-	Name              string                 `json:"name"`
-	CommandTopic      string                 `json:"command_topic"`
-	StateTopic        string                 `json:"state_topic,omitempty"`
-	Min               int                    `json:"min"`
-	Max               int                    `json:"max"`
-	Step              int                    `json:"step"`
-	Mode              string                 `json:"mode"`
-	UniqueID          string                 `json:"unique_id"`
-	AvailabilityTopic string                 `json:"availability_topic,omitempty"`
-	Device            map[string]interface{} `json:"device"`
+	Name              string         `json:"name"`
+	CommandTopic      string         `json:"command_topic"`
+	StateTopic        string         `json:"state_topic,omitempty"`
+	Min               int            `json:"min"`
+	Max               int            `json:"max"`
+	Step              int            `json:"step"`
+	Mode              string         `json:"mode"`
+	UniqueID          string         `json:"unique_id"`
+	AvailabilityTopic string         `json:"availability_topic,omitempty"`
+	Device            map[string]any `json:"device"`
 }
 
 // Discovery builds Home Assistant MQTT discovery payloads.
 type Discovery struct {
 	DeviceID string
 	Prefix   string
-	Device   map[string]interface{}
+	Device   map[string]any
 
 	// AvailabilityTopic is where the gateway publishes online/offline, so
 	// entities go unavailable instead of showing a stale retained value.
@@ -113,7 +113,7 @@ func (d Discovery) DerivedSensorConfig(reg config.DerivedRegisterConfig) (string
 //
 // The command topic is always the writer's subscribe topic, so commands cannot
 // be sent somewhere nothing is listening.
-func (d Discovery) CommandConfig(reg config.WriteRegisterConfig) (string, string, interface{}) {
+func (d Discovery) CommandConfig(reg config.WriteRegisterConfig) (string, string, any) {
 	uid := d.uniqueID(reg.Name)
 
 	if reg.MinValue == 0 && reg.MaxValue == 1 {
@@ -146,8 +146,8 @@ func (d Discovery) CommandConfig(reg config.WriteRegisterConfig) (string, string
 }
 
 // CreateDeviceInfo builds the shared device block for discovery payloads.
-func CreateDeviceInfo(deviceID, name, manufacturer, model, swVersion string) map[string]interface{} {
-	info := map[string]interface{}{
+func CreateDeviceInfo(deviceID, name, manufacturer, model, swVersion string) map[string]any {
+	info := map[string]any{
 		"identifiers":  []string{deviceID},
 		"name":         name,
 		"manufacturer": manufacturer,

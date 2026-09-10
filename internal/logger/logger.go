@@ -126,7 +126,7 @@ func NewWithConfig(config Config) *Logger {
 }
 
 // emit formats and writes one line to every enabled sink.
-func (l *Logger) emit(level Level, prefix, format string, args ...interface{}) {
+func (l *Logger) emit(level Level, prefix, format string, args ...any) {
 	if l.level > level {
 		return
 	}
@@ -144,27 +144,27 @@ func (l *Logger) emit(level Level, prefix, format string, args ...interface{}) {
 }
 
 // Debug logs a debug message.
-func (l *Logger) Debug(format string, args ...interface{}) {
+func (l *Logger) Debug(format string, args ...any) {
 	l.emit(DEBUG, "", format, args...)
 }
 
 // Info logs an info message.
-func (l *Logger) Info(format string, args ...interface{}) {
+func (l *Logger) Info(format string, args ...any) {
 	l.emit(INFO, "", format, args...)
 }
 
 // Warn logs a warning message.
-func (l *Logger) Warn(format string, args ...interface{}) {
+func (l *Logger) Warn(format string, args ...any) {
 	l.emit(WARN, "WARNING: ", format, args...)
 }
 
 // Error logs an error message.
-func (l *Logger) Error(format string, args ...interface{}) {
+func (l *Logger) Error(format string, args ...any) {
 	l.emit(ERROR, "ERROR: ", format, args...)
 }
 
 // Fatal logs a fatal message and exits.
-func (l *Logger) Fatal(format string, args ...interface{}) {
+func (l *Logger) Fatal(format string, args ...any) {
 	l.emit(ERROR, "FATAL: ", format, args...)
 	_ = l.Close()
 	os.Exit(1)

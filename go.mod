@@ -1,6 +1,8 @@
 module github.com/nean/aerosmart-gateway
 
-go 1.25.0
+go 1.27.0
+
+toolchain go1.27.1
 
 require (
 	github.com/eclipse/paho.mqtt.golang v1.5.1

@@ -41,7 +41,7 @@ func TestCalculateBackoffWithJitter_WithinJitterBounds(t *testing.T) {
 	)
 	lower := time.Duration(float64(base) * (1 - float64(jitter)/100)) // 75ms
 	upper := time.Duration(float64(base) * (1 + float64(jitter)/100)) // 125ms
-	for i := 0; i < 200; i++ {
+	for range 200 {
 		got := calculateBackoffWithJitter(0, initial, maxD, jitter)
 		if got < lower || got > upper {
 			t.Fatalf("delay %v out of jitter bounds [%v, %v]", got, lower, upper)
@@ -54,7 +54,7 @@ func TestCalculateBackoffWithJitter_WithinJitterBounds(t *testing.T) {
 // constant. A correct implementation must vary across calls.
 func TestCalculateBackoffWithJitter_ProducesVariation(t *testing.T) {
 	first := calculateBackoffWithJitter(2, 100, 10000, 25)
-	for i := 0; i < 200; i++ {
+	for range 200 {
 		if calculateBackoffWithJitter(2, 100, 10000, 25) != first {
 			return // observed variation -> pass
 		}

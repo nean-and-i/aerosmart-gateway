@@ -3,6 +3,7 @@ package mqtt
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -13,10 +14,10 @@ import (
 
 // Logger is the subset of logging this package needs.
 type Logger interface {
-	Debug(format string, args ...interface{})
-	Info(format string, args ...interface{})
-	Warn(format string, args ...interface{})
-	Error(format string, args ...interface{})
+	Debug(format string, args ...any)
+	Info(format string, args ...any)
+	Warn(format string, args ...any)
+	Error(format string, args ...any)
 }
 
 // MQTTConfig holds MQTT connection configuration.
@@ -230,9 +231,7 @@ func (c *Client) publishOnce(topic, value string, timeout time.Duration) error {
 func (c *Client) resubscribeAll() {
 	c.subMu.RLock()
 	topics := make(map[string]MessageHandler, len(c.subscribedTopics))
-	for topic, handler := range c.subscribedTopics {
-		topics[topic] = handler
-	}
+	maps.Copy(topics, c.subscribedTopics)
 	c.subMu.RUnlock()
 
 	if len(topics) == 0 {
@@ -365,7 +364,7 @@ func (c *Client) subscribe(topic string, handler MessageHandler) error {
 }
 
 // PublishDiscovery publishes one discovery payload.
-func (c *Client) PublishDiscovery(topic string, payload interface{}) error {
+func (c *Client) PublishDiscovery(topic string, payload any) error {
 	data, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("marshal discovery payload for %s: %w", topic, err)
