@@ -308,7 +308,9 @@ Example of Home Assistant dashboard:
 
 ### Write Operation
 
-1. MQTT message received on a write register's `subscribe_topic`
+1. MQTT message received on a write register's `subscribe_topic` and queued. Commands are
+   applied by a dedicated worker in arrival order, never on the MQTT client's own callback
+   goroutine, where blocking would stall inbound traffic including our own acknowledgements
 2. The value is parsed and range-checked first, so a malformed payload never disturbs the
    read cycle
 3. A duplicate of the last command accepted for that topic, within one second, is dropped

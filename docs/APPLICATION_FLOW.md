@@ -207,6 +207,15 @@ with stale ones, and derived values are never computed from sources that were no
 
 ## Register writes
 
+Commands are applied by a dedicated worker, not on paho's router goroutine.
+paho delivers subscription callbacks in order by default, and a callback that
+blocks stops inbound packets being read — including the PUBACKs for the
+handler's own publishes. Applying a command takes serial I/O and publishes
+several topics, so running it inline made those publishes time out and stalled
+every command queued behind it. A single worker drains a bounded queue, which
+keeps commands in arrival order; if the queue is full the command is dropped
+with an error rather than blocking the router.
+
 ```
 HandleMessage(ctx, topic, payload):
   resolve the register from the topic          -> unknown: log and return
@@ -292,6 +301,8 @@ told to publish to cannot drift from the one the gateway listens on.
 | Broker unreachable | Startup retries with backoff and jitter; later drops are handled by paho with re-subscription |
 | Broker stops acknowledging | Each operation fails after `op_timeout` |
 | Command arrives mid-cycle | Cycle cancelled, command applied, cycle retried shortly after |
+| Commands arriving faster than they can be applied | Queued up to 16, then dropped with an error; the MQTT router is never blocked |
+| Log file cannot be opened | Falls back to console logging, which is enabled for the fallback |
 | Nothing read this cycle | Reported as skipped, retried in 5s rather than a whole interval |
 
 ## Shutdown
@@ -299,8 +310,9 @@ told to publish to cannot drift from the one the gateway listens on.
 1. `SIGINT`/`SIGTERM` cancels the root context. A watchdog is armed; a second signal, or
    exceeding the grace period, exits immediately.
 2. MQTT disconnects first, so no further commands arrive, and publishes stop retrying.
-3. The poll loop and supervisor finish — cancellation reaches in-flight reads, so this
-   takes about one response timeout.
+3. The poll loop, command worker and supervisor finish — cancellation reaches in-flight
+   reads, and a command already being applied completes first, so this takes about one
+   response timeout.
 4. The serial port closes. `Close` takes the transaction lock, so a write already on the
    wire completes before the device is released.
 5. The log file is closed.

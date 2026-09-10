@@ -37,6 +37,11 @@ const (
 	// skipRetryDelay is how soon to retry after a cycle that read nothing,
 	// rather than waiting a whole read interval.
 	skipRetryDelay = 5 * time.Second
+
+	// commandQueueDepth bounds how many commands may wait to be applied.
+	// Applying one takes serial I/O, so a deeper queue would only accumulate
+	// stale commands.
+	commandQueueDepth = 16
 )
 
 func init() {
@@ -205,28 +210,20 @@ func run() error {
 	writer.SetReader(reader)
 	poller := registers.NewPoller(reader, derivedCalc, gate, log)
 
-	// Held for the duration of each command, and taken once during shutdown so
-	// the port is not closed under a write that is mid-exchange. Commands
-	// arrive on the MQTT router goroutine, which the WaitGroup cannot cover.
-	var commandMu sync.Mutex
+	// Commands are applied by a dedicated worker, not on paho's router
+	// goroutine. The worker is joined at shutdown, so the port is never closed
+	// under a write that is mid-exchange.
+	commands := newCommandQueue(commandQueueDepth, log)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		commands.run(ctx, writer.HandleMessage)
+	}()
 
 	if topics := writer.GetSubscribeTopics(); len(topics) > 0 {
 		log.Info("Subscribing to command topics: %v", topics)
 		for _, topic := range topics {
-			handler := func(t string, msg string) {
-				commandMu.Lock()
-				defer commandMu.Unlock()
-
-				if ctx.Err() != nil {
-					log.Warn("Ignoring command on %s during shutdown", t)
-					return
-				}
-				log.Debug("MQTT message on %s: %s", t, msg)
-				if err := writer.HandleMessage(ctx, t, msg); err != nil {
-					log.Error("Command on %s failed: %v", t, err)
-				}
-			}
-			if err := mqttClient.Subscribe(topic, handler); err != nil {
+			if err := mqttClient.Subscribe(topic, commands.enqueue); err != nil {
 				log.Error("Failed to subscribe to %s: %v", topic, err)
 			}
 		}
@@ -247,12 +244,6 @@ func run() error {
 	log.Info("Shutdown initiated, waiting for in-flight work...")
 	mqttClient.Disconnect()
 	wg.Wait()
-
-	// Wait for a command that was already being handled when the signal
-	// arrived; paho's Disconnect quiesce does not cover it.
-	commandMu.Lock()
-	//nolint:staticcheck // held only to observe completion; nothing follows
-	commandMu.Unlock()
 
 	if err := serialPort.Close(); err != nil {
 		log.Error("Error closing serial port: %v", err)

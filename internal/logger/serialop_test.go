@@ -3,7 +3,10 @@ package logger
 import (
 	"bytes"
 	"errors"
+	"io"
 	"log"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -108,4 +111,45 @@ func TestConcurrentLoggingAndClose(t *testing.T) {
 		t.Errorf("second Close() error = %v", err)
 	}
 	l.Info("after close must not panic")
+}
+
+// When the log file cannot be opened, the fallback must actually take effect.
+// It used to build a console logger but leave consoleLogging false while
+// fileLogging stayed true with a nil sink, so every line was discarded.
+func TestFileOpenFailureFallsBackToConsole(t *testing.T) {
+	// A path underneath a regular file cannot be opened (ENOTDIR).
+	blocker := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	unopenable := filepath.Join(blocker, "aerosmart.log")
+
+	stdout := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("Pipe() error = %v", err)
+	}
+	os.Stdout = w
+
+	l := NewWithConfig(Config{
+		Level:          "info",
+		LogFile:        unopenable,
+		FileLogging:    true,
+		ConsoleLogging: false, // as a service unit would have it
+	})
+	l.Info("this line must not be lost")
+
+	_ = w.Close()
+	os.Stdout = stdout
+	out, _ := io.ReadAll(r)
+
+	if !strings.Contains(string(out), "this line must not be lost") {
+		t.Errorf("log output = %q, want the message on stdout after the file failed to open", out)
+	}
+	if l.fileLogging {
+		t.Error("fileLogging = true with no file sink")
+	}
+	if !l.consoleLogging {
+		t.Error("consoleLogging = false, so nothing would be logged anywhere")
+	}
 }
