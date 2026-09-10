@@ -190,6 +190,7 @@ All timeouts are in milliseconds.
 | `serial.reopen_max_backoff` | Maximum reopen delay | `30000` |
 | `serial.health_check_interval` | How often port health is polled | `1000` |
 | `serial.write_priority_timeout` | Upper bound on how long a write may hold reads off | `10000` |
+| `serial.write_settle_delay` | Wait after writing before reading the register back | `50` |
 | `serial.xonxoff` | Software flow control. **Not supported by the driver**; `true` is reported as a warning and has no effect | `false` |
 | `serial.dsrdtr` | Hardware flow control. **Not supported by the driver**; warned about, no effect | `false` |
 
@@ -324,9 +325,10 @@ Example of Home Assistant dashboard:
    read cycle
 3. A duplicate of the last command accepted for that topic, within one second, is dropped
 4. The read cycle is preempted, and released again on every exit path
-5. The command is sent and the device's echo matched
-6. The register's own state topic is published, then any `verify_registers` are read back
-   and published
+5. The command is sent **once**. The unit applies writes but does not reliably echo them,
+   so nothing waits for an echo and a landed command is never re-sent
+6. After `write_settle_delay`, the `verify_registers` are read back. A successful read-back
+   is what confirms the write; the register's own state topic is published then
 
 ### Reliability
 

@@ -328,6 +328,46 @@ func (s *SerialPort) Transact(ctx context.Context, command string) (string, erro
 	}
 }
 
+// Send writes a command without waiting for a matching response frame.
+//
+// The unit applies register writes but does not reliably echo them: on a real
+// gateway most writes produced no matching frame within a second, while the
+// bus carried the resulting status change, proving the write had landed.
+// Waiting for an echo therefore failed writes that had in fact succeeded, and
+// retrying re-applied them. Callers confirm a write by reading the affected
+// registers back instead.
+func (s *SerialPort) Send(ctx context.Context, command string) error {
+	s.txMu.Lock()
+	defer s.txMu.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	port, fr, err := s.session()
+	if err != nil {
+		return err
+	}
+
+	// Discard anything stale so the reply to the following read-back cannot be
+	// satisfied by a frame that predates this command.
+	fr.reset()
+	if err := port.Flush(); err != nil {
+		if IsPortError(err) {
+			s.markUnhealthy(err)
+		}
+		return fmt.Errorf("flush before %q: %w", command, err)
+	}
+
+	if _, err := port.Write([]byte(command + "\r\n")); err != nil {
+		if IsPortError(err) {
+			s.markUnhealthy(err)
+		}
+		return fmt.Errorf("write %q: %w", command, err)
+	}
+	return nil
+}
+
 // Supervise reopens the port whenever it becomes unhealthy, with exponential
 // backoff, until ctx is done. It is the only place that reopens the port, so a
 // transient read failure cannot trigger a device-resetting reopen.

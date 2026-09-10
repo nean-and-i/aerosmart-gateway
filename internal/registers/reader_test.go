@@ -21,6 +21,7 @@ type fakeDevice struct {
 	err       error
 	failFirst int // fail this many calls before answering
 	unhealthy bool
+	sendErr   error // if set, Send fails with this
 	calls     []string
 	block     chan struct{} // if set, Transact waits on it (or on ctx)
 }
@@ -60,8 +61,20 @@ func (f *fakeDevice) callCount() int {
 	return len(f.calls)
 }
 
-func (f *fakeDevice) ResponseTimeout() time.Duration { return 50 * time.Millisecond }
-func (f *fakeDevice) IsHealthy() bool                { return !f.unhealthy }
+// Send records the command without producing a response, which is how the
+// real unit behaves for register writes.
+func (f *fakeDevice) Send(ctx context.Context, command string) error {
+	f.mu.Lock()
+	f.calls = append(f.calls, command)
+	err := f.sendErr
+	f.mu.Unlock()
+
+	if err != nil {
+		return err
+	}
+	return ctx.Err()
+}
+func (f *fakeDevice) IsHealthy() bool { return !f.unhealthy }
 
 // fakePublisher records what was published.
 type fakePublisher struct {
@@ -310,7 +323,7 @@ var fanWrite = config.WriteRegisterConfig{
 
 func testWriter(dev Transactor, pub Publisher, gate *ReadGate) *Writer {
 	log := testLogger()
-	w := NewWriter(dev, pub, log, []config.WriteRegisterConfig{fanWrite}, gate, 3, time.Millisecond)
+	w := NewWriter(dev, pub, log, []config.WriteRegisterConfig{fanWrite}, gate, 3, time.Millisecond, time.Millisecond)
 	w.SetReader(NewReader(dev, pub, log, []config.ReadRegisterConfig{fanReg}, 1, time.Millisecond))
 	return w
 }
@@ -741,5 +754,107 @@ func TestDerivedValidateAcceptsCompleteSources(t *testing.T) {
 	})
 	if err := d.Validate(); err != nil {
 		t.Fatalf("Validate() error = %v, want nil", err)
+	}
+}
+
+// ---------- write confirmation (real-device behaviour) ----------
+
+// The unit applies a write but does not reliably echo the command: on a real
+// gateway 4 of 6 writes produced no matching echo within 3 x 300ms, while the
+// bus showed the resulting status change, proving the write had landed.
+// Success must therefore be decided by reading the register back, not by an
+// echo, and the command must not be re-sent while waiting for one.
+func TestHandleMessageSucceedsWithoutAnEcho(t *testing.T) {
+	dev := &fakeDevice{responses: map[string]string{
+		// No entry for "130 5002 3": the command is accepted, never echoed.
+		"130 1067": "3",
+	}}
+	pub := newFakePublisher()
+	gate := NewReadGate(time.Second)
+	w := testWriter(dev, pub, gate)
+
+	if err := w.HandleMessage(context.Background(), fanWrite.SubscribeTopic, "3"); err != nil {
+		t.Fatalf("HandleMessage() error = %v, want success once the register reads back", err)
+	}
+
+	if v, ok := pub.get("aerosmart/luefterstatus"); !ok || v != "3" {
+		t.Errorf("verified value published = %q (%v), want 3", v, ok)
+	}
+	if v, ok := pub.get(fanWrite.Topic); !ok || v != "3" {
+		t.Errorf("state topic = %q (%v), want 3", v, ok)
+	}
+	if gate.Suppressed() {
+		t.Error("gate left suppressed")
+	}
+}
+
+// The command must be written once. Re-sending it while waiting for an echo
+// re-applies a setting that already took effect.
+func TestHandleMessageSendsCommandOnce(t *testing.T) {
+	dev := &fakeDevice{responses: map[string]string{"130 1067": "3"}}
+	w := testWriter(dev, newFakePublisher(), NewReadGate(time.Second))
+
+	if err := w.HandleMessage(context.Background(), fanWrite.SubscribeTopic, "3"); err != nil {
+		t.Fatalf("HandleMessage() error = %v", err)
+	}
+
+	dev.mu.Lock()
+	defer dev.mu.Unlock()
+	sends := 0
+	for _, c := range dev.calls {
+		if c == "130 5002 3" {
+			sends++
+		}
+	}
+	if sends != 1 {
+		t.Errorf("command written %d times, want exactly 1", sends)
+	}
+}
+
+// If the register cannot be read back, the write is unconfirmed and must be
+// reported: the value may or may not have been applied.
+func TestHandleMessageReportsUnconfirmedWrite(t *testing.T) {
+	dev := &fakeDevice{} // neither echoes nor answers the verify read
+	gate := NewReadGate(time.Second)
+	w := testWriter(dev, newFakePublisher(), gate)
+
+	err := w.HandleMessage(context.Background(), fanWrite.SubscribeTopic, "3")
+	if err == nil {
+		t.Fatal("HandleMessage() error = nil, want an unconfirmed-write error")
+	}
+	if !strings.Contains(err.Error(), "confirm") {
+		t.Errorf("error = %v, want it to say the write could not be confirmed", err)
+	}
+	if gate.Suppressed() {
+		t.Error("gate left suppressed")
+	}
+}
+
+// A write register with nothing to verify against cannot be confirmed, but the
+// command still goes out; that must not be reported as a failure.
+func TestHandleMessageWithoutVerifyRegisters(t *testing.T) {
+	reg := fanWrite
+	reg.VerifyRegisters = nil
+	dev := &fakeDevice{}
+	pub := newFakePublisher()
+	log := testLogger()
+	w := NewWriter(dev, pub, log, []config.WriteRegisterConfig{reg}, NewReadGate(time.Second), 3, time.Millisecond, time.Millisecond)
+	w.SetReader(NewReader(dev, pub, log, []config.ReadRegisterConfig{fanReg}, 1, time.Millisecond))
+
+	if err := w.HandleMessage(context.Background(), reg.SubscribeTopic, "3"); err != nil {
+		t.Fatalf("HandleMessage() error = %v, want success", err)
+	}
+	if v, ok := pub.get(reg.Topic); !ok || v != "3" {
+		t.Errorf("state topic = %q (%v), want 3", v, ok)
+	}
+}
+
+// A failure to even write the command must still be an error, and retried.
+func TestHandleMessageRetriesAFailedSend(t *testing.T) {
+	dev := &fakeDevice{sendErr: serial.ErrPortNotOpen}
+	w := testWriter(dev, newFakePublisher(), NewReadGate(time.Second))
+
+	if err := w.HandleMessage(context.Background(), fanWrite.SubscribeTopic, "3"); err == nil {
+		t.Fatal("HandleMessage() error = nil, want the send failure reported")
 	}
 }

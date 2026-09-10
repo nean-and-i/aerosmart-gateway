@@ -26,6 +26,10 @@ type Writer struct {
 	retries int
 	backoff time.Duration
 
+	// settleDelay is how long to wait after writing before reading the value
+	// back, giving the unit time to apply it.
+	settleDelay time.Duration
+
 	// lastCommand remembers the last command per topic that actually reached
 	// the device, so a broker redelivery is dropped while a retry after a
 	// failure, and a change back to an earlier value, both go through.
@@ -36,7 +40,7 @@ type Writer struct {
 
 // NewWriter creates a register writer. retries counts total attempts per
 // command; the gate is used to preempt in-flight read cycles.
-func NewWriter(dev Transactor, pub Publisher, log *logger.Logger, registers []config.WriteRegisterConfig, gate *ReadGate, retries int, backoff time.Duration) *Writer {
+func NewWriter(dev Transactor, pub Publisher, log *logger.Logger, registers []config.WriteRegisterConfig, gate *ReadGate, retries int, backoff time.Duration, settleDelay time.Duration) *Writer {
 	if retries < 1 {
 		retries = 1
 	}
@@ -55,6 +59,7 @@ func NewWriter(dev Transactor, pub Publisher, log *logger.Logger, registers []co
 		gate:         gate,
 		retries:      retries,
 		backoff:      backoff,
+		settleDelay:  settleDelay,
 		lastCommand:  make(map[string]lastWrite),
 		dedupeWindow: time.Second,
 	}
@@ -115,15 +120,28 @@ func (w *Writer) HandleMessage(ctx context.Context, topic string, message string
 	command := mqtt.ParseWriteRegisterCommand(register.CommandTemplate, valueStr)
 	w.logger.Info("=== Writing %s = %d (%q) ===", register.Name, value, command)
 
-	response, err := w.sendCommand(ctx, command)
-	if err != nil {
-		w.logger.SerialOperation("WRITE", command, "", 0, err)
-		w.logger.Error("Failed to write %s after %d attempt(s): %v", register.Name, w.retries, err)
+	sendStart := time.Now()
+	if err := w.sendCommand(ctx, command); err != nil {
+		w.logger.SerialOperation("WRITE", command, "", time.Since(sendStart), err)
+		w.logger.Error("Failed to send %s after %d attempt(s): %v", register.Name, w.retries, err)
 		return fmt.Errorf("write %s: %w", register.Name, err)
 	}
+	w.logger.SerialOperation("WRITE", command, "", time.Since(sendStart), nil)
 
-	w.logger.SerialOperation("WRITE", command, response, 0, nil)
-	w.logger.Info("Wrote %s = %d (device echoed %q)", register.Name, value, response)
+	// Give the unit a moment to apply the value before reading it back.
+	if !sleepCtx(ctx, w.settleDelay) {
+		return ctx.Err()
+	}
+
+	confirmed, checkable := w.verifyWrite(ctx, register)
+	if checkable && !confirmed {
+		// The command went out, so it may still have taken effect; the next
+		// read cycle will show the truth.
+		w.logger.Warn("Could not confirm %s = %d by reading back %v",
+			register.Name, value, register.VerifyRegisters)
+		return fmt.Errorf("write %s: sent but could not confirm it took effect", register.Name)
+	}
+
 	w.rememberSuccess(topic, valueStr)
 
 	// Reflect the accepted command on the register's own state topic, so the
@@ -134,44 +152,54 @@ func (w *Writer) HandleMessage(ctx context.Context, topic string, message string
 		}
 	}
 
-	w.verifyWrite(ctx, register)
+	if !checkable {
+		w.logger.Warn("Wrote %s = %d; no verify_registers configured, so it cannot be confirmed",
+			register.Name, value)
+	} else {
+		w.logger.Info("Wrote %s = %d, confirmed by read-back", register.Name, value)
+	}
 
 	w.logger.Info("=== Write of %s completed in %v ===", register.Name, time.Since(received))
 	return nil
 }
 
-// sendCommand writes the command, retrying a bounded number of times.
+// sendCommand writes the command, retrying only if the write itself failed.
 //
-// Retrying re-sends the command, which is safe here because every write
-// register sets an absolute value rather than applying a delta.
-func (w *Writer) sendCommand(ctx context.Context, command string) (string, error) {
+// A retry re-applies an absolute value, which is harmless, but it is reserved
+// for a genuine write error: the unit does not reliably answer a write, so
+// retrying on a missing response would re-send a command that already landed.
+func (w *Writer) sendCommand(ctx context.Context, command string) error {
 	var lastErr error
 	for attempt := 1; attempt <= w.retries; attempt++ {
 		if err := ctx.Err(); err != nil {
-			return "", err
+			return err
 		}
 		if attempt > 1 && !sleepCtx(ctx, w.backoff) {
-			return "", ctx.Err()
+			return ctx.Err()
 		}
 
-		response, err := w.dev.Transact(ctx, command)
+		err := w.dev.Send(ctx, command)
 		if err == nil {
-			return response, nil
+			return nil
 		}
 		lastErr = err
 		if isCancellation(err) {
-			return "", err
+			return err
 		}
-		w.logger.Warn("Write attempt %d/%d for %q failed: %v", attempt, w.retries, command, err)
+		w.logger.Warn("Send attempt %d/%d for %q failed: %v", attempt, w.retries, command, err)
 	}
-	return "", lastErr
+	return lastErr
 }
 
 // verifyWrite reads back the registers that confirm the write took effect and
 // publishes their fresh values.
-func (w *Writer) verifyWrite(ctx context.Context, register config.WriteRegisterConfig) {
+//
+// It reports whether any register could be read (confirmed) and whether there
+// was anything to check at all (checkable). A successful read-back is what
+// makes a write trustworthy, since the unit does not reliably echo commands.
+func (w *Writer) verifyWrite(ctx context.Context, register config.WriteRegisterConfig) (confirmed, checkable bool) {
 	if w.reader == nil || len(register.VerifyRegisters) == 0 {
-		return
+		return false, false
 	}
 
 	w.logger.Info("Verifying %s by reading %v", register.Name, register.VerifyRegisters)
@@ -202,7 +230,10 @@ func (w *Writer) verifyWrite(ctx context.Context, register config.WriteRegisterC
 			continue
 		}
 		w.logger.Info("Verified %s = %s", name, checked)
+		confirmed = true
 	}
+
+	return confirmed, true
 }
 
 // lastWrite records the most recent command accepted for a topic.
