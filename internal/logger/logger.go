@@ -76,14 +76,22 @@ func NewWithConfig(config Config) *Logger {
 		consoleLogger = log.New(os.Stdout, "", 0)
 	}
 
+	fileLogging := config.FileLogging && config.LogFile != ""
+	consoleLogging := config.ConsoleLogging
+
 	// Setup file logging
-	if config.FileLogging && config.LogFile != "" {
+	if fileLogging {
 		// Open log file in append mode, create if doesn't exist
 		logFile, err := os.OpenFile(config.LogFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 		if err != nil {
-			// If we can't open the log file, fall back to console only
-			fmt.Printf("[WARN] Could not open log file %s: %v\n", config.LogFile, err)
-			// Only set consoleLogger if it wasn't already configured
+			// Fall back to the console, and actually enable it: leaving
+			// consoleLogging off while fileLogging stayed on with no sink
+			// discarded every line, so a service whose log path is
+			// unwritable logged nothing at all.
+			fmt.Printf("[WARN] Could not open log file %s: %v; logging to console instead\n",
+				config.LogFile, err)
+			fileLogging = false
+			consoleLogging = true
 			if consoleLogger == nil {
 				consoleLogger = log.New(os.Stdout, "", 0)
 			}
@@ -96,8 +104,8 @@ func NewWithConfig(config Config) *Logger {
 	l := &Logger{
 		consoleLogger:  consoleLogger,
 		fileLogger:     fileLogger,
-		fileLogging:    config.FileLogging && config.LogFile != "",
-		consoleLogging: config.ConsoleLogging,
+		fileLogging:    fileLogging,
+		consoleLogging: consoleLogging,
 		file:           logFileHandle,
 	}
 

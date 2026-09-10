@@ -121,9 +121,12 @@ make a dead sensor look alive.
 ## Write with verification
 
 ```
- t       MQTT           Writer          ReadGate        SerialPort      MQTT
+ t     paho router    queue     worker/Writer   ReadGate    SerialPort   MQTT
  │
- 0ms  ──▶│ "3" on dw/aerosmart/luefterstufe
+ 0ms ──▶│ "3" on dw/aerosmart/luefterstufe
+        ├─ enqueue ──▶│         (never blocks; the router must keep reading
+        └─ returns    │          packets, including our own PUBACKs)
+                      └──────▶│
          ├─ resolve register
          ├─ parse + range-check         (BEFORE touching the read cycle)
          ├─ dedupe check
