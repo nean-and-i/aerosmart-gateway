@@ -597,3 +597,138 @@ func TestReadCycleIgnoresUnsolicitedChatter(t *testing.T) {
 		}
 	}
 }
+
+// laggingDevice applies a write immediately to its setpoint register but lets
+// the "actual stage" register trail, as the real unit does: 60ms after a stage
+// change 130 1067 still reported the previous value.
+type laggingDevice struct {
+	mu      sync.Mutex
+	pending []byte
+	mode    string // 130 5003, updates at once
+	status  string // 130 1067, updates after lag
+	lagUpTo time.Time
+	lag     time.Duration
+}
+
+func newLaggingDevice(lag time.Duration) *laggingDevice {
+	return &laggingDevice{mode: "1", status: "1", lag: lag}
+}
+
+func (d *laggingDevice) Read(p []byte) (int, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if len(d.pending) == 0 {
+		return 0, nil
+	}
+	n := copy(p, d.pending)
+	d.pending = d.pending[n:]
+	return n, nil
+}
+
+func (d *laggingDevice) Write(p []byte) (int, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	fields := strings.Fields(strings.TrimSpace(string(p)))
+	switch {
+	case len(fields) == 3 && fields[1] == "5002": // setpoint write, never echoed
+		d.mode = fields[2]
+		d.lagUpTo = time.Now().Add(d.lag)
+	case len(fields) == 2:
+		var value string
+		switch fields[1] {
+		case "5003":
+			value = d.mode
+		case "1067":
+			if time.Now().Before(d.lagUpTo) {
+				value = d.status // still the old stage
+			} else {
+				d.status = d.mode
+				value = d.status
+			}
+		default:
+			value = "0"
+		}
+		d.pending = append(d.pending, fields[0]+" "+fields[1]+" "+value+"\r\n"...)
+	}
+	return len(p), nil
+}
+
+func (d *laggingDevice) Flush() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.pending = nil
+	return nil
+}
+
+func (d *laggingDevice) Close() error { return nil }
+
+// The immediate read-back publishes the stale stage; the settle re-read must
+// correct it without waiting for the next full read cycle.
+func TestSettleRereadCorrectsALaggingValue(t *testing.T) {
+	dev := newLaggingDevice(150 * time.Millisecond)
+	log := logger.New("error")
+	sp := serial.New(serial.Config{
+		Port:            "/dev/fake",
+		ReadTimeout:     100 * time.Millisecond,
+		ResponseTimeout: 300 * time.Millisecond,
+		ReopenBackoff:   time.Millisecond,
+		Opener:          func() (serial.Port, error) { return dev, nil },
+	}, log)
+	if err := sp.Open(); err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer func() { _ = sp.Close() }()
+
+	statusReg := config.ReadRegisterConfig{
+		Name: "luefterstatus", Command: "130 1067", Topic: "aerosmart/luefterstatus",
+		Divisor: 1, Type: "integer", MinValue: 0, MaxValue: 5,
+	}
+	modeReg := config.ReadRegisterConfig{
+		Name: "lueftermode", Command: "130 5003", Topic: "aerosmart/lueftermode",
+		Divisor: 1, Type: "integer", MinValue: 0, MaxValue: 5,
+	}
+	writeReg := config.WriteRegisterConfig{
+		Name: "luefterstufe", CommandTemplate: "130 5002 {value}",
+		SubscribeTopic: "dw/aerosmart/luefterstufe", Topic: "aerosmart/luefterstufe",
+		MinValue: 0, MaxValue: 5,
+		StateFrom:       "lueftermode",
+		VerifyRegisters: []string{"luefterstatus", "lueftermode"},
+	}
+
+	pub := newRecordingPublisher()
+	reader := registers.NewReader(sp, pub, log, []config.ReadRegisterConfig{statusReg, modeReg}, 3, 10*time.Millisecond)
+	writer := registers.NewWriter(sp, pub, log, []config.WriteRegisterConfig{writeReg},
+		registers.NewReadGate(time.Second), 3, 10*time.Millisecond, time.Millisecond)
+	writer.SetReader(reader)
+
+	runResettle := writer.SetResettleDelay(250 * time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	resettleDone := make(chan struct{})
+	go func() { runResettle(ctx); close(resettleDone) }()
+
+	if err := writer.HandleMessage(ctx, "dw/aerosmart/luefterstufe", "4"); err != nil {
+		t.Fatalf("HandleMessage() error = %v", err)
+	}
+
+	// Immediately after the write the actual stage still reads the old value.
+	if v, _ := pub.get("aerosmart/luefterstatus"); v != "1" {
+		t.Errorf("luefterstatus right after the write = %q, want the stale 1", v)
+	}
+
+	// The settle re-read must publish the value the unit ended up at.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if v, _ := pub.get("aerosmart/luefterstatus"); v == "4" {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if v, _ := pub.get("aerosmart/luefterstatus"); v != "4" {
+		t.Errorf("luefterstatus after settling = %q, want 4; the lagging value was never corrected", v)
+	}
+
+	cancel()
+	<-resettleDone
+}

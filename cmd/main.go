@@ -216,6 +216,12 @@ func run() error {
 	writer := registers.NewWriter(serialPort, mqttClient, log, registersConfig.WriteRegisters, gate, retries, backoff,
 		msDuration(appConfig.Serial.WriteSettleDelay))
 	writer.SetReader(reader)
+
+	// Values that trail a command are read again shortly afterwards.
+	runResettle := writer.SetResettleDelay(msDuration(appConfig.Serial.WriteResettleDelay))
+	wg.Go(func() {
+		runResettle(ctx)
+	})
 	poller := registers.NewPoller(reader, derivedCalc, gate, log)
 
 	// Commands are applied by a dedicated worker, not on paho's router

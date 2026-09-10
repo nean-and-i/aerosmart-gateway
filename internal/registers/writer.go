@@ -30,6 +30,10 @@ type Writer struct {
 	// back, giving the unit time to apply it.
 	settleDelay time.Duration
 
+	// resettle re-reads the read-back registers again later, for values that
+	// trail the command.
+	resettle *resettler
+
 	// lastCommand remembers the last command per topic that actually reached
 	// the device, so a broker redelivery is dropped while a retry after a
 	// failure, and a change back to an earlier value, both go through.
@@ -67,6 +71,31 @@ func NewWriter(dev Transactor, pub Publisher, log *logger.Logger, registers []co
 
 // SetReader supplies the reader used to verify writes.
 func (w *Writer) SetReader(reader *Reader) { w.reader = reader }
+
+// SetResettleDelay enables a second read-back this long after a write, for
+// values that trail the command. Zero disables it. The returned function runs
+// the re-reads and must be called in its own goroutine.
+func (w *Writer) SetResettleDelay(delay time.Duration) func(context.Context) {
+	w.resettle = newResettler(delay, w.RefreshReadBack, w.logger)
+	return w.resettle.run
+}
+
+// RefreshReadBack re-reads the register's read-back registers and publishes
+// them, without judging whether the write succeeded.
+func (w *Writer) RefreshReadBack(ctx context.Context, register config.WriteRegisterConfig) {
+	values, _, _ := w.readBack(ctx, register)
+
+	if register.StateFrom == "" || register.Topic == "" {
+		return
+	}
+	actual, ok := values[register.StateFrom]
+	if !ok {
+		return
+	}
+	if err := w.pub.Publish(register.Topic, actual); err != nil {
+		w.logger.Error("Failed to publish settled state for %s: %v", register.Name, err)
+	}
+}
 
 // GetSubscribeTopics returns the command topics to subscribe to.
 func (w *Writer) GetSubscribeTopics() []string {
@@ -174,6 +203,11 @@ func (w *Writer) HandleMessage(ctx context.Context, topic string, message string
 		w.rememberSuccess(topic, valueStr)
 		w.logger.Warn("Wrote %s = %d; no state_from or verify_registers configured, "+
 			"so it cannot be confirmed", register.Name, value)
+	}
+
+	// Some values trail the command; read them again once things settle.
+	if w.resettle != nil {
+		w.resettle.schedule(register)
 	}
 
 	w.logger.Info("=== Write of %s completed in %v ===", register.Name, time.Since(received))

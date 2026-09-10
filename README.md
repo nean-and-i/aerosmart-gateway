@@ -191,6 +191,7 @@ All timeouts are in milliseconds.
 | `serial.health_check_interval` | How often port health is polled | `1000` |
 | `serial.write_priority_timeout` | Upper bound on how long a write may hold reads off | `10000` |
 | `serial.write_settle_delay` | Wait after writing before reading the register back | `50` |
+| `serial.write_resettle_delay` | Wait before a second read-back, for values that trail the command; 0 disables | `5000` |
 | `serial.xonxoff` | Software flow control. **Not supported by the driver**; `true` is reported as a warning and has no effect | `false` |
 | `serial.dsrdtr` | Hardware flow control. **Not supported by the driver**; warned about, no effect | `false` |
 
@@ -332,6 +333,10 @@ Example of Home Assistant dashboard:
    Assistant shows reality rather than the request. Any `verify_registers` are read and
    published to their own topics too. A value differing from the request is reported as an
    error, with the actual value published
+7. After `write_resettle_delay` the same registers are read once more, because
+   some values trail the command — the actual fan stage still reported the old value 60 ms
+   after a stage change. Repeated commands restart that wait, so one read happens after the
+   changes stop rather than one per command
 
 ### Reliability
 

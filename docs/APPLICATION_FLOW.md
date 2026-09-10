@@ -234,6 +234,7 @@ HandleMessage(ctx, topic, payload):
   read back verify_registers
   publish that actual value as the register's state, plus the verified values
   report an error if the unit is holding something other than what was asked
+  schedule one more read after write_resettle_delay   # for values that lag
 ```
 
 ### Why a write is not confirmed by its echo
@@ -252,6 +253,19 @@ confirmed by reading `verify_registers` back, which the unit answers reliably
 
 A write register with no `state_from` or `verify_registers` cannot be confirmed;
 the command is still sent and a warning says so.
+
+### Values that trail the command
+
+The setpoint register updates at once, but the register reporting what the unit
+is *actually doing* does not: 60ms after a stage change, `130 1067` still
+returned the previous stage, so the read-back published a number the unit was
+already moving away from. Home Assistant then held that stale value until the
+next full read cycle.
+
+So the read-back registers are read once more after `write_resettle_delay`
+(5s by default). The wait restarts on every write, so changing stage several
+times in a row produces one read after the changes stop rather than one per
+command, and scheduling it never blocks the write path.
 
 ### state_from
 
@@ -371,6 +385,7 @@ told to publish to cannot drift from the one the gateway listens on.
 | `health_check_interval` | `1000` | Port health poll interval |
 | `write_priority_timeout` | `10000` | Maximum time a write may hold reads off |
 | `write_settle_delay` | `50` | Wait after a write before reading the register back |
+| `write_resettle_delay` | `5000` | Wait before a second read-back, for values that lag; 0 disables |
 | `xonxoff` / `dsrdtr` | `false` | Not supported by the driver; `true` is warned about and has no effect |
 
 ### MQTT
