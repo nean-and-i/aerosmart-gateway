@@ -1,10 +1,29 @@
-# MQTT Message Delay Fix - Technical Documentation
+# MQTT Message Delay Fix - Historical Note
+
+> **Superseded.** This document describes the write-priority mechanism as it was
+> built on the old serial layer: a timestamp flag alongside nested read/write
+> retries, `SendAndReceive`, and port reopens on every retry attempt. None of
+> that code exists any more.
+>
+> The delay it addresses is still worth understanding, and the root-cause
+> analysis below remains accurate about the original problem. But for how write
+> priority works now — `ReadGate`, atomic cycle entry, cancellation reaching the
+> syscall layer, and release on every exit path — see
+> [Application Flow](APPLICATION_FLOW.md#write-priority) and
+> [Timing Diagrams](TIMING_DIAGRAMS.md#write-preempting-a-read-cycle).
+>
+> Specifically, these claims no longer hold:
+> - The retry counts and delays quoted here (`max_retries`, `read_max_retries`,
+>   `device_response_delay`, and so on) are no longer configuration options.
+>   Nested retries meant a single unresponsive register could take ~230s; there
+>   is now one retry level with a wall-clock budget.
+> - Write priority was signalled and cleared explicitly, and four error paths
+>   returned without clearing it, which cancelled the read cycle and blocked
+>   reads for 10 seconds. Release is now deferred on every path.
+> - A read timeout no longer reopens the port.
 
 This document explains the MQTT message delay issue that affected the Aerosmart
-Gateway and the **write-priority mechanism** that resolves it. The mechanism
-described here reflects the current implementation in
-[`internal/registers/reader.go`](../internal/registers/reader.go) and
-[`internal/serial/serial.go`](../internal/serial/serial.go).
+Gateway and the write-priority mechanism that resolved it at the time.
 
 ## Table of Contents
 

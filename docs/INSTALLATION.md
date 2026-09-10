@@ -84,16 +84,37 @@ Create a `config.yaml` file with the following structure:
 serial:
   port: "/dev/ttyUSB0"           # Serial device path
   baudrate: 115200               # Communication speed
-  read_timeout: 10               # Read timeout in milliseconds (0 = 200ms default)
-  device_response_delay: 40      # Wait after write (ms)
-  write_with_retry_delay: 10     # Write retry delay (ms)
-  read_with_retry_delay: 100     # Read retry delay (ms)
-  max_retries: 10                # Max operation retries
-  max_reopens: 3                 # Max port reopen attempts (code default: 10)
-  # Connection retry settings (code defaults: 100ms / 10000ms)
-  connect_retry_initial_delay_ms: 2
-  connect_retry_max_delay_ms: 400
-  connect_retry_jitter_percent: 25
+  bytesize: 8                    # Data bits (5-8)
+  parity: "N"                    # N, O or E
+  stopbits: 1                    # 1 or 2
+
+  # Flow control is NOT supported by the driver; true is rejected at startup
+  # rather than silently ignored, because XON/XOFF bytes would otherwise be
+  # parsed as frame data.
+  xonxoff: false
+  dsrdtr: false
+
+  # How long one read may block. The kernel expresses this as termios VTIME in
+  # deciseconds, so it is rounded up to a multiple of 100ms.
+  read_timeout: 200
+  # Budget for one command/response exchange. Stale or unmatched frames are
+  # discarded within this window without re-sending the command.
+  response_timeout: 300
+
+  # Attempts per register operation and the delay between them. This is the
+  # only retry level: worst case per register is 3 x (300 + 100) = 1.2s.
+  retries: 3
+  retry_backoff: 100
+
+  # A failed port is reopened by a single supervisor with this backoff.
+  # Reopening is reserved for real port errors (EIO, ENODEV): it toggles
+  # DTR/RTS, which many devices treat as a reset.
+  reopen_backoff: 500
+  reopen_max_backoff: 30000
+  health_check_interval: 1000
+
+  # Upper bound on how long an in-flight write may hold reads off.
+  write_priority_timeout: 10000
 
 # MQTT broker configuration
 mqtt:
@@ -104,16 +125,26 @@ mqtt:
   client_id: "aerosmart-gateway" # Client identifier
   qos: 1                         # Quality of Service (0, 1, or 2)
   retain: true                   # Retain messages
-  # Connection retry settings
+  # Online/offline topic, also registered as the MQTT last will, so an
+  # unclean disconnect marks the gateway offline instead of leaving retained
+  # values looking live. Defaults to "<device_id>/status".
+  availability_topic: "aerosmart/status"
+
+  # Bounds every broker interaction (ms). Publishes run on the serial read
+  # path, so an unbounded wait would stall polling if the broker accepts TCP
+  # but stops acknowledging.
+  op_timeout: 5000
+
+  # Connection retry settings (startup; paho handles later reconnects)
   connect_retry_initial_delay_ms: 500
   connect_retry_max_delay_ms: 30000
   connect_retry_jitter_percent: 25
-  # MQTT Resilience Configuration
-  # - Persistent Session: Subscriptions preserved across reconnects
-  # - Auto-Recovery: Automatic re-subscription on connection established
-  # - QoS 1: At-least-once delivery for subscriptions and publishes
-  # - KeepAlive: Disconnect detection within 30-60 seconds
-  # - Publish Retry: Retries with exponential backoff (1s, 2s, 4s)
+
+  # MQTT resilience
+  # - Clean session: the broker does not queue commands while the gateway is
+  #   offline, so an hours-old command is never replayed at startup
+  # - Auto-recovery: subscriptions are restored when the connection returns
+  # - KeepAlive: disconnect detection within 30-60 seconds
   publish_retry_count: 3         # Number of retries for failed publishes
 
 # Device ID for Home Assistant

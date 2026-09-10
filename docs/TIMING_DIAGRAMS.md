@@ -1,717 +1,267 @@
-# Aerosmart Gateway - Timing Diagrams
+# Aerosmart Gateway — Timing Diagrams
 
-This document contains detailed timing diagrams illustrating the interactions between the different components of the application.
+Sequence and timing views of the flows described in
+[Application Flow](APPLICATION_FLOW.md). Figures use the shipped defaults:
+`read_timeout: 200`, `response_timeout: 300`, `retries: 3`, `retry_backoff: 100`,
+`read_interval: 120`.
 
 ## Table of Contents
 
-- [Aerosmart Gateway - Timing Diagrams](#aerosmart-gateway---timing-diagrams)
-  - [Table of Contents](#table-of-contents)
-  - [System Overview](#system-overview)
-  - [Initialization Sequence](#initialization-sequence)
-  - [Periodic Read Cycle](#periodic-read-cycle)
-    - [Detailed SendAndReceive Flow](#detailed-sendandreceive-flow)
-  - [Write Operation with Verification](#write-operation-with-verification)
-    - [Write Priority Signaling (Timestamp-Based)](#write-priority-signaling-timestamp-based)
-    - [Message Deduplication](#message-deduplication)
-    - [Performance Comparison](#performance-comparison)
-    - [Key Changes](#key-changes)
-  - [Summary](#summary)
+- [Startup](#startup)
+- [Frame reassembly](#frame-reassembly)
+- [One transaction](#one-transaction)
+- [Periodic read cycle](#periodic-read-cycle)
+- [Write with verification](#write-with-verification)
+- [Write preempting a read cycle](#write-preempting-a-read-cycle)
+- [Retry and give-up](#retry-and-give-up)
+- [Port loss and recovery](#port-loss-and-recovery)
+- [Broker loss and recovery](#broker-loss-and-recovery)
+- [Shutdown](#shutdown)
+- [Timing summary](#timing-summary)
 
----
-
-## System Overview
+## Startup
 
 ```
-┌────────────────────────────────────────────────────────────────────────────┐
-│                           AEROSMART GATEWAY                                │
-│                                                                            │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐                  │
-│  │    main.go   │    │   serial/    │    │    mqtt/     │                  │
-│  │              │    │  serial.go   │    │   client.go  │                  │
-│  │  - Config    │    │              │    │              │                  │
-│  │  - Init      │    │  - Open/Close│    │  - Connect   │                  │
-│  │  - Main Loop │    │  - Write     │    │  - Publish   │                  │
-│  └──────┬───────┘    │  - Read      │    │  - Subscribe │                  │
-│         │            └──────┬───────┘    └──────┬───────┘                  │
-│         │                   │                   │                          │
-│         └───────────────────┼───────────────────┘                          │
-│                             ▼                                              │
-│                    ┌────────────────┐                                      │
-│                    │   registers/   │                                      │
-│                    │   reader.go    │                                      │
-│                    │                │                                      │
-│                    │ - ReadSingle   │◄──────────┐                          │
-│                    │ - ReadAll      │           │                          │
-│                    │ - PublishAll   │           │                          │
-│                    └────────────────┘           │                          │
-│                             │                   │                          │
-│                             ▼                   │                          │
-│                    ┌────────────────┐           │                          │
-│                    │   registers/   │           │                          │
-│                    │   reader.go    │           │                          │
-│                    │   (Writer)     │           │                          │
-│                    │ - HandleMessage│───────────┘                          │
-│                    │ - TriggerFull  │                                      │
-│                    └────────────────┘                                      │
-│                                                                            │
-└────────────────────────────────────────────────────────────────────────────┘
+ t        main                    config      serial            mqtt
+ │
+ 0ms  ├─ load + validate ────────▶│
+      │  (rejects unusable options, checks the cycle budget)
+      │◀─ ok ────────────────────┤
+      │
+      ├─ open port ──────────────────────────▶│
+      │   retries with backoff 500ms, 1s, 2s... indefinitely
+      │◀─ open ──────────────────────────────┤
+      ├─ start Supervise ────────────────────▶│ (health poll every 1s)
+      │
+      ├─ connect ───────────────────────────────────────────▶│
+      │   retries with backoff + jitter, 10 attempts
+      │◀─ connected ────────────────────────────────────────┤
+      │                                       │◀─ publish "online" (LWT armed)
+      ├─ publish discovery (retained) ─────────────────────▶│
+      ├─ subscribe to command topics ──────────────────────▶│
+      │
+      ├─ first read cycle immediately
+      └─ then every 120s, measured from the END of each cycle
 ```
 
----
+## Frame reassembly
 
-## Initialization Sequence
-
-```
-Time (ms)   Component          Action
-─────────────────────────────────────────────────────────────────────────────
-0           main              Load config.yaml
-10          main              Load registers.yaml
-15          main              Initialize logger (level, file/console)
-20          serial            NewSerialPort("/dev/ttyUSB0", 115200, ...)
-25          serial            connectSerialWithRetry() - exponential backoff
-30          serial            Open() - connect to device
-35          mqtt              NewClient(broker, port, ...)
-40          mqtt              connectMQTTWithRetry() - exponential backoff
-45          mqtt              Connect() - connect to broker
-50          mqtt              publishHADiscovery() - sensor & switch configs
-55          registers         NewReader(serial, mqtt, readRegisters)
-60          registers         NewWriter(serial, mqtt, writeRegisters)
-65          registers         writer.SetReader(reader)
-67          registers         writer.SetDerivedCalculator(derivedCalc)
-70          mqtt              Subscribe("dw/aerosmart/luefterstufe")
-75          mqtt              Subscribe("dw/aerosmart/boilerheizstab")
-80          main              Start periodic ticker (60s interval)
-85          main              writer.TriggerFullReadout() - initial read
-90          registers         reader.ReadAll() - read all registers
-95          serial            SendAndReceive("130 1067", 10) - reg 1
-100         serial            SendAndReceive("130 5003", 10) - reg 2
-...         ...               ... (more registers)
-200         registers         reader.PublishAll(values) - publish to MQTT
-205         main              Application running, waiting for ticker
-```
-
----
-
-## Periodic Read Cycle
+The property that keeps a lossy link from desyncing. The buffer survives across calls.
 
 ```
-Time (ms)   Component          Action
-─────────────────────────────────────────────────────────────────────────────
-0           main              Ticker fires - writer.TriggerFullReadout()
-5           writer            isWritePriorityActive() - no active priority
-10          reader            ReadAll() - start read cycle
-15          reader            Mark isReading = true
-20          serial            SendAndReceive("130 1067", 10)
-25          serial            WaitForReadComplete() - no read pending
-30          serial            FlushInputMultiple(3)
-35          serial            WriteWithRetry("130 1067\r\n", 10, 10ms)
-40          serial            Sleep(deviceResponseDelay=40ms)
-80          serial            ReadWithRetry(10, 100ms) - wait for response
-85          serial            <-- "130 1067 3" (fan speed 3)
-90          reader            Parse & validate value (3 in range 0-5)
-95          serial            SendAndReceive("130 5003", 10)
-                              (No ForceReopen on attempt 0; ForceReopen runs
-                               only on retry attempts >0)
-100         serial            WriteWithRetry("130 5003\r\n", 10, 10ms)
-105         serial            Sleep(deviceResponseDelay=40ms)
-145         serial            ReadWithRetry(10, 100ms)
-150         serial            <-- "130 5003 3"
-155         reader            Parse & validate value
-...         ...               ... (continue for all registers)
-500         reader            Mark isReading = false
-505         reader            Store values in reader.values
-510         reader            PublishAll(values) - publish all to MQTT
-515         mqtt              Publish("aerosmart/luefterstatus", "3")
-520         mqtt              Publish("aerosmart/lueftermode", "3")
-...         ...               ... (publish all valid register values)
-550         main              Wait for next ticker
+device sends:  "130 1067 3\r\n"
+
+read #1 ──▶ "130 10"              buffer: "130 10"        no '\n' yet
+read #2 ──▶ (VTIME expires, io.EOF)  buffer: "130 10"     RETAINED, reported as timeout
+read #3 ──▶ "67 3\r\n"            buffer: "130 1067 3\r\n"
+                                   ──▶ frame "130 1067 3", buffer emptied
 ```
 
-### Detailed SendAndReceive Flow
+Several frames in one burst are delivered one at a time:
 
 ```
-SendAndReceive(command, maxRetries=10)
-    │
-    ▼
-┌──────────────────────────────────────────────────────────────────────────┐
-│ Acquire writeMu lock (ensures write operations have priority)            │
-└──────────────────────────────────────────────────────────────────────────┘
-    │
-    ▼
-┌──────────────────────────────────────────────────────────────────────────┐
-│ Attempt 0:                                                               │
-│  1. WaitForReadComplete() - wait for any ongoing read to finish          │
-│  2. No ForceReopen on attempt 0 (only on retries >0)                     │
-│  3. FlushInputMultiple(3) - clear stale data                             │
-│  4. WriteWithRetry("130 1067\r\n", 10, 10ms)                             │
-│     - Write attempt 1: SUCCESS                                           │
-│  5. Sleep(40ms) - device response delay                                  │
-│  6. ReadWithRetry(10, 100ms)                                             │
-│     - Read attempt 1: SUCCESS - "130 1067 3"                             │
-│  7. Parse response - extract value "3"                                   │
-│  8. Return response                                                      │
-└──────────────────────────────────────────────────────────────────────────┘
-    │
-    ▼
-Release writeMu lock
+read #1 ──▶ "130 1067 3\r\n130 5003 2\r\n"
+   readFrame() ──▶ "130 1067 3"     buffer keeps "130 5003 2\r\n"
+   readFrame() ──▶ "130 5003 2"     buffer empty
 ```
 
----
-
-## Write Operation with Verification
+## One transaction
 
 ```
-Time (ms)   Component          Action
-────────────────────────────────────────────────────────────────────────────
-0           MQTT Broker       Message published to "dw/aerosmart/luefterstufe"
-5           mqtt              Callback invoked with message "3"
-10          writer            HandleMessage("dw/aerosmart/luefterstufe", "3")
-12          writer            isDuplicateMessage() - check for duplicates
-15          writer            SignalWritePriority() - set timestamp
-20          writer            reader.Cancel() - cancel any ongoing read
-25          writer            reader.ResetContext() - create new context
-30          writer            Find matching register, validate value (3 in 0-5)
-35          writer            Build command: "130 5002 3"
-40          serial            SendAndReceive("130 5002 3", 10)
-45          serial            FlushInputMultiple(3) - NO ForceReopen on first!
-50          serial            WriteWithRetry("130 5002 3\r\n", 10, 10ms)
-55          serial            Sleep(deviceResponseDelay=40ms)
-95          serial            ReadWithRetry(10, 100ms) - get response
-100         serial            <-- "130 5002 OK"
-105         writer            FlushBuffer() - FlushInputMultiple(5)
-110         writer            Sleep(deviceResponseDelay=40ms) - wait before verify
-150         writer            Read verify register: luefterstatus
-155         serial            reader.ReadSingle(luefterstatus)
-160         serial            SendAndReceive("130 1067", 10)
-165         serial            <-- "130 1067 3"
-170         mqtt              Publish("aerosmart/luefterstatus", "3")
-175         writer            Read verify register: lueftermode
-180         serial            reader.ReadSingle(lueftermode)
-185         serial            SendAndReceive("130 5003", 10)
-190         serial            <-- "130 5003 3"
-195         mqtt              Publish("aerosmart/lueftermode", "3")
-200         writer            ClearWritePriority() - allow reads to resume
-205         writer            Log: "MQTT: Message processing latency: 2.18s"
+ t=0        Transact("130 1067")
+            ├─ take txMu                          (serialises the wire)
+            ├─ reset software buffer
+            ├─ port.Flush()                       TCIOFLUSH, ~0ms
+ ~0ms       ├─ write "130 1067\r\n"               13 bytes, ~1ms at 115200
+            │  deadline = t + 300ms
+            │
+            ├─ readFrame ──▶ "140 9999 1"         unsolicited: DISCARD, keep reading
+            ├─ readFrame ──▶ "130 1067 3"         prefix matches: return "3"
+ ~40ms      └─ release txMu
 ```
 
-### Write Priority Signaling (Timestamp-Based)
+The command is written **once**. A non-matching frame is discarded rather than triggering a
+re-send, which is what keeps writes idempotent.
+
+Silent device:
 
 ```
-Writer.SignalWritePriority()
-    │
-    ▼
-┌──────────────────────────────────────────────────────────────────────────┐
-│ writePriorityMu.Lock()                                                   │
-│ writePriorityTime = time.Now()                                           │
-│ writePriorityMu.Unlock()                                                 │
-└──────────────────────────────────────────────────────────────────────────┘
-
-Writer.TriggerFullReadout()
-    │
-    ▼
-┌──────────────────────────────────────────────────────────────────────────┐
-│ if isWritePriorityActive():                                              │
-│   - Lock mutex                                                           │
-│   - If writePriorityTime.IsZero(): return false                         │
-│   - If time.Since(writePriorityTime) >= 10s:                            │
-│       writePriorityTime = Time{} (expired)                              │
-│       return false                                                      │
-│   - Otherwise: return true (skip read cycle)                            │
-│   - Unlock mutex                                                        │
-└──────────────────────────────────────────────────────────────────────────┘
+ t=0    write, deadline = t + 300ms
+        readFrame blocks in the kernel up to read_timeout (200ms), returns io.EOF
+        readFrame again; deadline passes
+ 300ms  ErrReadTimeout  (any partial bytes stay buffered for the next attempt)
 ```
 
-### Message Deduplication
+## Periodic read cycle
+
+Healthy link, 29 read registers:
 
 ```
-Writer.isDuplicateMessage(topic, value)
-    │
-    ▼
-┌──────────────────────────────────────────────────────────────────────────┐
-│ Key = "topic:value"                                                      │
-│                                                                          │
-│ recentMessagesMu.Lock()                                                  │
-│                                                                          │
-│ if info, exists := recentMessages[key]; exists {                        │
-│     if time.Since(info.Timestamp) < 1 second {                          │
-│         // Duplicate! Skip processing                                    │
-│         recentMessagesMu.Unlock()                                       │
-│         return true                                                     │
-│     }                                                                   │
-│     delete(recentMessages, key)  // Clean up old entry                  │
-│ }                                                                        │
-│                                                                          │
-│ // Store new message                                                     │
-│ recentMessages[key] = MessageInfo{                                      │
-│     Topic: topic,                                                       │
-│     Value: value,                                                       │
-│     Timestamp: time.Now(),                                             │
-│ }                                                                        │
-│                                                                          │
-│ recentMessagesMu.Unlock()                                               │
-│ return false  // Process this message                                   │
-└──────────────────────────────────────────────────────────────────────────┘
+ t          Poller              Reader             SerialPort        MQTT
+ │
+ 0ms   ├─ health ok, gate ok ──▶│
+       │                        ├─ register 1 ────▶│ ~40ms
+       │                        │◀─ value ─────────┤
+       │                        ├─ register 2 ────▶│ ~40ms
+       │                        │ ...
+ ~1.2s │                        │◀─ 29 registers done
+       │◀─ values ──────────────┤
+       ├─ publish valid values ──────────────────────────────────▶│
+       ├─ derived values from the same snapshot ─────────────────▶│
+       │
+       └─ wait 120s from HERE, so the device always gets an idle gap
 ```
 
-### Write Priority Signaling
+Invalid readings are skipped, not republished — with retained messages a stale value would
+make a dead sensor look alive.
+
+## Write with verification
 
 ```
-Writer.SignalWritePriority()
-    │
-    ▼
-┌──────────────────────────────────────────────────────────────────────────┐
-│ writePriorityMu.Lock()                                                   │
-│ writePriorityTime = time.Now()                                           │
-│ writePriorityMu.Unlock()                                                 │
-└──────────────────────────────────────────────────────────────────────────┘
+ t       MQTT           Writer          ReadGate        SerialPort      MQTT
+ │
+ 0ms  ──▶│ "3" on dw/aerosmart/luefterstufe
+         ├─ resolve register
+         ├─ parse + range-check         (BEFORE touching the read cycle)
+         ├─ dedupe check
+         ├─ Preempt ──────────────▶│    cancels any in-flight cycle
+ ~1ms    ├─ "130 5002 3" ───────────────────────────▶│
+         │◀─ echo "130 5002 3" ─────────────────────┤ ~40ms
+ ~45ms   ├─ publish own state topic ──────────────────────────────▶│
+         ├─ read luefterstatus ─────────────────────▶│ ~40ms
+         ├─ publish verified value ──────────────────────────────▶│
+ ~130ms  └─ Release (deferred: happens on EVERY exit path)
 ```
 
----
+A malformed payload (`"ON"`, out of range, unknown topic) returns before `Preempt`, so it
+never disturbs a readout.
 
-## Retry and Recovery
-
-### Serial Communication Retry Flow
-
-```
-SendAndReceive fails
-    │
-    ▼
-┌──────────────────────────────────────────────────────────────────────────┐
-│ For attempt = 0 to maxRetries-1:                                         │
-│                                                                          │
-│  1. WriteWithRetry(command, writeMaxRetries=10, delay=10ms)              │
-│     - attempt 0: FAIL (timeout)                                          │
-│     - sleep 10ms                                                         │
-│     - attempt 1: FAIL (timeout)                                          │
-│     - ...                                                                │
-│     - attempt 9: FAIL                                                    │
-│                                                                          │
-│  2. tryReopen() - check if can reopen                                    │
-│     - reopenCount < maxReopens (10)                                      │
-│     - Reopen() - close port, wait 2ms, reopen                            │
-│                                                                          │
-│  3. Continue to next attempt                                             │
-│                                                                          │
-│  4. ReadWithRetry(readMaxRetries=10, delay=100ms)                        │
-│     - attempt 0: FAIL (timeout)                                          │
-│     - sleep 100ms                                                        │
-│     - attempt 1: FAIL                                                    │
-│     - ...                                                                │
-│     - attempt 9: FAIL                                                    │
-│                                                                          │
-│  5. tryReopen() - reopen port                                            │
-│                                                                          │
-│  6. If all attempts fail: return error                                   │
-└──────────────────────────────────────────────────────────────────────────┘
-```
-
-### Connection Retry with Exponential Backoff
+## Write preempting a read cycle
 
 ```
-Initial delay: 100ms (serial), 500ms (MQTT)
-Max delay: 10000ms (serial), 30000ms (MQTT)
-Jitter: 25%
-
-Serial connect retry: delay = min(100ms * 2^attempt, 10000ms) * (1 ± 0.25)
-Attempt 0: ~100ms
-Attempt 1: ~200ms
-Attempt 2: ~400ms
-Attempt 3: ~800ms
-Attempt 4: ~1600ms
-Attempt 5: ~3200ms
-Attempt 6: ~6400ms
-Attempt 7: ~10000ms (capped)
-Attempt 8: ~10000ms (capped)
-Attempt 9: ~10000ms (capped)
+ t         pollLoop        Poller/Reader        ReadGate       Writer
+ │
+ 0ms   ├─ RunCycle ──────▶│ reading register 7...
+       │                  │                        │
+ 300ms │                  │                   ◀────┤ Preempt (command arrives)
+       │                  │◀─ cycleCtx cancelled
+       │                  │  current Transact returns within one response timeout
+ ~600ms│◀─ context.Canceled
+       │  ctx.Err() == nil, so this is NOT shutdown
+       │  wait skipDelay (5s), not the full 120s
+       │                                           │ write completes, Release
+ 5.6s  ├─ RunCycle ──────▶│ full cycle runs
 ```
 
----
+Two things this pins down: a preempted cycle must not end the poll loop, and it must be
+retried in seconds rather than costing a whole interval of data.
 
-## Write Priority Preemption
+## Retry and give-up
 
-### Scenario: Periodic read in progress, write command arrives
-
-```
-Time (ms)   Component          Action
-─────────────────────────────────────────────────────────────────────────────
-0           main              Ticker fires - TriggerFullReadout()
-5           writer            isWritePriorityActive() - no active priority
-10          reader            ReadAll() - start reading register 1
-15          reader            isReading = true
-20          serial            SendAndReceive("130 1067", 10)
-25          serial            Write("130 1067\r\n")
-30          serial            Sleep(40ms)
-35          serial            Read() - waiting for response...
-40          MQTT Broker       Message published: "dw/aerosmart/luefterstufe" = "3"
-45          mqtt              Callback invoked
-50          writer            HandleMessage() called
-55          writer            SignalWritePriority() - set timestamp
-60          writer            Cancel() - reader.Cancel()
-65          writer            ResetContext()
-70          reader            ctx.Done() signaled (checked between registers)
-75          serial            in-flight Read() completes (NOT interrupted)
-80          reader            ReadAll sees ctx.Done(), stops; skips remaining regs
-85          serial            writeMu released by the finished read
-90          writer            write SendAndReceive() acquires writeMu
-95          writer            HandleMessage() continues
-100         serial            SendAndReceive("130 5002 3", 10)
-105         serial            Write command
-110         serial            Read response
-115         serial            FlushBuffer()
-120         serial            Verify registers
-125         mqtt              Publish verified values
-130         main              Next ticker fires - normal read proceeds
-```
-
----
-
-## MQTT Message Flow
-
-### Publishing Sensor Data
+One unresponsive register:
 
 ```
-Reader.PublishAll(values)
-    │
-    ▼
-For each register value:
-    │
-    ├─> mqtt.Publish("aerosmart/luefterstatus", "3")
-    │       │
-    │       ▼
-    │   ┌────────────────────────────────────┐
-    │   │ Check IsConnected()                │
-    │   │ client.Publish(topic, QOS,         │
-    │   │             Retain=true, "3")      │
-    │   │ token.Wait()                       │
-    │   └────────────────────────────────────┘
-    │
-    ├─> mqtt.Publish("aerosmart/lueftermode", "3")
-    │       │
-    │       ▼
-    │   ┌────────────────────────────────────┐
-    │   │ Check IsConnected()                │
-    │   │ client.Publish(topic, QOS,         │
-    │   │             Retain=true, "3")      │
-    │   │ token.Wait()                       │
-    │   └────────────────────────────────────┘
-    │
-    └─> ... (more registers)
+ t=0     attempt 1 ──▶ write, wait 300ms ──▶ ErrReadTimeout
+ 400ms   attempt 2 ──▶ (after 100ms backoff) ──▶ ErrReadTimeout
+ 800ms   attempt 3 ──▶ ──▶ ErrReadTimeout
+ 1.2s    give up: register marked invalid, nothing published, cycle continues
 ```
 
-### Subscribing to Write Commands
+A dead port short-circuits, because the supervisor owns recovery:
 
 ```
-mqttClient.Subscribe("dw/aerosmart/luefterstufe", handler)
-    │
-    ▼
-┌──────────────────────────────────────────────────────────────────────────┐
-│ 1. Define callback:                                                      │
-│    callback := func(client mqtt.Client, msg mqtt.Message) {              │
-│        handler(msg.Topic(), string(msg.Payload()))                       │
-│    }                                                                     │
-│                                                                          │
-│ 2. Subscribe:                                                            │
-│    token := client.Subscribe(topic, QOS, callback)                     │
-│    token.Wait()                                                          │
-│                                                                          │
-│ 3. When message arrives:                                                 │
-│    - MQTT broker sends message                                           │
-│    - callback invoked                                                    │
-│    - handler(msg.Topic(), string(msg.Payload()))                         │
-│    - Writer.HandleMessage() called                                       │
-└──────────────────────────────────────────────────────────────────────────┘
+ t=0     attempt 1 ──▶ EIO ──▶ mark unhealthy ──▶ stop immediately
 ```
 
-### Home Assistant Discovery
+Whole cycle against a silent device: 29 x 1.2s ≈ 35s, inside the 120s interval. Startup
+rejects a configuration where that does not hold.
+
+## Port loss and recovery
 
 ```
-publishHADiscovery()
-    │
-    ▼
-┌──────────────────────────────────────────────────────────────────────────┐
-│ For each read register with HA config:                                   │
-│  1. Create HASensorConfig{                                               │
-│       Name: "Aerosmart luefterstatus",                                   │
-│       StateTopic: "aerosmart/luefterstatus",                             │
-│       Unit: nil,                                                         │
-│       DeviceClass: nil,                                                  │
-│       UniqueID: "aerosmart_luefterstatus",                               │
-│       Device: {...}                                                      │
-│     }                                                                    │
-│  2. Publish to                                                           │
-│          "{prefix}/sensor/aerosmart/aerosmart_luefterstatus/config"     │
-│  3. Sleep(2ms) - rate limiting                                           │
-│                                                                          │
-│ For each write register with HA config:                                  │
-│  1. Create HASwitchConfig{                                               │
-│       Name: "Aerosmart Lüfterstufe",                                     │
-│       CommandTopic: "dw/aerosmart/luefterstufe",                         │
-│       StateTopic: "aerosmart/lueftermode",                               │
-│       UniqueID: "aerosmart_luefterstufe",                                │
-│       Device: {...}                                                      │
-│     }                                                                    │
-│  2. Publish to                                                           │
-│          "{prefix}/switch/aerosmart/aerosmart_luefterstufe/config"       │
-│  3. Sleep(2ms) - rate limiting                                           │
-└──────────────────────────────────────────────────────────────────────────┘
+ t          Transact            SerialPort           Supervise
+ │
+ 0s    ├─ read ──────────────▶│ EIO (adapter unplugged)
+       │                       ├─ healthy = false
+       │◀─ error ──────────────┤
+       │
+       │  cycles now return ErrCycleSkipped and retry in 5s
+       │  rather than grinding 29 registers against a dead port
+       │
+ 1s    │                       │◀── health poll: unhealthy ──┤
+       │                       │◀── reopen (fails) ──────────┤ wait 500ms
+       │                       │◀── reopen (fails) ──────────┤ wait 1s
+       │                       │◀── reopen (fails) ──────────┤ wait 2s ... up to 30s
+       │
+ Ns    │                       │◀── reopen succeeds ─────────┤ still waits the backoff
+       │                       ├─ healthy = true              before another attempt
+       │
+       │  cycles resume
 ```
 
----
+The backoff is applied after a *successful* reopen too. A port that opens cleanly but keeps
+failing I/O would otherwise be reopened once per health poll, toggling DTR/RTS — which many
+devices treat as a reset.
 
-## MQTT Reconnection Timing
-
-### Network Disconnection Scenario
-
-> Detection time depends on when the failure falls within the 30s KeepAlive ping
-> cycle — from ~30s (failure just before a ping) up to ~70s (failure just after a
-> successful ping; see "KeepAlive Timing Detail" below). The timeline shows the
-> early-detection case.
+## Broker loss and recovery
 
 ```
-Time (s)    Component              Action
-────────────────────────────────────────────────────────────────────────────
-0           Normal                Application running, periodic reads
-0           Network               Network connection lost
-0           MQTT Client           Unaware of disconnection (no PINGRESP)
-30          MQTT Client           KeepAlive timeout (30s + ping timeout)
-30          MQTT Client           OnConnectionLost fires
-30          MQTT Client           connected = false
-30          MQTT Client           Log: "MQTT connection lost: <error>"
-30          MQTT Client           Auto-reconnect starts
-30          MQTT Client           Log: "MQTT attempting to reconnect..."
-35          MQTT Client           ConnectionNotification: Connecting
-35          MQTT Client           Connect to broker
-40          MQTT Client           OnConnect fires
-40          MQTT Client           connected = true
-40          MQTT Client           Log: "MQTT connected to tcp://broker:1883"
-40          MQTT Client           resubscribeAll() called
-40          MQTT Client           Log: "MQTT recovering X subscriptions..."
-41          MQTT Client           Re-subscribe topic 1
-42          MQTT Client           Re-subscribe topic 2
-43          MQTT Client           Log: "MQTT all subscriptions recovered"
-43          Main                  Continue periodic read cycle
+ t         Gateway                    paho                   Broker
+ │
+ 0s    ├─ publish ──────────────────▶│ ──────────────────────▶│
+       │                              │                        X network drops
+ ≤30s  │                              │ KeepAlive detects it
+       │                              ├─ ConnectionLost logged
+       │                              │  LWT: broker publishes "offline"
+       │  publishes now fail after op_timeout (5s) each, bounded,
+       │  so the read loop is never wedged
+       │
+       │                              ├─ reconnect attempts, backing off to 60s
+ Ns    │                              │◀───────── reconnected ─┤
+       │                              ├─ OnConnect (off the callback goroutine):
+       │                              │    publish "online"
+       │                              │    re-subscribe every tracked topic,
+       │                              │    continuing past individual failures
 ```
 
-### MQTT Broker Restart Scenario
+A clean session is used, so the broker does **not** queue commands while the gateway is
+offline. Without that, an hours-old fan command would be replayed at startup.
+
+## Shutdown
 
 ```
-Time (s)    Component              Action
-────────────────────────────────────────────────────────────────────────────
-0           Normal                Application connected, subscribed
-0           MQTT Broker           Broker restarts (loses state)
-0           MQTT Client           Connection lost detected
-0           MQTT Client           OnConnectionLost fires
-0           MQTT Client           Log: "MQTT connection lost: <error>"
-5           MQTT Client           First reconnect attempt (5s backoff)
-5           MQTT Client           Log: "MQTT attempting to reconnect..."
-5           MQTT Client           ConnectionNotification: Connecting
-10          MQTT Client           Connect succeeds
-10          MQTT Client           OnConnect fires
-10          MQTT Client           resubscribeAll() called
-10          MQTT Client           Log: "MQTT recovering X subscriptions..."
-10          MQTT Client           Re-subscribe to all topics (configured QoS)
-12          MQTT Client           Log: "MQTT all subscriptions recovered"
-12          Main                  Continue normal operation
+ t         signal handler        main               MQTT          Serial
+ │
+ 0ms   ──▶│ SIGTERM
+          ├─ cancel root ctx ──▶│
+          ├─ arm watchdog (10s; a second signal exits at once)
+          │                      ├─ Disconnect ───▶│ publish "offline"
+          │                      │                  │ (ONE bounded attempt)
+          │                      │                  │ retries disabled from here
+ ~50ms    │                      ├─ wait for loops
+          │                      │   in-flight read sees the cancellation and
+          │                      │   returns within one response timeout
+ ~350ms   │                      ├─ Close ────────────────────────▶│
+          │                      │   takes txMu, so a write already on the wire
+          │                      │   finishes before the device is released
+          │                      ├─ close the log file
+ ~360ms   │◀─ shutdownDone ──────┤
+          └─ watchdog stood down
 ```
 
-### Publish Retry on Connection Loss
+Completion is signalled *after* teardown, so the watchdog covers the real work.
 
-```
-Time (ms)   Component              Action
-────────────────────────────────────────────────────────────────────────────
-0           Reader                Publish("aerosmart/temp", "22.5")
-5           MQTT Client           Check IsConnected() - true
-10          MQTT Client           client.Publish(topic, 1, retain, "22.5")
-15          MQTT Client           Token wait...
-20          Network               Connection lost during publish
-25          MQTT Client           Token error: connection lost
-25          MQTT Client           Retry attempt 1 (sleep 1s)
-26          MQTT Client           client.Publish(...) - SUCCESS
-30          MQTT Client           Return nil (success)
-```
+## Timing summary
 
-### Connection State Transitions
-
-```
-State: Connected ──────────────────────────────────────────────────────────►
-    │                                                                    │
-    │ OnConnectionLost                                                  │
-    ▼                                                                    │
-State: ConnectionLost ───────────────────────────────────────────────────►
-    │                                                                    │
-    │ AutoReconnect triggered                                           │
-    ▼                                                                    │
-State: Connecting ───────────────────────────────────────────────────────►
-    │                                                                    │
-    │ ReconnectingHandler: "MQTT attempting to reconnect..."            │
-    │ Reconnect: fixed 5s interval (capped 60s)                        │
-    ▼                                                                    │
-State: Connected ───────────────────────────────────────────────────────►
-    │                                                                    │
-    │ OnConnect: resubscribeAll()                                       │
-    │ Log: "MQTT recovering X subscriptions..."                         │
-    │ Re-subscribe all topics                                          │
-    │ Log: "MQTT all subscriptions recovered"                           │
-    ▼                                                                    │
-State: Normal Operation ─────────────────────────────────────────────────►
-```
-
-### KeepAlive Timing Detail
-
-```
-Time (s)    Component              Action
-────────────────────────────────────────────────────────────────────────────
-0           MQTT Client           Connected, KeepAlive timer started
-30          MQTT Client           Send PINGREQ to broker
-30          MQTT Broker           Acknowledge PINGRESP
-30          MQTT Client           KeepAlive timer reset
-60          MQTT Client           Send PINGREQ to broker
-60          MQTT Broker           (NO RESPONSE - network down)
-70          MQTT Client           PINGREQ timeout (10s)
-70          MQTT Client           Connection lost detected
-70          MQTT Client           OnConnectionLost fires
-70          MQTT Client           Auto-reconnect starts
-```
-
----
-
-## Graceful Shutdown
-
-```
-Signal (SIGINT/SIGTERM) received
-    │
-    ▼
-┌──────────────────────────────────────────────────────────────────────────┐
-│ 1. main: <-sigChan                                                       │
-│ 2. log.SignalReceived(sig)                                               │
-│ 3. cancel() - ctx cancelled                                              │
-│                                                                          │
-│ 4. Main loop:                                                            │
-│    select {                                                              │
-│    case <-ctx.Done():                                                    │
-│        close(forceQuit)                                                  │
-│        return                                                            │
-│    }                                                                     │
-│                                                                          │
-│ 5. <-forceQuit (after 5 second timeout or immediate)                     │
-│ 6. log.Info("Force shutdown initiated...")                               │
-│                                                                          │
-│ 7. mqttClient.Disconnect()                                               │
-│    - client.Disconnect(250ms)                                            │
-│    - connected = false                                                   │
-│                                                                          │
-│ 8. serialPort.Close()                                                    │
-│    - port.Close()                                                        │
-│    - open = false                                                        │
-│                                                                          │
-│ 9. log.Info("Aerosmart Gateway stopped")                                 │
-└──────────────────────────────────────────────────────────────────────────┘
-```
-
-### Shutdown Timeout Handling
-
-```
-┌──────────────────────────────────────────────────────────────────────────┐
-│ go func() {                                                              │
-│     sig := <-sigChan                                                     │
-│     log.SignalReceived(sig)                                              │
-│                                                                          │
-│     // Cancel context for graceful shutdown                              │
-│     cancel()                                                             │
-│                                                                          │
-│     // Wait for graceful shutdown with timeout                           │
-│     select {                                                             │
-│     case <-forceQuit:                                                    │
-│         // Already shut down gracefully                                  │
-│         return                                                           │
-│     case <-time.After(5 * time.Second):                                  │
-│         // Force shutdown after timeout                                  │
-│         log.Warn("Graceful shutdown timed out, forcing exit...")         │
-│         os.Exit(1)                                                       │
-│     }                                                                    │
-│ }()                                                                      │
-└──────────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Write Priority Fix - Race Condition Resolution
-
-### The Problem
-
-The original implementation used a channel-based write priority detection that had an inverted logic bug:
-
-```
-Race Condition Scenario (BEFORE FIX)
-────────────────────────────────────────────────────────────────────────────
-Time    Component          Action
-0ms     Main Loop          TriggerFullReadout() starts
-5ms     writer             select { case writePriorityChan <- {}: ... default: }
-        │                  │                                              │
-        │                  │  ← Send SUCCEEDS (channel empty = no write) │
-        │                  ▼  but code treated success as "write pending" │
-        │                  INCORRECTLY skips the periodic read            │
-        │                                                                  │
-        │                  When a write IS pending (channel full):        │
-        │                  ← Send FAILS (default case)                    │
-        │                  INCORRECTLY proceeds with read                  │
-```
-
-### The Solution
-
-The fix uses a timestamp-based approach with automatic 10-second expiry:
-
-```
-Race Condition Resolution (AFTER FIX)
-────────────────────────────────────────────────────────────────────────────
-Time    Component          Action
-0ms     Main Loop          TriggerFullReadout() starts
-5ms     writer             isWritePriorityActive()
-        │                  │                                              │
-        │                  │  ← Check writePriorityTime                   │
-        │                  │  ← If zero or expired: return false          │
-        │                  │  ← If recent (< 10s): return true           │
-        │                  ▼                                              │
-        │                  Correct decision every time                    │
-        │                                                                  │
-10ms    MQTT               Message arrives                                │
-15ms    writer             HandleMessage() - SignalWritePriority()         │
-        │                  writePriorityTime = time.Now()                 │
-20ms    writer             Write operation completes in 1-3 seconds       │
-25ms    writer             ClearWritePriority() - reads resume immediately│
-```
-
-### Performance Comparison
-
-| Metric | Before Fix | After Fix | Improvement |
-|--------|------------|-----------|-------------|
-| MQTT message detection | 30+ seconds | <1 second | ~30x faster |
-| Write operation total | 30+ seconds | 1-3 seconds | ~20x faster |
-| Serial round-trip per register | reopen on every write | reopen only on retries | faster (config-dependent) |
-| Detection reliability | Inverted logic bug | reliable | Fixed |
-| Recovery from serial errors | Blocked until cleared | 10s auto-expiry | Fixed |
-
-> The latency figures above are illustrative. Actual read/write durations depend on the serial config (`device_response_delay`, `read_max_retries`, register count) and are logged per cycle.
-
-### Key Changes
-
-1. **Timestamp-Based Priority**: `writePriorityTime time.Time` with mutex protection
-2. **Auto-Expiry (10 seconds)**: Prevents permanent blocking on serial errors
-3. **Explicit Clear**: `ClearWritePriority()` after successful write allows immediate read resumption
-4. **Message Deduplication**: 1-second window prevents duplicate processing
-5. **Timing Metrics**: Logs latency for monitoring
-
----
-
-## Summary
-
-The timing diagrams above illustrate:
-
-1. **Initialization**: Application startup sequence with connection establishment
-2. **Periodic Read**: Regular register reading with MQTT publishing
-3. **Write Operations**: Control command handling with verification
-4. **Retry Logic**: Exponential backoff and port reopening on failures
-5. **Write Priority**: Preemption mechanism for time-sensitive control commands
-6. **MQTT Flow**: Message publishing and subscription handling
-7. **Shutdown**: Graceful shutdown with timeout handling
-These diagrams help understand the data flow and timing characteristics of the application, which is useful for debugging and performance optimization.
+| Operation | Typical | Worst case |
+|-----------|---------|-----------|
+| One transaction (device answers) | ~40ms | `response_timeout` (300ms) |
+| One register including retries | ~40ms | `retries x (response_timeout + retry_backoff)` = 1.2s |
+| Full cycle, 29 registers, healthy | ~1.2s | — |
+| Full cycle, silent device | — | ~35s (must fit `read_interval`) |
+| Write with verification | ~130ms | ~2.4s (command + one verify register) |
+| Write preempting a cycle | ~300ms to yield | one `response_timeout` |
+| Cycle skipped (write pending / port recovering) | immediate | retried after 5s |
+| MQTT publish | ~1ms | `op_timeout` x `publish_retry_count` |
+| Port reopen | ~5ms | backoff to 30s between attempts |
+| Shutdown | ~360ms | 10s, then forced exit |

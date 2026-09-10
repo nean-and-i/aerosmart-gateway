@@ -6,6 +6,9 @@ package integration
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -359,5 +362,68 @@ func TestPollingSurvivesAWritePreemption(t *testing.T) {
 	}
 	if v, ok := pub.get("aerosmart/luefterstatus"); !ok || v != "3" {
 		t.Errorf("luefterstatus after preemption = %q (%v), want 3; polling did not resume", v, ok)
+	}
+}
+
+// silentPort never answers, so a transaction runs its full response budget.
+type silentPort struct{}
+
+func (silentPort) Read([]byte) (int, error)    { return 0, nil }
+func (silentPort) Write(p []byte) (int, error) { return len(p), nil }
+func (silentPort) Flush() error                { return nil }
+func (silentPort) Close() error                { return nil }
+
+// config.EffectiveResponseTimeout predicts what the serial layer will actually
+// wait, and the cycle-budget check depends on that prediction. The two compute
+// the VTIME rounding separately, so this pins them together: an under-estimate
+// would let a config pass validation and then overrun its read interval.
+func TestConfigResponseBudgetMatchesSerialBehaviour(t *testing.T) {
+	cases := []struct{ readTimeout, responseTimeout int }{
+		{200, 300}, // response timeout dominates
+		{300, 100}, // read timeout dominates and is raised
+		{250, 100}, // read timeout is rounded up to 300
+		{10, 50},   // both below granularity, floor applies
+	}
+
+	for _, tc := range cases {
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		body := fmt.Sprintf("mqtt:\n  broker: \"x\"\nserial:\n  read_timeout: %d\n  response_timeout: %d\n",
+			tc.readTimeout, tc.responseTimeout)
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatalf("WriteFile() error = %v", err)
+		}
+		ac, err := config.LoadAppConfig(path)
+		if err != nil {
+			t.Fatalf("LoadAppConfig() error = %v", err)
+		}
+		predicted := time.Duration(ac.EffectiveResponseTimeout()) * time.Millisecond
+
+		sp := serial.New(serial.Config{
+			Port:            "/dev/fake",
+			ReadTimeout:     time.Duration(ac.Serial.ReadTimeout) * time.Millisecond,
+			ResponseTimeout: time.Duration(ac.Serial.ResponseTimeout) * time.Millisecond,
+			Opener:          func() (serial.Port, error) { return silentPort{}, nil },
+		}, logger.New("error"))
+		if err := sp.Open(); err != nil {
+			t.Fatalf("Open() error = %v", err)
+		}
+
+		start := time.Now()
+		_, _ = sp.Transact(context.Background(), "130 1067")
+		elapsed := time.Since(start)
+		_ = sp.Close()
+
+		// The real wait must not exceed what config predicted, or the budget
+		// check under-estimates the cycle.
+		if elapsed > predicted+150*time.Millisecond {
+			t.Errorf("read_timeout=%d response_timeout=%d: transaction took %v, config predicted %v",
+				tc.readTimeout, tc.responseTimeout, elapsed, predicted)
+		}
+		// And it must actually use most of the budget, or the prediction is
+		// needlessly pessimistic.
+		if elapsed < predicted/2 {
+			t.Errorf("read_timeout=%d response_timeout=%d: transaction took only %v, config predicted %v",
+				tc.readTimeout, tc.responseTimeout, elapsed, predicted)
+		}
 	}
 }
