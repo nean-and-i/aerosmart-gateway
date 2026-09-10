@@ -70,7 +70,7 @@ func (f *fakePaho) Disconnect(uint) {
 	f.connected = false
 }
 
-func (f *fakePaho) Publish(topic string, _ byte, retained bool, payload interface{}) paho.Token {
+func (f *fakePaho) Publish(topic string, _ byte, retained bool, payload any) paho.Token {
 	f.mu.Lock()
 	f.publishes = append(f.publishes, publishCall{topic: topic, payload: payload.(string), retain: retained})
 	tokenFn := f.token
@@ -110,10 +110,10 @@ func (f *fakePaho) publishCount(topic string) int {
 
 type nopLogger struct{}
 
-func (nopLogger) Debug(string, ...interface{}) {}
-func (nopLogger) Info(string, ...interface{})  {}
-func (nopLogger) Warn(string, ...interface{})  {}
-func (nopLogger) Error(string, ...interface{}) {}
+func (nopLogger) Debug(string, ...any) {}
+func (nopLogger) Info(string, ...any)  {}
+func (nopLogger) Warn(string, ...any)  {}
+func (nopLogger) Error(string, ...any) {}
 
 func testClient(t *testing.T, fake *fakePaho) *Client {
 	t.Helper()

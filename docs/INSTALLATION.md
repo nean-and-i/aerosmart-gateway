@@ -27,7 +27,7 @@ This document provides detailed instructions for setting up and running the Aero
 
 ### Software Requirements
 
-- **Go 1.25 or later**: For building from source
+- **Go 1.27 or later**: For building from source
 - **MQTT Broker**: Any MQTT broker (Mosquitto, Home Assistant MQTT, etc.)
 - **Serial Port Access**: The user running the application needs access to the serial port
 
@@ -53,7 +53,7 @@ git clone https://github.com/nean/aerosmart-gateway.git
 cd aerosmart-gateway
 
 # Build the application
-go build -o aerosmart-gateway ./cmd/main.go
+go build -o aerosmart-gateway ./cmd
 ```
 
 ### Method 3: Docker
@@ -665,7 +665,7 @@ journalctl -u aerosmart -f
 ### Development Setup
 
 ```bash
-# Install Go 1.25 or later
+# Install Go 1.27 or later
 # https://go.dev/doc/install
 
 # Clone the repository
@@ -679,20 +679,20 @@ go mod download
 go test ./...
 
 # Build
-go build -o aerosmart-gateway ./cmd/main.go
+go build -o aerosmart-gateway ./cmd
 ```
 
 ### Cross-Compilation for Raspberry Pi
 
 ```bash
 # Build for ARMv6 (Raspberry Pi Zero)
-GOOS=linux GOARCH=arm GOARM=6 go build -o aerosmart-gateway-armv6 ./cmd/main.go
+GOOS=linux GOARCH=arm GOARM=6 go build -o aerosmart-gateway-armv6 ./cmd
 
 # Build for ARMv7 (Raspberry Pi 2/3)
-GOOS=linux GOARCH=arm GOARM=7 go build -o aerosmart-gateway-armv7 ./cmd/main.go
+GOOS=linux GOARCH=arm GOARM=7 go build -o aerosmart-gateway-armv7 ./cmd
 
 # Build for ARM64 (Raspberry Pi 4)
-GOOS=linux GOARCH=arm64 go build -o aerosmart-gateway-arm64 ./cmd/main.go
+GOOS=linux GOARCH=arm64 go build -o aerosmart-gateway-arm64 ./cmd
 ```
 
 ### Docker Build

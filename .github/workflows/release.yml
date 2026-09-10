@@ -28,7 +28,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.25'
+          go-version: '1.27'
           cache: true
 
       - name: Run golangci-lint
@@ -47,7 +47,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.25'
+          go-version: '1.27'
           cache: true
 
       - name: Run tests
@@ -73,7 +73,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.25'
+          go-version: '1.27'
           cache: true
 
       - name: Determine version
@@ -101,7 +101,7 @@ jobs:
             SUFFIX="${GOARCH}v${GOARM}"
           fi
           FILENAME="aerosmart-gateway-${VERSION}-linux-${SUFFIX}"
-          go build -ldflags "-s -w -X main.version=${VERSION}" -o "$FILENAME" ./cmd/main.go
+          go build -ldflags "-s -w -X main.version=${VERSION}" -o "$FILENAME" ./cmd
           echo "filename=${FILENAME}" >> "$GITHUB_OUTPUT"
 
       - name: Upload artifact

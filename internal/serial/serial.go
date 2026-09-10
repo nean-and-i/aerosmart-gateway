@@ -31,10 +31,10 @@ var ErrPortNotOpen = errors.New("serial: port not open")
 
 // Logger is the subset of logging this package needs.
 type Logger interface {
-	Debug(format string, args ...interface{})
-	Info(format string, args ...interface{})
-	Warn(format string, args ...interface{})
-	Error(format string, args ...interface{})
+	Debug(format string, args ...any)
+	Info(format string, args ...any)
+	Warn(format string, args ...any)
+	Error(format string, args ...any)
 }
 
 // Config holds serial link settings. It is passed as a struct rather than as
@@ -414,7 +414,7 @@ func commandPrefix(command string) string {
 //
 // Frames look like "130 1067 3": node address, register address, value.
 func ParseResponse(response string, expectedCommand string) (string, bool) {
-	for _, line := range strings.Split(response, "\n") {
+	for line := range strings.SplitSeq(response, "\n") {
 		parts := strings.Fields(line)
 		if len(parts) < 3 {
 			continue

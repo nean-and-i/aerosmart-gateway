@@ -20,7 +20,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.25'
+          go-version: '1.27'
           cache: true
 
       - name: Run golangci-lint
@@ -39,7 +39,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.25'
+          go-version: '1.27'
           cache: true
 
       - name: Download dependencies
@@ -75,7 +75,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.25'
+          go-version: '1.27'
           cache: true
 
       - name: Build
@@ -88,7 +88,7 @@ jobs:
           if [ -n "$GOARM" ]; then
             SUFFIX="${GOARCH}v${GOARM}"
           fi
-          go build -ldflags "-s -w" -o aerosmart-gateway-linux-${SUFFIX} ./cmd/main.go
+          go build -ldflags "-s -w" -o aerosmart-gateway-linux-${SUFFIX} ./cmd
 
       - name: Upload binary
         uses: actions/upload-artifact@v4

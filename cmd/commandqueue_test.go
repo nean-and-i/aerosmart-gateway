@@ -77,7 +77,7 @@ func TestCommandQueueEnqueueNeverBlocks(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		for i := 0; i < 50; i++ {
+		for range 50 {
 			q.enqueue("dw/aerosmart/luefterstufe", "3")
 		}
 		close(done)

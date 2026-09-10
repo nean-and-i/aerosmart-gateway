@@ -71,7 +71,7 @@ The application follows a layered architecture with the following main component
 
 ### Prerequisites
 
-- Go 1.25 or later
+- Go 1.27 or later
 - A serial device connected to your Aerosmart M ventilation system
 - MQTT broker (e.g., Mosquitto)
 
@@ -83,7 +83,7 @@ git clone https://github.com/nean/aerosmart-gateway.git
 cd aerosmart-gateway
 
 # Build the application
-go build -o aerosmart-gateway ./cmd/main.go
+go build -o aerosmart-gateway ./cmd
 ```
 
 ### Configuration
@@ -372,12 +372,12 @@ go test ./...
 ### Building with Docker
 
 ```dockerfile
-FROM golang:1.25-alpine AS builder
+FROM golang:1.27-alpine AS builder
 WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN go build -o aerosmart-gateway ./cmd/main.go
+RUN go build -o aerosmart-gateway ./cmd
 
 FROM alpine:latest
 RUN apk --no-cache add ca-certificates
