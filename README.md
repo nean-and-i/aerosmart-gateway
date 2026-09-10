@@ -26,46 +26,54 @@ A Go-based gateway application that communicates with Drexel&Weiss Aerosmart M v
 
 ## Architecture
 
-The application follows a layered architecture with the following main components:
+Each layer depends on an interface rather than a concrete type, which is what
+lets the whole stack be exercised against a scripted device in tests.
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        main.go                                  │
-│  - Initialization & Configuration                               │
-│  - Connection Management                                        │
-│  - Main Loop (Periodic Reads)                                   │
-└─────────────────────────────────────────────────────────────────┘
-        │                     │                     │
-        ▼                     ▼                     ▼
-┌───────────────┐   ┌─────────────────┐   ┌───────────────┐
-│   serial/     │   │    mqtt/        │   │   registers/  │
-│   serial.go   │   │    client.go    │   │   reader.go   │
-│               │   │                 │   │               │
-│ - Open/Close  │   │ - Connect       │   │ - ReadSingle  │
-│ - Write       │   │ - Publish       │   │ - ReadAll     │
-│ - Read        │   │ - Subscribe     │   │ - PublishAll  │
-│ - SendAnd     │   │ - Discovery     │   │               │
-│   Receive     │   │                 │   │               │
-└───────────────┘   └─────────────────┘   └───────────────┘
-        │                     │                     │
-        │                     │                     │
-        └─────────────────────┼─────────────────────┘
-                              ▼
-                    ┌─────────────────┐
-                    │   registers/    │
-                    │   reader.go     │
-                    │   (Writer)      │
-                    │ - HandleMessage │
-                    │ - TriggerFull   │
-                    └─────────────────┘
+                        ┌──────────────┐
+                        │  MQTT broker │
+                        └──────┬───────┘
+                               │ commands / state / discovery
+                        ┌──────┴────────┐
+                        │ internal/mqtt │  Client    bounded ops, LWT
+                        │               │  Discovery HA payloads
+                        └──────┬────────┘
+                               │ Publisher
+   ┌───────────────────────────┴────────────────────────────┐
+   │                  internal/registers                    │
+   │                                                        │
+   │   Poller ──── RunCycle ────▶ Reader ────▶ Publisher    │
+   │      │                         │                       │
+   │   ReadGate ◀─── Preempt ──── Writer                    │
+   │                                │                       │
+   │                    DerivedCalculator                   │
+   └───────────────────────────┬────────────────────────────┘
+                               │ Transactor
+                        ┌──────┴─────────┐
+                        │ internal/serial│ SerialPort  transactions, health
+                        │                │ frameReader persistent buffer
+                        └──────┬─────────┘
+                               │ Port
+                        ┌──────┴───────┐
+                        │Aerosmart unit│
+                        └──────────────┘
 ```
 
-### Component Flow
+`cmd` wires these together and owns signal handling, the poll loop and the
+command worker.
 
-1. **Serial Port** (`internal/serial/serial.go`): Handles all serial communication with the device, including retry logic and port management
-2. **MQTT Client** (`internal/mqtt/client.go`): Manages MQTT connections, publishing, and subscriptions
-3. **Register Reader** (`internal/registers/reader.go`): Reads register values from the device and publishes to MQTT
-4. **Register Writer** (`internal/registers/reader.go`): Handles write commands from MQTT and verifies after writing
+### Components
+
+| Package | Responsibility |
+|---------|----------------|
+| `internal/serial` | Frame reassembly, one command/response transaction at a time, port health, supervised reopen |
+| `internal/registers` | Read/publish cycles (`Poller`, `Reader`), command handling (`Writer`), write priority (`ReadGate`), derived values |
+| `internal/mqtt` | Broker connection with bounded operations, availability, Home Assistant discovery payloads |
+| `internal/config` | Loading, defaults and startup validation of both YAML files |
+| `internal/logger` | Levelled logging to console and/or file |
+
+See [Application Flow](docs/APPLICATION_FLOW.md) for how the pieces interact and
+why the serial layer is shaped the way it is.
 
 ## Quick Start
 
