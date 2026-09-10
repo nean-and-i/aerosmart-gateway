@@ -90,9 +90,12 @@ against a scripted device (see `internal/integration`).
    without `{value}`, `verify_registers` naming registers that do not exist, and write
    registers whose state topic collides with a read register's.
 3. Check the retry budget: the worst-case full cycle
-   (`retries x (response_timeout + retry_backoff) x read register count`) must fit inside
-   `read_interval`.
-4. Check that every configured derived register has an implementation.
+   (`retries x (response_timeout + read_timeout + retry_backoff) x read register count`)
+   must fit inside `read_interval`. The `read_timeout` term matters because an attempt can
+   pass its response deadline only after a read that has already started, and that read
+   blocks for a full `read_timeout`.
+4. Check that every configured derived register has an implementation and lists every
+   source its formula reads.
 5. Open the serial port, retrying with backoff indefinitely — on an embedded gateway the
    USB adapter may appear after boot, so exiting would only crash-loop under systemd.
 6. Start the serial supervisor.
@@ -245,9 +248,12 @@ read, so a write typically waits one response timeout rather than a whole cycle.
 
 ## MQTT
 
-- **Every operation is bounded.** Publishes and subscribes use `WaitTimeout(op_timeout)`.
-  Publishing happens on the serial read path, and paho's `Wait()` has no timeout, so a
-  broker that accepts TCP but stops acknowledging could otherwise wedge polling forever.
+- **Every operation is bounded**, on both sides of the call. Publishes and subscribes use
+  `WaitTimeout(op_timeout)` for the acknowledgement, and `SetWriteTimeout(op_timeout)` for
+  the hand-off. Both are needed: paho's outgoing channel is unbuffered and, without a write
+  timeout, `Publish` itself blocks for a hardcoded 30s before any token is waited on, with
+  no deadline on the socket write. Publishing happens on the serial read path, so an
+  unbounded wait would stall polling and overrun the shutdown grace period.
 - **Clean session.** A persistent session let the broker queue commands while the gateway
   was offline and replay them on reconnect — an hours-old fan command applied at startup.
   Subscriptions are restored by the connect handler instead.

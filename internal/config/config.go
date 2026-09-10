@@ -374,6 +374,19 @@ func (c *AppConfig) Validate() error {
 			problems = append(problems, fmt.Sprintf("%s: %d must not be negative", d.key, d.value))
 		}
 	}
+	// The startup open loop doubles the backoff and caps it at the maximum, so
+	// a maximum below the initial value collapses the delay to nothing and
+	// hammers the device node.
+	if c.Serial.ReopenMaxBackoff < c.Serial.ReopenBackoff {
+		problems = append(problems, fmt.Sprintf(
+			"serial.reopen_max_backoff: %d is below serial.reopen_backoff (%d)",
+			c.Serial.ReopenMaxBackoff, c.Serial.ReopenBackoff))
+	}
+	if c.MQTT.ConnectRetryMaxDelayMs < c.MQTT.ConnectRetryInitialDelayMs {
+		problems = append(problems, fmt.Sprintf(
+			"mqtt.connect_retry_max_delay_ms: %d is below mqtt.connect_retry_initial_delay_ms (%d)",
+			c.MQTT.ConnectRetryMaxDelayMs, c.MQTT.ConnectRetryInitialDelayMs))
+	}
 	if p := c.MQTT.ConnectRetryJitterPercent; p < 0 || p > 100 {
 		problems = append(problems, fmt.Sprintf("mqtt.connect_retry_jitter_percent: %d is not in 0..100", p))
 	}
@@ -389,18 +402,25 @@ func (c *AppConfig) Validate() error {
 	return nil
 }
 
-// EffectiveResponseTimeout is the response budget the serial layer will
-// actually use: read_timeout is rounded up to the kernel's 100ms granularity,
-// and a response can never arrive faster than one read, so a smaller
-// response_timeout is raised to it.
-func (c *AppConfig) EffectiveResponseTimeout() int {
+// EffectiveReadTimeout is the per-read block time the serial layer will
+// actually use: the kernel expresses it as termios VTIME in deciseconds, so it
+// is rounded up to a multiple of 100ms with that as the floor.
+func (c *AppConfig) EffectiveReadTimeout() int {
 	readTimeout := c.Serial.ReadTimeout
 	if readTimeout < serialReadGranularityMs {
-		readTimeout = serialReadGranularityMs
-	} else if r := readTimeout % serialReadGranularityMs; r != 0 {
+		return serialReadGranularityMs
+	}
+	if r := readTimeout % serialReadGranularityMs; r != 0 {
 		readTimeout += serialReadGranularityMs - r
 	}
-	if c.Serial.ResponseTimeout < readTimeout {
+	return readTimeout
+}
+
+// EffectiveResponseTimeout is the response budget the serial layer will
+// actually use. A response can never arrive faster than one read, so a smaller
+// response_timeout is raised to the effective read timeout.
+func (c *AppConfig) EffectiveResponseTimeout() int {
+	if readTimeout := c.EffectiveReadTimeout(); c.Serial.ResponseTimeout < readTimeout {
 		return readTimeout
 	}
 	return c.Serial.ResponseTimeout
@@ -420,7 +440,11 @@ func (c *AppConfig) ValidateCycleBudget(registerCount int) error {
 		return nil
 	}
 
-	perRegisterMs := c.Serial.Retries * (c.EffectiveResponseTimeout() + c.Serial.RetryBackoff)
+	// An attempt can pass its response deadline only after a read that already
+	// started, and that read blocks for a whole read_timeout, so one attempt
+	// costs up to response_timeout + read_timeout.
+	perAttemptMs := c.EffectiveResponseTimeout() + c.EffectiveReadTimeout() + c.Serial.RetryBackoff
+	perRegisterMs := c.Serial.Retries * perAttemptMs
 	worstCycleMs := perRegisterMs * registerCount
 	if worstCycleMs <= c.ReadInterval*1000 {
 		return nil
@@ -429,8 +453,7 @@ func (c *AppConfig) ValidateCycleBudget(registerCount int) error {
 	return fmt.Errorf("%w: worst-case read cycle is %d registers x %d attempts x %dms = %.1fs, "+
 		"which exceeds read_interval (%ds); lower serial.retries or serial.response_timeout, "+
 		"or raise read_interval",
-		ErrInvalidConfig, registerCount, c.Serial.Retries,
-		c.EffectiveResponseTimeout()+c.Serial.RetryBackoff,
+		ErrInvalidConfig, registerCount, c.Serial.Retries, perAttemptMs,
 		float64(worstCycleMs)/1000, c.ReadInterval)
 }
 

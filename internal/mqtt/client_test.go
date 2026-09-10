@@ -289,3 +289,58 @@ func TestPublishDiscoveryMarshalsAndRetains(t *testing.T) {
 		t.Error("discovery was not retained; Home Assistant would lose entities on restart")
 	}
 }
+
+// The paho options carry the whole reliability story, so pin them.
+func TestClientOptions(t *testing.T) {
+	c := NewClient(&MQTTConfig{
+		Broker:            "192.168.1.20",
+		Port:              1883,
+		ClientID:          "aerosmart-gateway",
+		QOS:               1,
+		AvailabilityTopic: "aerosmart/status",
+		OpTimeout:         5 * time.Second,
+	}, nopLogger{})
+
+	o := c.clientOptions()
+
+	// Without a write timeout, paho leaves the socket write with no deadline
+	// and blocks the caller for a hardcoded 30s handing the packet to its
+	// unbuffered outgoing channel. OpTimeout would then bound nothing: the
+	// blocking happens inside Publish, before the token is ever waited on.
+	if got := o.WriteTimeout; got != 5*time.Second {
+		t.Errorf("WriteTimeout() = %v, want the configured op_timeout; publishes would not be bounded", got)
+	}
+	if got := o.ConnectTimeout; got != 5*time.Second {
+		t.Errorf("ConnectTimeout() = %v, want 5s", got)
+	}
+	// A persistent session would let the broker queue commands while the
+	// gateway is offline and replay them at startup.
+	if !o.CleanSession {
+		t.Error("CleanSession() = false, want true")
+	}
+	if !o.AutoReconnect {
+		t.Error("AutoReconnect() = false, want true")
+	}
+	if !o.WillEnabled {
+		t.Fatal("WillEnabled = false, want a last will so an unclean exit marks the gateway offline")
+	}
+	if o.WillTopic != "aerosmart/status" || string(o.WillPayload) != payloadOffline || !o.WillRetained {
+		t.Errorf("will = %q/%q retained=%v, want aerosmart/status/%s retained",
+			o.WillTopic, o.WillPayload, o.WillRetained, payloadOffline)
+	}
+}
+
+// An announcement racing a shutdown must not leave the availability topic
+// retained as "online" after the process exits: a clean disconnect suppresses
+// the last will, so nothing would correct it.
+func TestOnConnectedSkipsAnnouncementDuringShutdown(t *testing.T) {
+	fake := &fakePaho{connected: true}
+	c := testClient(t, fake)
+	c.shuttingDown.Store(true)
+
+	c.onConnected()
+
+	if n := fake.publishCount("aerosmart/status"); n != 0 {
+		t.Errorf("published availability %d times during shutdown, want 0", n)
+	}
+}

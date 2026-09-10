@@ -205,10 +205,18 @@ func run() error {
 	writer.SetReader(reader)
 	poller := registers.NewPoller(reader, derivedCalc, gate, log)
 
+	// Held for the duration of each command, and taken once during shutdown so
+	// the port is not closed under a write that is mid-exchange. Commands
+	// arrive on the MQTT router goroutine, which the WaitGroup cannot cover.
+	var commandMu sync.Mutex
+
 	if topics := writer.GetSubscribeTopics(); len(topics) > 0 {
 		log.Info("Subscribing to command topics: %v", topics)
 		for _, topic := range topics {
 			handler := func(t string, msg string) {
+				commandMu.Lock()
+				defer commandMu.Unlock()
+
 				if ctx.Err() != nil {
 					log.Warn("Ignoring command on %s during shutdown", t)
 					return
@@ -239,6 +247,12 @@ func run() error {
 	log.Info("Shutdown initiated, waiting for in-flight work...")
 	mqttClient.Disconnect()
 	wg.Wait()
+
+	// Wait for a command that was already being handled when the signal
+	// arrived; paho's Disconnect quiesce does not cover it.
+	commandMu.Lock()
+	//nolint:staticcheck // held only to observe completion; nothing follows
+	commandMu.Unlock()
 
 	if err := serialPort.Close(); err != nil {
 		log.Error("Error closing serial port: %v", err)

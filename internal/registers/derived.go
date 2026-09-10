@@ -120,17 +120,42 @@ var derivedFormulas = map[string]func(src map[string]float64) float64{
 	},
 }
 
-// Validate reports configured derived registers that have no implementation,
-// so the mistake surfaces at startup instead of as a warning every cycle.
+// derivedInputs lists the register values each formula reads. A formula takes
+// its inputs from a map, so an input the config omits from `sources` would
+// silently read zero and publish a wrong value as valid.
+var derivedInputs = map[string][]string{
+	"zuluftabluftprozent":      {"zuluftumin", "abluftumin"},
+	"co2luefterstufe4":         {"co2luefterstufe3"},
+	"beschattungtemp_adjusted": {"beschattungtemp", "beschattungaussentemp", "aussentemp"},
+}
+
+// Validate reports derived registers that have no implementation, or whose
+// configured sources do not cover everything their formula reads, so the
+// mistake surfaces at startup instead of as a wrong value published forever.
 func (d *DerivedCalculator) Validate() error {
-	var missing []string
+	var problems []string
+
 	for _, reg := range d.registers {
 		if _, ok := derivedFormulas[reg.Name]; !ok {
-			missing = append(missing, reg.Name)
+			problems = append(problems, fmt.Sprintf("%s has no formula implementation", reg.Name))
+			continue
+		}
+
+		listed := make(map[string]bool, len(reg.Sources))
+		for _, source := range reg.Sources {
+			listed[source] = true
+		}
+		for _, input := range derivedInputs[reg.Name] {
+			if !listed[input] {
+				problems = append(problems, fmt.Sprintf(
+					"%s reads %q but does not list it in sources; it would silently read 0",
+					reg.Name, input))
+			}
 		}
 	}
-	if len(missing) > 0 {
-		return fmt.Errorf("%w: %s", ErrNoFormula, strings.Join(missing, ", "))
+
+	if len(problems) > 0 {
+		return fmt.Errorf("%w: %s", ErrNoFormula, strings.Join(problems, "; "))
 	}
 	return nil
 }

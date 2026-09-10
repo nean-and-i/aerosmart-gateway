@@ -717,3 +717,35 @@ func TestPollerReportsSkippedCycleWhenSuppressed(t *testing.T) {
 		t.Fatalf("RunCycle() error = %v, want ErrCycleSkipped", err)
 	}
 }
+
+// A formula reads its inputs from the sources map, so an input the config
+// forgot to list silently reads 0 and publishes a wrong value as valid.
+func TestDerivedValidateRequiresEveryFormulaInput(t *testing.T) {
+	d := NewDerivedCalculator(newFakePublisher(), testLogger(), []config.DerivedRegisterConfig{{
+		Name:  "beschattungtemp_adjusted",
+		Topic: "aerosmart/x",
+		// "aussentemp" omitted: the comparison would become "x < 0" and always
+		// take the same branch.
+		Sources: []string{"beschattungtemp", "beschattungaussentemp"},
+	}})
+
+	err := d.Validate()
+	if err == nil {
+		t.Fatal("Validate() = nil, want an error about the missing source")
+	}
+	if !strings.Contains(err.Error(), "aussentemp") {
+		t.Errorf("Validate() error = %v, want it to name the missing source aussentemp", err)
+	}
+}
+
+func TestDerivedValidateAcceptsCompleteSources(t *testing.T) {
+	d := NewDerivedCalculator(newFakePublisher(), testLogger(), []config.DerivedRegisterConfig{
+		{Name: "zuluftabluftprozent", Topic: "t", Sources: []string{"zuluftumin", "abluftumin"}},
+		{Name: "co2luefterstufe4", Topic: "t", Sources: []string{"co2luefterstufe3"}},
+		{Name: "beschattungtemp_adjusted", Topic: "t",
+			Sources: []string{"beschattungtemp", "beschattungaussentemp", "aussentemp"}},
+	})
+	if err := d.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v, want nil", err)
+	}
+}
