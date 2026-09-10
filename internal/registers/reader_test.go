@@ -552,10 +552,7 @@ func TestDerivedSkipsRegistersWithMissingSources(t *testing.T) {
 		{Name: "co2luefterstufe4", Topic: "aerosmart/co2luefterstufe4", Sources: []string{"co2luefterstufe3"}},
 	})
 
-	values, err := d.Calculate(map[string]*RegisterValue{}) // source absent
-	if err != nil {
-		t.Fatalf("Calculate() error = %v", err)
-	}
+	values := d.Calculate(map[string]*RegisterValue{}) // source absent
 	if v := values["co2luefterstufe4"]; v == nil || v.Valid {
 		t.Errorf("co2luefterstufe4 = %+v, want invalid", v)
 	}
@@ -572,13 +569,10 @@ func TestDerivedDivisionByZeroGuard(t *testing.T) {
 		{Name: "zuluftabluftprozent", Topic: "aerosmart/z", Sources: []string{"zuluftumin", "abluftumin"}},
 	})
 
-	values, err := d.Calculate(map[string]*RegisterValue{
+	values := d.Calculate(map[string]*RegisterValue{
 		"zuluftumin": {Name: "zuluftumin", Value: "120", Valid: true},
 		"abluftumin": {Name: "abluftumin", Value: "0", Valid: true},
 	})
-	if err != nil {
-		t.Fatalf("Calculate() error = %v", err)
-	}
 	if v := values["zuluftabluftprozent"]; v == nil || !v.Valid || v.Value != "100.0" {
 		t.Errorf("zuluftabluftprozent = %+v, want valid 100.0", v)
 	}

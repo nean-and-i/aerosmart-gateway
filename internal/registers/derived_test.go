@@ -45,10 +45,7 @@ func TestDerivedCalculator_Calculate(t *testing.T) {
 		"abluftumin": {Name: "abluftumin", Value: "2000", Valid: true},
 	}
 
-	results, err := calc.Calculate(sourceValues)
-	if err != nil {
-		t.Fatalf("Calculate failed: %v", err)
-	}
+	results := calc.Calculate(sourceValues)
 
 	// Check zuluftabluftprozent
 	if val, ok := results["zuluftabluftprozent"]; !ok {
@@ -62,10 +59,7 @@ func TestDerivedCalculator_Calculate(t *testing.T) {
 		"co2luefterstufe3": {Name: "co2luefterstufe3", Value: "1000", Valid: true},
 	}
 
-	results, err = calc.Calculate(sourceValues)
-	if err != nil {
-		t.Fatalf("Calculate failed: %v", err)
-	}
+	results = calc.Calculate(sourceValues)
 
 	if val, ok := results["co2luefterstufe4"]; !ok {
 		t.Error("Expected co2luefterstufe4 in results")
@@ -80,10 +74,7 @@ func TestDerivedCalculator_Calculate(t *testing.T) {
 		"aussentemp":            {Name: "aussentemp", Value: "15.0", Valid: true},
 	}
 
-	results, err = calc.Calculate(sourceValues)
-	if err != nil {
-		t.Fatalf("Calculate failed: %v", err)
-	}
+	results = calc.Calculate(sourceValues)
 
 	if val, ok := results["beschattungtemp_adjusted"]; !ok {
 		t.Error("Expected beschattungtemp_adjusted in results")
@@ -98,10 +89,7 @@ func TestDerivedCalculator_Calculate(t *testing.T) {
 		"aussentemp":            {Name: "aussentemp", Value: "15.0", Valid: true},
 	}
 
-	results, err = calc.Calculate(sourceValues)
-	if err != nil {
-		t.Fatalf("Calculate failed: %v", err)
-	}
+	results = calc.Calculate(sourceValues)
 
 	if val, ok := results["beschattungtemp_adjusted"]; !ok {
 		t.Error("Expected beschattungtemp_adjusted in results")
@@ -127,10 +115,7 @@ func TestDerivedCalculator_MissingSource(t *testing.T) {
 
 	sourceValues := map[string]*RegisterValue{}
 
-	results, err := calc.Calculate(sourceValues)
-	if err != nil {
-		t.Fatalf("Calculate should not fail: %v", err)
-	}
+	results := calc.Calculate(sourceValues)
 
 	// Should have invalid result for missing source
 	if val, ok := results["test"]; !ok {
@@ -161,10 +146,7 @@ func TestDerivedCalculator_DivisionByZero(t *testing.T) {
 		"abluftumin": {Name: "abluftumin", Value: "0", Valid: true},
 	}
 
-	results, err := calc.Calculate(sourceValues)
-	if err != nil {
-		t.Fatalf("Calculate should handle division by zero: %v", err)
-	}
+	results := calc.Calculate(sourceValues)
 
 	// Should return 100 as fallback
 	if val, ok := results["zuluftabluftprozent"]; !ok {

@@ -33,8 +33,11 @@ func NewDerivedCalculator(pub Publisher, log *logger.Logger, registers []config.
 	}
 }
 
-// Calculate calculates derived register values based on source values
-func (d *DerivedCalculator) Calculate(sourceValues map[string]*RegisterValue) (map[string]*RegisterValue, error) {
+// Calculate computes every derived register from a read-cycle snapshot.
+//
+// A register that cannot be computed is returned with Valid false rather than
+// failing the batch, so one missing source does not suppress the others.
+func (d *DerivedCalculator) Calculate(sourceValues map[string]*RegisterValue) map[string]*RegisterValue {
 	results := make(map[string]*RegisterValue)
 
 	for _, derived := range d.registers {
@@ -58,7 +61,7 @@ func (d *DerivedCalculator) Calculate(sourceValues map[string]*RegisterValue) (m
 		d.logger.Debug("Derived register %s = %s", derived.Name, value)
 	}
 
-	return results, nil
+	return results
 }
 
 // calculateSingle calculates a single derived register

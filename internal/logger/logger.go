@@ -189,6 +189,15 @@ func (l *Logger) SerialOperation(operation string, command string, response stri
 	l.Debug("SERIAL %s (took %v): cmd=%q response=%q", operation, duration, command, response)
 }
 
+// FileLoggingActive reports whether log lines are being written to a file.
+// It can be false even when file logging was requested, if the path could not
+// be opened and the console fallback took over.
+func (l *Logger) FileLoggingActive() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.fileLogging
+}
+
 // Close releases the log file, if one is open. It is idempotent, and safe to
 // call while other goroutines are still logging.
 func (l *Logger) Close() error {

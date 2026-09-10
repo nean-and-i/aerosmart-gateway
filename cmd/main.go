@@ -98,7 +98,9 @@ func run() error {
 		return nil
 	}
 
-	if appConfig.Logging.FileLogging {
+	// Ask the logger rather than the config: an unwritable path falls back to
+	// console logging, and the startup line should say what is really happening.
+	if log.FileLoggingActive() {
 		log.Info("File logging enabled: %s", appConfig.Logging.LogFile)
 	} else {
 		log.Info("File logging disabled")
