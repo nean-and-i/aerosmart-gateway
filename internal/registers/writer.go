@@ -133,11 +133,14 @@ func (w *Writer) HandleMessage(ctx context.Context, topic string, message string
 		return ctx.Err()
 	}
 
-	// Establish what the unit actually holds now, so the state topic carries
-	// reality rather than the request.
-	actual, resolved := w.readState(ctx, register)
+	// One read per register: state_from is often also a verify register, and
+	// reading it twice puts an avoidable transaction on the wire per write.
+	values, confirmed, checkable := w.readBack(ctx, register)
 
-	confirmed, checkable := w.verifyWrite(ctx, register)
+	actual, resolved := "", false
+	if register.StateFrom != "" {
+		actual, resolved = values[register.StateFrom]
+	}
 
 	state := valueStr
 	if resolved {
@@ -177,24 +180,72 @@ func (w *Writer) HandleMessage(ctx context.Context, topic string, message string
 	return nil
 }
 
-// readState reads the register that carries the write register's real value.
-func (w *Writer) readState(ctx context.Context, register config.WriteRegisterConfig) (string, bool) {
-	if w.reader == nil || register.StateFrom == "" {
-		return "", false
+// readBack reads every register needed to confirm this write - state_from plus
+// verify_registers - once each, and publishes each to its own topic.
+//
+// confirmed reports whether at least one register could be read; checkable
+// whether there was anything to read at all. A successful read-back is what
+// makes a write trustworthy, since the unit does not reliably echo commands.
+func (w *Writer) readBack(ctx context.Context, register config.WriteRegisterConfig) (map[string]string, bool, bool) {
+	if w.reader == nil {
+		return nil, false, false
 	}
 
-	stateReg, ok := w.reader.Register(register.StateFrom)
-	if !ok {
-		w.logger.Warn("state_from register %s is not configured for reading", register.StateFrom)
-		return "", false
+	// state_from first, so its value is the one reported if it also appears in
+	// verify_registers.
+	names := make([]string, 0, len(register.VerifyRegisters)+1)
+	if register.StateFrom != "" {
+		names = append(names, register.StateFrom)
+	}
+	for _, name := range register.VerifyRegisters {
+		names = append(names, name)
+	}
+	if len(names) == 0 {
+		return nil, false, false
 	}
 
-	value, err := w.reader.ReadSingle(ctx, stateReg)
-	if err != nil {
-		w.logger.Warn("Failed to read %s back for %s: %v", register.StateFrom, register.Name, err)
-		return "", false
+	w.logger.Info("Reading back %s: %v", register.Name, names)
+
+	values := make(map[string]string, len(names))
+	confirmed := false
+
+	for _, name := range names {
+		if _, done := values[name]; done {
+			continue
+		}
+
+		readReg, ok := w.reader.Register(name)
+		if !ok {
+			w.logger.Warn("Read-back register %s is not a configured read register, skipping", name)
+			continue
+		}
+
+		value, err := w.reader.ReadSingle(ctx, readReg)
+		if err != nil {
+			w.logger.Warn("Failed to read %s back: %v", name, err)
+			continue
+		}
+
+		valid, checked := w.reader.ValidateValue(value, readReg)
+		if !valid {
+			w.logger.Warn("Read-back value %s for %s is out of range, not publishing", checked, name)
+			continue
+		}
+
+		values[name] = checked
+		confirmed = true
+
+		if readReg.Topic == "" {
+			continue
+		}
+		if err := w.pub.Publish(readReg.Topic, checked); err != nil {
+			w.logger.Error("Failed to publish %s to %s: %v", name, readReg.Topic, err)
+			continue
+		}
+		w.logger.Info("Published %s = %s to %s", name, checked, readReg.Topic)
 	}
-	return value, true
+
+	return values, confirmed, true
 }
 
 // sendCommand writes the command, retrying only if the write itself failed.
@@ -223,51 +274,6 @@ func (w *Writer) sendCommand(ctx context.Context, command string) error {
 		w.logger.Warn("Send attempt %d/%d for %q failed: %v", attempt, w.retries, command, err)
 	}
 	return lastErr
-}
-
-// verifyWrite reads back the registers that confirm the write took effect and
-// publishes their fresh values.
-//
-// It reports whether any register could be read (confirmed) and whether there
-// was anything to check at all (checkable). A successful read-back is what
-// makes a write trustworthy, since the unit does not reliably echo commands.
-func (w *Writer) verifyWrite(ctx context.Context, register config.WriteRegisterConfig) (confirmed, checkable bool) {
-	if w.reader == nil || len(register.VerifyRegisters) == 0 {
-		return false, false
-	}
-
-	w.logger.Info("Verifying %s by reading %v", register.Name, register.VerifyRegisters)
-
-	for _, name := range register.VerifyRegisters {
-		verifyReg, ok := w.reader.Register(name)
-		if !ok {
-			w.logger.Warn("Verify register %s is not a configured read register, skipping", name)
-			continue
-		}
-
-		value, err := w.reader.ReadSingle(ctx, verifyReg)
-		if err != nil {
-			w.logger.Warn("Failed to verify %s: %v", name, err)
-			continue
-		}
-
-		valid, checked := w.reader.ValidateValue(value, verifyReg)
-		if !valid {
-			w.logger.Warn("Verified value %s for %s is out of range, not publishing", checked, name)
-			continue
-		}
-		if verifyReg.Topic == "" {
-			continue
-		}
-		if err := w.pub.Publish(verifyReg.Topic, checked); err != nil {
-			w.logger.Error("Failed to publish verified %s: %v", name, err)
-			continue
-		}
-		w.logger.Info("Verified %s = %s", name, checked)
-		confirmed = true
-	}
-
-	return confirmed, true
 }
 
 // lastWrite records the most recent command accepted for a topic.
