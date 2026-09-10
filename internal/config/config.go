@@ -57,6 +57,13 @@ type SerialConfig struct {
 	// write, so the read-back is what confirms it.
 	WriteSettleDelay int `yaml:"write_settle_delay"`
 
+	// WriteResettleDelay is how long after a write to read the affected
+	// registers a second time, in milliseconds. Some values trail the
+	// command - the actual fan stage still reported the old value 60ms after
+	// a stage change - so without this Home Assistant keeps a stale number
+	// until the next full read cycle. Zero disables the second read.
+	WriteResettleDelay int `yaml:"write_resettle_delay"`
+
 	// Flow control. The tarm/serial driver supports neither, so a true value
 	// is rejected by Validate rather than silently ignored.
 	XonXoff bool `yaml:"xonxoff"`
@@ -270,6 +277,9 @@ func (c *AppConfig) applyDefaults() {
 	if c.Serial.WriteSettleDelay == 0 {
 		c.Serial.WriteSettleDelay = 50
 	}
+	if c.Serial.WriteResettleDelay == 0 {
+		c.Serial.WriteResettleDelay = 5000
+	}
 
 	if c.DeviceID == "" {
 		c.DeviceID = "aerosmart"
@@ -376,6 +386,7 @@ func (c *AppConfig) Validate() error {
 		{"serial.health_check_interval", c.Serial.HealthCheckInterval},
 		{"serial.write_priority_timeout", c.Serial.WritePriorityTimeout},
 		{"serial.write_settle_delay", c.Serial.WriteSettleDelay},
+		{"serial.write_resettle_delay", c.Serial.WriteResettleDelay},
 		{"mqtt.op_timeout", c.MQTT.OpTimeout},
 		{"mqtt.connect_retry_initial_delay_ms", c.MQTT.ConnectRetryInitialDelayMs},
 		{"mqtt.connect_retry_max_delay_ms", c.MQTT.ConnectRetryMaxDelayMs},

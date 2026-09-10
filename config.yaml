@@ -44,6 +44,13 @@ serial:
   # verify_registers is what confirms a write took effect.
   write_settle_delay: 50
 
+  # How long after a write to read the affected registers a second time. Some
+  # values trail the command: 60ms after a stage change the actual fan stage
+  # (130 1067) still reported the previous value, so the first read-back
+  # publishes a number the unit is already moving away from. Repeated changes
+  # restart this wait, so one read happens after they stop. 0 disables it.
+  write_resettle_delay: 5000
+
 mqtt:
   broker: "192.168.1.20"
   port: 1883
