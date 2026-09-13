@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 
+	"github.com/nean/aerosmart-gateway/internal/config"
+
 	"github.com/nean/aerosmart-gateway/internal/logger"
 )
 
@@ -19,11 +21,26 @@ type Poller struct {
 	derived *DerivedCalculator
 	gate    *ReadGate
 	logger  *logger.Logger
+
+	// writeRegisters carry their own state topic, which only a write would
+	// otherwise ever publish. The unit changes these by itself - party mode
+	// reverts after about 90 minutes, and the mode can be changed at the
+	// unit's panel - so each cycle republishes them from their state_from
+	// register. Without this the Home Assistant number and switch entities
+	// keep the value from the last write indefinitely, including across a
+	// gateway restart.
+	writeRegisters []config.WriteRegisterConfig
 }
 
 // NewPoller creates a poller. derived may be nil.
-func NewPoller(reader *Reader, derived *DerivedCalculator, gate *ReadGate, log *logger.Logger) *Poller {
-	return &Poller{reader: reader, derived: derived, gate: gate, logger: log}
+func NewPoller(reader *Reader, derived *DerivedCalculator, gate *ReadGate, log *logger.Logger, writeRegisters []config.WriteRegisterConfig) *Poller {
+	return &Poller{
+		reader:         reader,
+		derived:        derived,
+		gate:           gate,
+		logger:         log,
+		writeRegisters: writeRegisters,
+	}
 }
 
 // RunCycle performs one full readout, unless a write is currently in flight.
@@ -51,9 +68,19 @@ func (p *Poller) RunCycle(ctx context.Context) error {
 		return err
 	}
 
+	// A write can preempt the cycle after its last read. Publishing the
+	// snapshot then would overwrite the newer values that write just
+	// published, and they would not be corrected until the next cycle.
+	if err := cycleCtx.Err(); err != nil {
+		p.logger.Info("=== Read cycle preempted before publishing, discarding the snapshot ===")
+		return err
+	}
+
 	if err := p.reader.PublishAll(values); err != nil {
 		p.logger.Error("Failed to publish some register values: %v", err)
 	}
+
+	p.publishWriteRegisterState(values)
 
 	if p.derived != nil {
 		if err := p.derived.PublishAll(p.derived.Calculate(values)); err != nil {
@@ -62,4 +89,23 @@ func (p *Poller) RunCycle(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// publishWriteRegisterState republishes each write register's state from the
+// read register that carries its real value.
+func (p *Poller) publishWriteRegisterState(values map[string]*RegisterValue) {
+	for _, reg := range p.writeRegisters {
+		if reg.StateFrom == "" || reg.Topic == "" {
+			continue
+		}
+		source, ok := values[reg.StateFrom]
+		if !ok || source == nil || !source.Valid {
+			continue
+		}
+		if err := p.reader.pub.Publish(reg.Topic, source.Value); err != nil {
+			p.logger.Error("Failed to publish state for %s to %s: %v", reg.Name, reg.Topic, err)
+			continue
+		}
+		p.logger.Debug("Published %s state = %s to %s", reg.Name, source.Value, reg.Topic)
+	}
 }

@@ -22,6 +22,7 @@ type fakeDevice struct {
 	failFirst int // fail this many calls before answering
 	unhealthy bool
 	sendErr   error // if set, Send fails with this
+	afterCall func(n int)
 	calls     []string
 	block     chan struct{} // if set, Transact waits on it (or on ctx)
 }
@@ -50,6 +51,11 @@ func (f *fakeDevice) Transact(ctx context.Context, command string) (string, erro
 		return "", f.err
 	}
 	if v, ok := f.responses[command]; ok {
+		// Fires as this read succeeds, so a cancellation triggered here lands
+		// after the read rather than interrupting it.
+		if f.afterCall != nil {
+			f.afterCall(n)
+		}
 		return v, nil
 	}
 	return "", serial.ErrReadTimeout
@@ -473,7 +479,7 @@ func TestPollerSkipsCycleWhileWriteIsPending(t *testing.T) {
 	pub := newFakePublisher()
 	gate := NewReadGate(time.Hour)
 	p := NewPoller(NewReader(dev, pub, testLogger(), []config.ReadRegisterConfig{fanReg}, 1, time.Millisecond),
-		nil, gate, testLogger())
+		nil, gate, testLogger(), nil)
 
 	gate.Preempt() // a write is in progress
 
@@ -495,7 +501,7 @@ func TestPollerPublishesReadAndDerivedValues(t *testing.T) {
 		Sources: []string{"co2luefterstufe3"},
 	}})
 	reader := NewReader(dev, pub, log, []config.ReadRegisterConfig{fanReg, tempReg}, 1, time.Millisecond)
-	p := NewPoller(reader, derived, NewReadGate(time.Second), log)
+	p := NewPoller(reader, derived, NewReadGate(time.Second), log, nil)
 
 	if err := p.RunCycle(context.Background()); err != nil {
 		t.Fatalf("RunCycle() error = %v", err)
@@ -514,7 +520,7 @@ func TestPollerDoesNotPublishCancelledCycle(t *testing.T) {
 	dev := &fakeDevice{responses: map[string]string{"130 1067": "3"}}
 	pub := newFakePublisher()
 	p := NewPoller(NewReader(dev, pub, testLogger(), []config.ReadRegisterConfig{fanReg}, 1, time.Millisecond),
-		nil, NewReadGate(time.Second), testLogger())
+		nil, NewReadGate(time.Second), testLogger(), nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -636,7 +642,7 @@ func TestPollerSkipsCycleWhilePortUnhealthy(t *testing.T) {
 	dev := &fakeDevice{responses: map[string]string{"130 1067": "3"}, unhealthy: true}
 	pub := newFakePublisher()
 	p := NewPoller(NewReader(dev, pub, testLogger(), []config.ReadRegisterConfig{fanReg}, 3, time.Millisecond),
-		nil, NewReadGate(time.Second), testLogger())
+		nil, NewReadGate(time.Second), testLogger(), nil)
 
 	if err := p.RunCycle(context.Background()); !errors.Is(err, ErrCycleSkipped) {
 		t.Fatalf("RunCycle() error = %v, want ErrCycleSkipped", err)
@@ -705,7 +711,7 @@ func TestReadAllRecordsRawDeviceValue(t *testing.T) {
 func TestPollerReportsSkippedCycle(t *testing.T) {
 	dev := &fakeDevice{unhealthy: true}
 	p := NewPoller(NewReader(dev, newFakePublisher(), testLogger(), []config.ReadRegisterConfig{fanReg}, 1, time.Millisecond),
-		nil, NewReadGate(time.Second), testLogger())
+		nil, NewReadGate(time.Second), testLogger(), nil)
 
 	err := p.RunCycle(context.Background())
 	if !errors.Is(err, ErrCycleSkipped) {
@@ -717,7 +723,7 @@ func TestPollerReportsSkippedCycleWhenSuppressed(t *testing.T) {
 	dev := &fakeDevice{responses: map[string]string{"130 1067": "3"}}
 	gate := NewReadGate(time.Hour)
 	p := NewPoller(NewReader(dev, newFakePublisher(), testLogger(), []config.ReadRegisterConfig{fanReg}, 1, time.Millisecond),
-		nil, gate, testLogger())
+		nil, gate, testLogger(), nil)
 	gate.Preempt()
 
 	if err := p.RunCycle(context.Background()); !errors.Is(err, ErrCycleSkipped) {
@@ -972,5 +978,174 @@ func TestVerifyRegistersArePublishedToTheirOwnTopics(t *testing.T) {
 	}
 	if reads != 1 {
 		t.Errorf("lueftermode read %d times, want 1", reads)
+	}
+}
+
+// ---------- review round 8 ----------
+
+var modeReadReg = config.ReadRegisterConfig{
+	Name: "lueftermode", Command: "130 5003", Topic: "aerosmart/lueftermode",
+	Divisor: 1, Type: "integer", MinValue: 0, MaxValue: 5,
+}
+
+func stateWriter(t *testing.T, dev Transactor, pub Publisher, gate *ReadGate) (*Writer, config.WriteRegisterConfig) {
+	t.Helper()
+	reg := fanWrite
+	reg.StateFrom = "lueftermode"
+	reg.VerifyRegisters = []string{"luefterstatus", "lueftermode"}
+
+	log := testLogger()
+	w := NewWriter(dev, pub, log, []config.WriteRegisterConfig{reg}, gate, 3, time.Millisecond, time.Millisecond)
+	w.SetReader(NewReader(dev, pub, log, []config.ReadRegisterConfig{fanReg, modeReadReg}, 1, time.Millisecond))
+	return w, reg
+}
+
+// A settle re-read captures values before a newer command runs. Publishing
+// them afterwards would leave Home Assistant showing the superseded mode, and
+// the write register's state topic never self-corrects.
+func TestRefreshReadBackSkipsSupersededWrite(t *testing.T) {
+	dev := &fakeDevice{responses: map[string]string{"130 1067": "4", "130 5003": "4"}}
+	pub := newFakePublisher()
+	w, reg := stateWriter(t, dev, pub, NewReadGate(time.Second))
+
+	// A write of 4 happens, and its refresh is scheduled.
+	if err := w.HandleMessage(context.Background(), reg.SubscribeTopic, "4"); err != nil {
+		t.Fatalf("HandleMessage(4) error = %v", err)
+	}
+	stale := w.WriteSequence(reg.Name)
+
+	// The user then changes to 2, which completes first.
+	dev.mu.Lock()
+	dev.responses["130 1067"] = "2"
+	dev.responses["130 5003"] = "2"
+	dev.mu.Unlock()
+	if err := w.HandleMessage(context.Background(), reg.SubscribeTopic, "2"); err != nil {
+		t.Fatalf("HandleMessage(2) error = %v", err)
+	}
+
+	// The older refresh now runs. It must not publish anything.
+	w.refreshIfCurrent(context.Background(), reg, stale)
+
+	if v, _ := pub.get(reg.Topic); v != "2" {
+		t.Errorf("state topic = %q, want 2; a superseded refresh overwrote it", v)
+	}
+	if v, _ := pub.get("aerosmart/lueftermode"); v != "2" {
+		t.Errorf("lueftermode = %q, want 2; a superseded refresh overwrote it", v)
+	}
+}
+
+// A refresh that has not been superseded must still publish.
+func TestRefreshReadBackRunsWhenCurrent(t *testing.T) {
+	dev := &fakeDevice{responses: map[string]string{"130 1067": "4", "130 5003": "4"}}
+	pub := newFakePublisher()
+	w, reg := stateWriter(t, dev, pub, NewReadGate(time.Second))
+
+	if err := w.HandleMessage(context.Background(), reg.SubscribeTopic, "4"); err != nil {
+		t.Fatalf("HandleMessage() error = %v", err)
+	}
+	seq := w.WriteSequence(reg.Name)
+
+	// The unit settles on stage 1 under auto.
+	dev.mu.Lock()
+	dev.responses["130 1067"] = "1"
+	dev.mu.Unlock()
+
+	w.refreshIfCurrent(context.Background(), reg, seq)
+
+	if v, _ := pub.get("aerosmart/luefterstatus"); v != "1" {
+		t.Errorf("luefterstatus = %q, want the settled 1", v)
+	}
+}
+
+// A command that reached the wire must be remembered even if the read-back
+// disagreed, or the user's correction back to the previous value is dropped as
+// a duplicate while the unit sits on the value they are trying to leave.
+func TestDedupeDoesNotSwallowACorrectionAfterAnUnconfirmedWrite(t *testing.T) {
+	// The unit never mirrors, so every write reports a mismatch.
+	dev := &fakeDevice{responses: map[string]string{"130 1067": "9", "130 5003": "9"}}
+	pub := newFakePublisher()
+	w, reg := stateWriter(t, dev, pub, NewReadGate(time.Second))
+
+	// 2 succeeds as far as being sent, then 4, then a correction back to 2.
+	_ = w.HandleMessage(context.Background(), reg.SubscribeTopic, "2")
+	_ = w.HandleMessage(context.Background(), reg.SubscribeTopic, "4")
+	_ = w.HandleMessage(context.Background(), reg.SubscribeTopic, "2")
+
+	dev.mu.Lock()
+	defer dev.mu.Unlock()
+	var sent []string
+	for _, c := range dev.calls {
+		if strings.HasPrefix(c, "130 5002") {
+			sent = append(sent, c)
+		}
+	}
+	want := []string{"130 5002 2", "130 5002 4", "130 5002 2"}
+	if len(sent) != len(want) {
+		t.Fatalf("commands sent = %v, want %v; the correction was dropped as a duplicate", sent, want)
+	}
+	for i := range want {
+		if sent[i] != want[i] {
+			t.Errorf("sent[%d] = %q, want %q", i, sent[i], want[i])
+		}
+	}
+}
+
+// A genuine broker redelivery of the last command is still dropped.
+func TestDedupeStillDropsARedelivery(t *testing.T) {
+	dev := &fakeDevice{responses: map[string]string{"130 1067": "2", "130 5003": "2"}}
+	w, reg := stateWriter(t, dev, newFakePublisher(), NewReadGate(time.Second))
+
+	_ = w.HandleMessage(context.Background(), reg.SubscribeTopic, "2")
+	before := dev.callCount()
+	_ = w.HandleMessage(context.Background(), reg.SubscribeTopic, "2")
+
+	if dev.callCount() != before {
+		t.Error("a redelivery of the last command reached the device again")
+	}
+}
+
+// The read cycle must keep a write register's state topic current, or a mode
+// the unit leaves on its own - party reverting after ~90 minutes, or a change
+// made at the unit's panel - never reaches Home Assistant.
+func TestPollerPublishesWriteRegisterState(t *testing.T) {
+	writeReg := fanWrite
+	writeReg.StateFrom = "lueftermode"
+
+	dev := &fakeDevice{responses: map[string]string{"130 1067": "1", "130 5003": "1"}}
+	pub := newFakePublisher()
+	log := testLogger()
+	reader := NewReader(dev, pub, log, []config.ReadRegisterConfig{fanReg, modeReadReg}, 1, time.Millisecond)
+	p := NewPoller(reader, nil, NewReadGate(time.Second), log, []config.WriteRegisterConfig{writeReg})
+
+	if err := p.RunCycle(context.Background()); err != nil {
+		t.Fatalf("RunCycle() error = %v", err)
+	}
+	if v, ok := pub.get(writeReg.Topic); !ok || v != "1" {
+		t.Errorf("%s = %q (%v), want 1 from the read cycle", writeReg.Topic, v, ok)
+	}
+}
+
+// A cycle cancelled after its last read must not publish its snapshot: a write
+// that preempted it has already published newer values.
+func TestPollerWithholdsPublishWhenCancelledAfterTheLastRead(t *testing.T) {
+	dev := &fakeDevice{responses: map[string]string{"130 1067": "1"}}
+	pub := newFakePublisher()
+	gate := NewReadGate(time.Second)
+	p := NewPoller(NewReader(dev, pub, testLogger(), []config.ReadRegisterConfig{fanReg}, 1, time.Millisecond),
+		nil, gate, testLogger(), nil)
+
+	// Cancel the moment the reads are done but before publishing.
+	dev.afterCall = func(n int) {
+		if n == 1 {
+			gate.Preempt()
+		}
+	}
+
+	err := p.RunCycle(context.Background())
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("RunCycle() error = %v, want context.Canceled", err)
+	}
+	if v, ok := pub.get("aerosmart/luefterstatus"); ok {
+		t.Errorf("published %q from a cancelled cycle; a preempting write's values would be overwritten", v)
 	}
 }

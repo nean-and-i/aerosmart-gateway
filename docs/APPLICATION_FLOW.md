@@ -237,6 +237,11 @@ HandleMessage(ctx, topic, payload):
   schedule one more read after write_resettle_delay   # for values that lag
 ```
 
+The command is remembered for deduplication as soon as it reaches the wire, not
+when it is confirmed. This unit applies writes whether or not it confirms them,
+so remembering only confirmed ones left the previous value on record - and a
+user correcting back to it looked like a redelivery and was dropped.
+
 ### Why a write is not confirmed by its echo
 
 The unit applies register writes but does not reliably answer them. Measured on
@@ -273,7 +278,17 @@ cycle.
 
 So the read-back registers are read once more after `write_resettle_delay`
 (5s by default), which is what gives `aerosmart/luefterstatus` the stage the
-unit actually settled on. The wait restarts on every write, so changing stage several
+unit actually settled on. Each write register keeps its own pending re-read,
+and a re-read publishes nothing if a newer command for that register has run
+since it was scheduled - `readBack` releases the wire between reads, so a whole
+command can complete inside one, and publishing the older values would put the
+superseded mode back on the state topic.
+
+A mode the unit leaves by itself - party reverting after ~90 minutes, or a
+change made at its own panel - is not a command, so nothing schedules a
+re-read. Every read cycle therefore republishes each write register's state
+topic from its `state_from` register, which is also what restores those topics
+after a gateway restart. The wait restarts on every write, so changing stage several
 times in a row produces one read after the changes stop rather than one per
 command, and scheduling it never blocks the write path.
 
