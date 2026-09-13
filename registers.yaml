@@ -1,5 +1,21 @@
+# luefterstufe (write 130 5002) and lueftermode (read 130 5003) are a MODE, not
+# a linear fan speed:
+#
+#   0-3  manual fan stage      luefterstatus mirrors the commanded stage
+#   4    auto                  luefterstatus follows the co2luefterstufe*
+#                              thresholds, so it is whatever CO2 currently warrants
+#   5    party                 luefterstatus goes to the highest stage (3) for a
+#                              fixed period (~90 min), then the unit reverts by itself
+#
+# So for 4 and 5 the running stage is decided by the unit, not by the command.
+# luefterstatus has to be read again once it has decided, which is what
+# serial.write_resettle_delay does. Party mode expiring is picked up by the
+# normal read cycle.
+
 read_registers:
   - name: "luefterstatus"
+    # The stage actually running (0-3). NOT the commanded mode: see the note
+    # above. Reads 1 under auto with low CO2, 3 under party.
     command: "130 1067"
     topic: "aerosmart/luefterstatus"
     divisor: 1
@@ -349,6 +365,7 @@ read_registers:
 
 write_registers:
   - name: "luefterstufe"
+    # 0-3 manual stage, 4 auto, 5 party. See the note at the top of this file.
     command_template: "130 5002 {value}"
     subscribe_topic: "dw/aerosmart/luefterstufe"
     # Own state topic: sharing "aerosmart/lueftermode" with the read register
