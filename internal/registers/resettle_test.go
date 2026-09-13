@@ -15,7 +15,7 @@ type refreshRecorder struct {
 	calls []string
 }
 
-func (r *refreshRecorder) refresh(_ context.Context, reg config.WriteRegisterConfig) {
+func (r *refreshRecorder) refresh(_ context.Context, reg config.WriteRegisterConfig, _ uint64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.calls = append(r.calls, reg.Name)
@@ -38,7 +38,7 @@ func TestResettlerRefreshesAfterTheDelay(t *testing.T) {
 	done := make(chan struct{})
 	go func() { rs.run(ctx); close(done) }()
 
-	rs.schedule(config.WriteRegisterConfig{Name: "luefterstufe"})
+	rs.schedule(config.WriteRegisterConfig{Name: "luefterstufe"}, 1)
 
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) && len(rec.snapshot()) == 0 {
@@ -65,7 +65,7 @@ func TestResettlerCoalescesRapidWrites(t *testing.T) {
 
 	// Five writes, each well inside the delay.
 	for i := 0; i < 5; i++ {
-		rs.schedule(config.WriteRegisterConfig{Name: "luefterstufe"})
+		rs.schedule(config.WriteRegisterConfig{Name: "luefterstufe"}, 1)
 		time.Sleep(10 * time.Millisecond)
 	}
 
@@ -83,8 +83,9 @@ func TestResettlerCoalescesRapidWrites(t *testing.T) {
 	<-done
 }
 
-// The latest write wins, so the register refreshed is the one last commanded.
-func TestResettlerRefreshesTheLatestRegister(t *testing.T) {
+// Each register keeps its own pending entry: commanding a second register must
+// not discard the first one's re-read, whose value may still be lagging.
+func TestResettlerRefreshesEveryScheduledRegister(t *testing.T) {
 	rec := &refreshRecorder{}
 	rs := newResettler(30*time.Millisecond, rec.refresh, testLogger())
 
@@ -93,15 +94,21 @@ func TestResettlerRefreshesTheLatestRegister(t *testing.T) {
 	done := make(chan struct{})
 	go func() { rs.run(ctx); close(done) }()
 
-	rs.schedule(config.WriteRegisterConfig{Name: "luefterstufe"})
-	rs.schedule(config.WriteRegisterConfig{Name: "boilerheizstab"})
+	rs.schedule(config.WriteRegisterConfig{Name: "luefterstufe"}, 1)
+	rs.schedule(config.WriteRegisterConfig{Name: "boilerheizstab"}, 1)
 
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) && len(rec.snapshot()) == 0 {
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && len(rec.snapshot()) < 2 {
 		time.Sleep(time.Millisecond)
 	}
-	if got := rec.snapshot(); len(got) != 1 || got[0] != "boilerheizstab" {
-		t.Fatalf("refreshes = %v, want one for boilerheizstab", got)
+
+	got := rec.snapshot()
+	if len(got) != 2 {
+		t.Fatalf("refreshes = %v, want one per register", got)
+	}
+	seen := map[string]bool{got[0]: true, got[1]: true}
+	if !seen["luefterstufe"] || !seen["boilerheizstab"] {
+		t.Errorf("refreshes = %v, want both registers", got)
 	}
 
 	cancel()
@@ -111,12 +118,12 @@ func TestResettlerRefreshesTheLatestRegister(t *testing.T) {
 // schedule runs on the command path and must never block, even with nothing
 // consuming it.
 func TestResettlerScheduleNeverBlocks(t *testing.T) {
-	rs := newResettler(time.Hour, func(context.Context, config.WriteRegisterConfig) {}, testLogger())
+	rs := newResettler(time.Hour, func(context.Context, config.WriteRegisterConfig, uint64) {}, testLogger())
 
 	done := make(chan struct{})
 	go func() {
 		for i := 0; i < 100; i++ {
-			rs.schedule(config.WriteRegisterConfig{Name: "luefterstufe"})
+			rs.schedule(config.WriteRegisterConfig{Name: "luefterstufe"}, 1)
 		}
 		close(done)
 	}()
@@ -137,7 +144,7 @@ func TestResettlerDisabledWithZeroDelay(t *testing.T) {
 	done := make(chan struct{})
 	go func() { rs.run(ctx); close(done) }()
 
-	rs.schedule(config.WriteRegisterConfig{Name: "luefterstufe"})
+	rs.schedule(config.WriteRegisterConfig{Name: "luefterstufe"}, 1)
 	time.Sleep(100 * time.Millisecond)
 
 	if got := rec.snapshot(); len(got) != 0 {

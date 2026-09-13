@@ -222,7 +222,7 @@ func run() error {
 	wg.Go(func() {
 		runResettle(ctx)
 	})
-	poller := registers.NewPoller(reader, derivedCalc, gate, log)
+	poller := registers.NewPoller(reader, derivedCalc, gate, log, registersConfig.WriteRegisters)
 
 	// Commands are applied by a dedicated worker, not on paho's router
 	// goroutine. The worker is joined at shutdown, so the port is never closed

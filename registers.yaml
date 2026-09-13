@@ -9,8 +9,12 @@
 #
 # So for 4 and 5 the running stage is decided by the unit, not by the command.
 # luefterstatus has to be read again once it has decided, which is what
-# serial.write_resettle_delay does. Party mode expiring is picked up by the
-# normal read cycle.
+# serial.write_resettle_delay does.
+#
+# Party mode expiring, and any change made at the unit's own panel, are picked
+# up by the read cycle: every cycle republishes each write register's state
+# topic from its state_from register, so the Home Assistant entity follows the
+# unit rather than only ever showing the last value written.
 
 read_registers:
   - name: "luefterstatus"

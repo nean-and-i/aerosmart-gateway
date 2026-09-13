@@ -314,8 +314,12 @@ Example of Home Assistant dashboard:
    shortly afterwards rather than after a full interval
 3. Registers are read sequentially: send command → read matching frame → apply divisor →
    validate range → publish
-4. Derived values are computed from that same snapshot and published
-5. A cancelled cycle publishes nothing, so partial results cannot mix with stale ones
+4. Each write register's state topic is republished from its `state_from` register, so a
+   mode the unit changed by itself - party mode expiring, or the panel being used - reaches
+   Home Assistant, and the entities are restored after a restart
+5. Derived values are computed from that same snapshot and published
+6. A cancelled cycle publishes nothing, including one cancelled after its last read, so a
+   preempting write's fresher values are not overwritten
 
 ### Write Operation
 

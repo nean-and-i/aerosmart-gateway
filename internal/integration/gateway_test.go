@@ -163,7 +163,7 @@ func newStack(t *testing.T, dev serial.Port) (*registers.Poller, *recordingPubli
 	pub := newRecordingPublisher()
 	reader := registers.NewReader(sp, pub, log, readRegisters, 3, 10*time.Millisecond)
 	gate := registers.NewReadGate(time.Second)
-	return registers.NewPoller(reader, nil, gate, log), pub, sp
+	return registers.NewPoller(reader, nil, gate, log, nil), pub, sp
 }
 
 // Every frame arriving one byte at a time must still be reassembled, and every
@@ -293,7 +293,7 @@ func TestWritePreemptsAnInFlightReadCycle(t *testing.T) {
 	pub := newRecordingPublisher()
 	gate := registers.NewReadGate(time.Second)
 	reader := registers.NewReader(sp, pub, log, readRegisters, 3, 10*time.Millisecond)
-	poller := registers.NewPoller(reader, nil, gate, log)
+	poller := registers.NewPoller(reader, nil, gate, log, nil)
 
 	cycleDone := make(chan time.Duration, 1)
 	go func() {
@@ -337,7 +337,7 @@ func TestPollingSurvivesAWritePreemption(t *testing.T) {
 	pub := newRecordingPublisher()
 	gate := registers.NewReadGate(50 * time.Millisecond)
 	reader := registers.NewReader(sp, pub, log, readRegisters, 3, 10*time.Millisecond)
-	poller := registers.NewPoller(reader, nil, gate, log)
+	poller := registers.NewPoller(reader, nil, gate, log, nil)
 
 	// First cycle succeeds.
 	if err := poller.RunCycle(context.Background()); err != nil {
@@ -582,7 +582,7 @@ func TestReadCycleIgnoresUnsolicitedChatter(t *testing.T) {
 
 	pub := newRecordingPublisher()
 	reader := registers.NewReader(sp, pub, log, readRegisters, 3, 10*time.Millisecond)
-	poller := registers.NewPoller(reader, nil, registers.NewReadGate(time.Second), log)
+	poller := registers.NewPoller(reader, nil, registers.NewReadGate(time.Second), log, nil)
 
 	if err := poller.RunCycle(context.Background()); err != nil {
 		t.Fatalf("RunCycle() error = %v", err)

@@ -34,6 +34,13 @@ type Writer struct {
 	// trail the command.
 	resettle *resettler
 
+	// writeSeq counts accepted commands per register. A settle re-read carries
+	// the sequence it was scheduled at and publishes nothing if a newer
+	// command has since run, which would otherwise leave Home Assistant
+	// showing the superseded value.
+	seqMu    sync.Mutex
+	writeSeq map[string]uint64
+
 	// lastCommand remembers the last command per topic that actually reached
 	// the device, so a broker redelivery is dropped while a retry after a
 	// failure, and a change back to an earlier value, both go through.
@@ -64,6 +71,7 @@ func NewWriter(dev Transactor, pub Publisher, log *logger.Logger, registers []co
 		retries:      retries,
 		backoff:      backoff,
 		settleDelay:  settleDelay,
+		writeSeq:     make(map[string]uint64),
 		lastCommand:  make(map[string]lastWrite),
 		dedupeWindow: time.Second,
 	}
@@ -76,20 +84,51 @@ func (w *Writer) SetReader(reader *Reader) { w.reader = reader }
 // values that trail the command. Zero disables it. The returned function runs
 // the re-reads and must be called in its own goroutine.
 func (w *Writer) SetResettleDelay(delay time.Duration) func(context.Context) {
-	w.resettle = newResettler(delay, w.RefreshReadBack, w.logger)
+	w.resettle = newResettler(delay, w.refreshIfCurrent, w.logger)
 	return w.resettle.run
 }
 
-// RefreshReadBack re-reads the register's read-back registers and publishes
-// them, without judging whether the write succeeded.
-func (w *Writer) RefreshReadBack(ctx context.Context, register config.WriteRegisterConfig) {
-	values, _, _ := w.readBack(ctx, register)
+// WriteSequence returns how many commands have been accepted for a register.
+func (w *Writer) WriteSequence(name string) uint64 {
+	w.seqMu.Lock()
+	defer w.seqMu.Unlock()
+	return w.writeSeq[name]
+}
+
+// nextWriteSequence records another accepted command and returns the new count.
+func (w *Writer) nextWriteSequence(name string) uint64 {
+	w.seqMu.Lock()
+	defer w.seqMu.Unlock()
+	w.writeSeq[name]++
+	return w.writeSeq[name]
+}
+
+// refreshIfCurrent re-reads the register's read-back registers and publishes
+// them, unless a newer command for that register has run in the meantime.
+//
+// readBack releases the wire between reads - to publish, and during a retry
+// backoff - so a whole command can complete inside a refresh. Publishing the
+// values read before it would put the superseded mode back on the state topic,
+// where nothing would correct it until the next write.
+func (w *Writer) refreshIfCurrent(ctx context.Context, register config.WriteRegisterConfig, seq uint64) {
+	if w.WriteSequence(register.Name) != seq {
+		w.logger.Debug("Skipping settle re-read of %s: a newer command has run", register.Name)
+		return
+	}
+
+	values, _, _ := w.readBackIfCurrent(ctx, register, seq)
+	if values == nil {
+		return
+	}
 
 	if register.StateFrom == "" || register.Topic == "" {
 		return
 	}
 	actual, ok := values[register.StateFrom]
 	if !ok {
+		return
+	}
+	if w.WriteSequence(register.Name) != seq {
 		return
 	}
 	if err := w.pub.Publish(register.Topic, actual); err != nil {
@@ -149,6 +188,10 @@ func (w *Writer) HandleMessage(ctx context.Context, topic string, message string
 	command := mqtt.ParseWriteRegisterCommand(register.CommandTemplate, valueStr)
 	w.logger.Info("=== Writing %s = %d (%q) ===", register.Name, value, command)
 
+	// Count the command before it goes out, so a settle re-read scheduled by
+	// an earlier command knows it has been superseded.
+	seq := w.nextWriteSequence(register.Name)
+
 	sendStart := time.Now()
 	if err := w.sendCommand(ctx, command); err != nil {
 		w.logger.SerialSend(command, time.Since(sendStart), err)
@@ -156,6 +199,13 @@ func (w *Writer) HandleMessage(ctx context.Context, topic string, message string
 		return fmt.Errorf("write %s: %w", register.Name, err)
 	}
 	w.logger.SerialSend(command, time.Since(sendStart), nil)
+
+	// The command reached the wire, and this unit applies writes whether or
+	// not it confirms them. Remembering it here rather than only on success
+	// keeps deduplication comparing against what was actually sent; comparing
+	// against an older value made a user's correction back to it look like a
+	// redelivery and dropped it.
+	w.rememberSent(topic, valueStr)
 
 	// Give the unit a moment to apply the value before reading it back.
 	if !sleepCtx(ctx, w.settleDelay) {
@@ -188,7 +238,6 @@ func (w *Writer) HandleMessage(ctx context.Context, topic string, message string
 			register.Name, value, register.StateFrom, actual)
 		return fmt.Errorf("write %s: unit reports %s, not %d", register.Name, actual, value)
 	case resolved:
-		w.rememberSuccess(topic, valueStr)
 		w.logger.Info("Wrote %s = %d, confirmed by %s", register.Name, value, register.StateFrom)
 	case checkable && !confirmed:
 		// The command went out, so it may still have taken effect; the next
@@ -197,17 +246,15 @@ func (w *Writer) HandleMessage(ctx context.Context, topic string, message string
 			register.Name, value, register.VerifyRegisters)
 		return fmt.Errorf("write %s: sent but could not confirm it took effect", register.Name)
 	case checkable:
-		w.rememberSuccess(topic, valueStr)
 		w.logger.Info("Wrote %s = %d, confirmed by read-back", register.Name, value)
 	default:
-		w.rememberSuccess(topic, valueStr)
 		w.logger.Warn("Wrote %s = %d; no state_from or verify_registers configured, "+
 			"so it cannot be confirmed", register.Name, value)
 	}
 
 	// Some values trail the command; read them again once things settle.
 	if w.resettle != nil {
-		w.resettle.schedule(register)
+		w.resettle.schedule(register, seq)
 	}
 
 	w.logger.Info("=== Write of %s completed in %v ===", register.Name, time.Since(received))
@@ -221,6 +268,12 @@ func (w *Writer) HandleMessage(ctx context.Context, topic string, message string
 // whether there was anything to read at all. A successful read-back is what
 // makes a write trustworthy, since the unit does not reliably echo commands.
 func (w *Writer) readBack(ctx context.Context, register config.WriteRegisterConfig) (map[string]string, bool, bool) {
+	return w.readBackIfCurrent(ctx, register, 0)
+}
+
+// readBackIfCurrent is readBack, abandoning the work if seq is non-zero and a
+// newer command for the register has run.
+func (w *Writer) readBackIfCurrent(ctx context.Context, register config.WriteRegisterConfig, seq uint64) (map[string]string, bool, bool) {
 	if w.reader == nil {
 		return nil, false, false
 	}
@@ -246,6 +299,10 @@ func (w *Writer) readBack(ctx context.Context, register config.WriteRegisterConf
 	for _, name := range names {
 		if _, done := values[name]; done {
 			continue
+		}
+		if seq != 0 && w.WriteSequence(register.Name) != seq {
+			w.logger.Debug("Abandoning settle re-read of %s: a newer command has run", register.Name)
+			return nil, false, false
 		}
 
 		readReg, ok := w.reader.Register(name)
@@ -333,8 +390,8 @@ func (w *Writer) isDuplicate(topic, value string) bool {
 	return time.Since(last.at) < w.dedupeWindow
 }
 
-// rememberSuccess records a command that reached the device.
-func (w *Writer) rememberSuccess(topic, value string) {
+// rememberSent records a command that reached the wire.
+func (w *Writer) rememberSent(topic, value string) {
 	w.dedupeMu.Lock()
 	defer w.dedupeMu.Unlock()
 	w.lastCommand[topic] = lastWrite{value: value, at: time.Now()}
