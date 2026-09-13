@@ -256,14 +256,24 @@ the command is still sent and a warning says so.
 
 ### Values that trail the command
 
-The setpoint register updates at once, but the register reporting what the unit
-is *actually doing* does not: 60ms after a stage change, `130 1067` still
-returned the previous stage, so the read-back published a number the unit was
-already moving away from. Home Assistant then held that stale value until the
-next full read cycle.
+`luefterstufe` is a mode, not a fan speed:
+
+| Value | Meaning | What `luefterstatus` (`130 1067`) does |
+|-------|---------|----------------------------------------|
+| 0-3 | manual stage | mirrors the commanded stage |
+| 4 | auto | follows the `co2luefterstufe*` thresholds |
+| 5 | party | goes to the highest stage (3) for ~90 min, then reverts |
+
+For 4 and 5 the running stage is therefore decided by the unit, not by the
+command, and it is not known at the moment the write returns. Even for a manual
+stage the value trails: 60ms after a change, `130 1067` still returned the
+previous stage, so the read-back published a number the unit was already moving
+away from. Home Assistant then held that stale value until the next full read
+cycle.
 
 So the read-back registers are read once more after `write_resettle_delay`
-(5s by default). The wait restarts on every write, so changing stage several
+(5s by default), which is what gives `aerosmart/luefterstatus` the stage the
+unit actually settled on. The wait restarts on every write, so changing stage several
 times in a row produces one read after the changes stop rather than one per
 command, and scheduling it never blocks the write path.
 
