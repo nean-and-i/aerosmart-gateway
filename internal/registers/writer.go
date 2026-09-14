@@ -116,6 +116,13 @@ func (w *Writer) refreshIfCurrent(ctx context.Context, register config.WriteRegi
 		return
 	}
 
+	// The re-read puts transactions on the wire and publishes the values it
+	// gets back. A poll cycle running alongside it samples the register
+	// before it settles and publishes that afterwards, so the state topic
+	// would carry the stale value again until the next cycle.
+	w.gate.Preempt()
+	defer w.gate.Release()
+
 	values, _, _ := w.readBackIfCurrent(ctx, register, seq)
 	if values == nil {
 		return
@@ -196,6 +203,14 @@ func (w *Writer) HandleMessage(ctx context.Context, topic string, message string
 	if err := w.sendCommand(ctx, command); err != nil {
 		w.logger.SerialSend(command, time.Since(sendStart), err)
 		w.logger.Error("Failed to send %s after %d attempt(s): %v", register.Name, w.retries, err)
+		// The sequence bump above already superseded any re-read the previous
+		// command scheduled, so returning here would drop it with nothing in
+		// its place and leave a lagging value unpublished until the next full
+		// cycle. A partial write may also have reached the unit, so reading
+		// the register again is the only way to learn what it is holding.
+		if w.resettle != nil {
+			w.resettle.schedule(register, seq)
+		}
 		return fmt.Errorf("write %s: %w", register.Name, err)
 	}
 	w.logger.SerialSend(command, time.Since(sendStart), nil)

@@ -57,12 +57,18 @@ type SerialConfig struct {
 	// write, so the read-back is what confirms it.
 	WriteSettleDelay int `yaml:"write_settle_delay"`
 
-	// WriteResettleDelay is how long after a write to read the affected
+	// WriteResettleDelaySet is how long after a write to read the affected
 	// registers a second time, in milliseconds. Some values trail the
 	// command - the actual fan stage still reported the old value 60ms after
 	// a stage change - so without this Home Assistant keeps a stale number
-	// until the next full read cycle. Zero disables the second read.
-	WriteResettleDelay int `yaml:"write_resettle_delay"`
+	// until the next full read cycle.
+	//
+	// A pointer so an explicit 0, which disables the second read, can be told
+	// apart from an omitted key, which takes the default.
+	WriteResettleDelaySet *int `yaml:"write_resettle_delay"`
+
+	// WriteResettleDelay is the resolved value, filled in by applyDefaults.
+	WriteResettleDelay int `yaml:"-"`
 
 	// Flow control. The tarm/serial driver supports neither, so a true value
 	// is rejected by Validate rather than silently ignored.
@@ -124,9 +130,16 @@ type HADiscoveryConfig struct {
 	Prefix     string           `yaml:"prefix"`
 	DeviceInfo DeviceInfoConfig `yaml:"device_info"`
 
-	// ExpireAfter marks an entity unavailable after this many seconds without
-	// an update. Defaults to 2.5x the read interval.
-	ExpireAfter int `yaml:"expire_after"`
+	// ExpireAfterSet marks an entity unavailable after this many seconds
+	// without an update. Defaults to 2.5x the read interval.
+	//
+	// A pointer for the same reason as WriteResettleDelaySet: the discovery
+	// payload omits the field when it is 0, which is how an entity is told
+	// never to expire, so an explicit 0 has to survive applyDefaults.
+	ExpireAfterSet *int `yaml:"expire_after"`
+
+	// ExpireAfter is the resolved value, filled in by applyDefaults.
+	ExpireAfter int `yaml:"-"`
 }
 
 // LoggingConfig holds logging configuration.
@@ -277,7 +290,9 @@ func (c *AppConfig) applyDefaults() {
 	if c.Serial.WriteSettleDelay == 0 {
 		c.Serial.WriteSettleDelay = 50
 	}
-	if c.Serial.WriteResettleDelay == 0 {
+	if c.Serial.WriteResettleDelaySet != nil {
+		c.Serial.WriteResettleDelay = *c.Serial.WriteResettleDelaySet
+	} else {
 		c.Serial.WriteResettleDelay = 5000
 	}
 
@@ -330,7 +345,9 @@ func (c *AppConfig) applyDefaults() {
 	}
 	// Allow a couple of missed cycles before an entity is called stale, so a
 	// single failed readout does not flap every sensor to unavailable.
-	if c.HADiscovery.ExpireAfter == 0 && c.ReadInterval > 0 {
+	if c.HADiscovery.ExpireAfterSet != nil {
+		c.HADiscovery.ExpireAfter = *c.HADiscovery.ExpireAfterSet
+	} else if c.ReadInterval > 0 {
 		c.HADiscovery.ExpireAfter = c.ReadInterval * 5 / 2
 	}
 

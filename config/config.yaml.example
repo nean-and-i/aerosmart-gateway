@@ -1,5 +1,11 @@
 # Aerosmart Gateway Configuration
-# Copy this file to config.yaml and modify as needed
+# Copy this file to config.yaml and modify as needed.
+#
+# Every value below is the built-in default, so a key you delete keeps working.
+# All timeouts are in milliseconds unless stated otherwise.
+#
+# Check a configuration without talking to the device or the broker:
+#   ./aerosmart-gateway -validate -config config.yaml -registers registers.yaml
 
 serial:
   port: "/dev/ttyUSB0"
@@ -7,23 +13,56 @@ serial:
   bytesize: 8
   parity: "N"
   stopbits: 1
-  timeout: 0
-  xonxoff: true
+
+  # Flow control is NOT implemented by the tarm/serial driver, and never has
+  # been. Setting either to true is reported as a warning at startup rather
+  # than silently ignored, but it does nothing either way.
+  xonxoff: false
   dsrdtr: false
-  write_timeout: 1
-  read_timeout: 10          # Read timeout in milliseconds (0 = 200ms default)
-  max_reopens: 3           # Maximum number of port reopen attempts (default: 10)
-  deadline_timeout: 150    # Flush input deadline timeout in milliseconds (default: 150)
-  write_with_retry_delay: 10  # Delay between write retries in milliseconds (default: 10)
-  device_response_delay: 40   # Delay to wait for device response in milliseconds (default: 40)
-  read_with_retry_delay: 100   # Delay between read retries in milliseconds (default: 100)
-  read_max_retries: 10     # Maximum number of read retries (default: 10)
-  write_max_retries: 10    # Maximum number of write retries (default: 10)
-  max_retries: 10          # Maximum number of register read/write operation retries (default: 10)
-  # Connection retry configuration
-  connect_retry_initial_delay_ms: 2   # Initial delay for exponential backoff in ms (code default: 100)
-  connect_retry_max_delay_ms: 400     # Maximum delay for exponential backoff in ms (code default: 10000)
-  connect_retry_jitter_percent: 25      # Jitter percentage (0-100, default: 25%)
+
+  # How long a single read may block. The kernel expresses this as termios
+  # VTIME in deciseconds, so it is rounded up to a multiple of 100ms; anything
+  # below 100 is raised to 100.
+  read_timeout: 200
+
+  # Total budget for one command/response exchange. Unmatched or stale frames
+  # are discarded within this window without re-sending the command. A value
+  # below read_timeout is raised to it, since no response can arrive sooner.
+  response_timeout: 300
+
+  # Attempts per register operation, and the delay between them. This is the
+  # only retry level in the stack: worst case per register is
+  # retries * (response_timeout + read_timeout + retry_backoff)
+  #   = 3 * (300 + 200 + 100) = 1.8s.
+  # Startup rejects a configuration whose worst-case full cycle (that figure
+  # times the number of read registers) does not fit inside read_interval.
+  retries: 3
+  retry_backoff: 100
+
+  # A failed port is reopened by a single supervisor with this backoff.
+  # Reopening is reserved for real port errors (EIO, ENODEV, ENXIO): it
+  # toggles DTR/RTS, which many devices treat as a reset, so it is never used
+  # as a remedy for a plain timeout.
+  reopen_backoff: 500
+  reopen_max_backoff: 30000
+  health_check_interval: 1000
+
+  # Upper bound on how long an in-flight write may hold reads off, so a lost
+  # release can never wedge polling.
+  write_priority_timeout: 10000
+
+  # How long to wait after writing a register before reading it back. The unit
+  # applies writes but does not reliably echo them, so the read-back of
+  # state_from and verify_registers is what confirms a write took effect.
+  write_settle_delay: 50
+
+  # How long after a write to read the affected registers a second time. Some
+  # values trail the command: 60ms after a stage change the actual fan stage
+  # (130 1067) still reported the previous value, so the first read-back
+  # publishes a number the unit is already moving away from. Repeated changes
+  # restart this wait, so one read happens after they stop. Set to 0 to
+  # disable the second read entirely.
+  write_resettle_delay: 5000
 
 mqtt:
   broker: "192.168.1.20"
@@ -33,45 +72,60 @@ mqtt:
   client_id: "aerosmart-gateway"
   qos: 1
   retain: true
-  # Connection retry configuration
-  connect_retry_initial_delay_ms: 500   # Initial delay for exponential backoff (default: 500ms)
-  connect_retry_max_delay_ms: 30000     # Maximum delay for exponential backoff (default: 30s)
-  connect_retry_jitter_percent: 25      # Jitter percentage (0-100, default: 25%)
-  # MQTT Resilience Configuration
-  # - Persistent Session: Subscriptions preserved across reconnects (CleanSession=false)
-  # - Auto-Recovery: Automatic re-subscription on connection established
-  # - QoS 1: At-least-once delivery for subscriptions and publishes
-  # - KeepAlive: Disconnect detection within 30-60 seconds
-  # - Publish Retry: Retries with exponential backoff (1s, 2s, 4s)
-  publish_retry_count: 3                # Number of retries for failed publishes (default: 3)
 
-# Device ID for Home Assistant discovery AND ""identifiers for "device_info"
-# device_info:
-#   identifiers: <device_id>
+  # Online/offline topic. Also registered as the MQTT last will, so an unclean
+  # disconnect marks the gateway offline instead of leaving retained values
+  # looking live. Defaults to "<device_id>/status".
+  availability_topic: "aerosmart/status"
+
+  # Bounds every broker interaction. Publishes happen on the serial read path,
+  # so an unbounded wait would stall polling if the broker accepts TCP but
+  # stops acknowledging.
+  op_timeout: 5000
+
+  publish_retry_count: 3
+
+  # Connection retry (used at startup; paho handles later reconnects itself).
+  connect_retry_initial_delay_ms: 500
+  connect_retry_max_delay_ms: 30000
+  connect_retry_jitter_percent: 25
+
+  # MQTT resilience
+  # - Clean session: the broker does not queue commands while the gateway is
+  #   offline, so an hours-old fan command is never replayed at startup.
+  #   Subscriptions are restored explicitly once the connection returns.
+  # - KeepAlive is 30s, so a dead link is detected within 30-60 seconds.
+  # - Failed publishes are retried with exponential backoff.
+
+# Device ID, also used as the Home Assistant device identifier
+# (device_info.identifiers).
 device_id: "aerosmart"
 
 # Logging level: debug, info, warn, error
-log_level: "debug"
+log_level: "info"
 
-# Logging configuration
-# Set log_file to empty or "-" to disable file logging (stdout only)
-# This improves SD card lifetime by reducing IO writes
 logging:
-  # Log file path (set to empty to disable file logging)
-  # log_file: "-"
-  # log_file: "/var/log/aerosmart.log"
-  # Enable/disable file logging (true/false)
+  # Log file path; empty or "-" disables file logging, which spares the SD card.
+  log_file: "-"
   file_logging: false
-  # Enable/disable console logging
+  # Disabling console_logging and file_logging together is rejected at startup,
+  # since nothing would be logged anywhere.
   console_logging: true
 
-# Read interval in seconds
+# Read interval in seconds, measured from the end of the previous cycle so an
+# overrunning readout still leaves the device an idle gap.
 read_interval: 120
 
 # Home Assistant MQTT Discovery
 ha_discovery:
   enabled: true
   prefix: "homeassistant"
+
+  # Seconds without an update before an entity is shown unavailable rather
+  # than displaying a stale retained value. Defaults to 2.5x read_interval;
+  # set to 0 to leave entities available indefinitely.
+  expire_after: 300
+
   device_info:
     # identifiers: <device_id>
     name: "Aerosmart Gateway"

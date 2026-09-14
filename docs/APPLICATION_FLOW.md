@@ -209,6 +209,10 @@ MQTT messages, republishing the last good value would make a dead sensor look al
 
 A cancelled cycle publishes nothing at all, so a partial readout cannot mix fresh values
 with stale ones, and derived values are never computed from sources that were not read.
+Cancellation is checked before publishing starts and again between every published value,
+because the publish phase is 30+ broker round trips bounded only by `op_timeout`: a write
+landing partway through would otherwise have its fresher values overwritten by the rest of
+the snapshot, including the write-register state topics republished at the end.
 
 ## Register writes
 
@@ -278,11 +282,27 @@ cycle.
 
 So the read-back registers are read once more after `write_resettle_delay`
 (5s by default), which is what gives `aerosmart/luefterstatus` the stage the
-unit actually settled on. Each write register keeps its own pending re-read,
-and a re-read publishes nothing if a newer command for that register has run
-since it was scheduled - `readBack` releases the wire between reads, so a whole
-command can complete inside one, and publishing the older values would put the
-superseded mode back on the state topic.
+unit actually settled on. Setting it to `0` switches the second read off. Each
+write register keeps its own pending re-read, and a re-read publishes nothing
+if a newer command for that register has run since it was scheduled -
+`readBack` releases the wire between reads, so a whole command can complete
+inside one, and publishing the older values would put the superseded mode back
+on the state topic.
+
+The re-read holds the read gate for its duration, exactly as a write does. It
+runs on its own goroutine, so without that a read cycle could start after the
+write, sample the register before it settled, and publish that stale value over
+the re-read's fresher one. Because the gate then has two independent holders,
+suppression is reference-counted: whichever finishes first releases only its
+own hold, and the `write_priority_timeout` deadline still drops every hold at
+once so a lost release cannot wedge polling.
+
+A command that never reaches the wire schedules a re-read too. Accepting a
+command bumps the register's write sequence before the send, which supersedes
+any re-read the previous command scheduled; returning on a send failure without
+replacing it would drop that earlier command's lagging value until the next
+full read cycle. A partial write may also have reached the unit, so reading the
+register again is the only way to learn what it is holding.
 
 A mode the unit leaves by itself - party reverting after ~90 minutes, or a
 change made at its own panel - is not a command, so nothing schedules a
@@ -374,7 +394,7 @@ told to publish to cannot drift from the one the gateway listens on.
 | Broker unreachable | Startup retries with backoff and jitter; later drops are handled by paho with re-subscription |
 | Broker stops acknowledging | Each operation fails after `op_timeout` |
 | Command arrives mid-cycle | Cycle cancelled, command applied, cycle retried shortly after |
-| Write not echoed by the unit | Expected; the write is confirmed by reading `verify_registers` back |
+| Write not echoed by the unit | Expected; the write is confirmed by reading `state_from` and `verify_registers` back |
 | Write cannot be confirmed | Reported as an error, but the command was sent and may have taken effect; the next cycle shows the truth |
 | Unsolicited broadcast frames | Discarded by the frame matcher, including from node addresses that are not configured registers |
 | Commands arriving faster than they can be applied | Queued up to 16, then dropped with an error; the MQTT router is never blocked |
@@ -410,7 +430,7 @@ told to publish to cannot drift from the one the gateway listens on.
 | `health_check_interval` | `1000` | Port health poll interval |
 | `write_priority_timeout` | `10000` | Maximum time a write may hold reads off |
 | `write_settle_delay` | `50` | Wait after a write before reading the register back |
-| `write_resettle_delay` | `5000` | Wait before a second read-back, for values that lag; 0 disables |
+| `write_resettle_delay` | `5000` | Wait before a second read-back, for values that lag; `0` disables it |
 | `xonxoff` / `dsrdtr` | `false` | Not supported by the driver; `true` is warned about and has no effect |
 
 ### MQTT
@@ -436,7 +456,7 @@ told to publish to cannot drift from the one the gateway listens on.
 | `logging.console_logging` | `true` | Console output; disabling both sinks is rejected |
 | `logging.file_logging` / `log_file` | `false` / `-` | File output; `-` or empty disables it |
 | `ha_discovery.enabled` / `prefix` | `true` / `homeassistant` | Discovery |
-| `ha_discovery.expire_after` | `2.5 x read_interval` | Seconds before an entity is shown unavailable |
+| `ha_discovery.expire_after` | `2.5 x read_interval` | Seconds before an entity is shown unavailable; `0` omits it, so entities never expire |
 
 Options removed with the serial rework are reported as warnings at startup rather than
 silently ignored: `max_retries`, `read_max_retries`, `write_max_retries`,
