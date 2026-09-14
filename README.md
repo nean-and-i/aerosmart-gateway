@@ -9,13 +9,13 @@ A Go-based gateway application that communicates with Drexel&Weiss Aerosmart M v
 - **Serial Communication**: Reads and writes to Aerosmart M device via serial over [USB located on Mainboard - refer to INSTALLATION.md](docs/INSTALLATION.md). NOTE: It is **NOT** Modbus RTU, no modbus settings required.
 - **MQTT Integration**: Publishes sensor data and subscribes to control commands
 - **MQTT Resilience**:
-  - **Persistent Session**: Subscriptions preserved across reconnects (CleanSession=false)
-  - **Auto-Recovery**: Automatically re-subscribes to topics after connection loss
+  - **Clean Session**: The broker does not queue commands while the gateway is offline, so an hours-old command is never replayed at startup
+  - **Auto-Recovery**: Subscriptions are restored explicitly once the connection returns
   - **Configurable QoS**: Supports QoS 0, 1, or 2 (default: 1 for at-least-once delivery)
   - **KeepAlive Monitoring**: Detects network failures within 30-60 seconds
   - **Connection State Visibility**: Logs reconnection progress and state changes
   - **Publish Retry**: Automatic retry with exponential backoff for failed publishes
-- **Home Assistant Discovery**: Auto-discovers sensors and switches in Home Assistant
+- **Home Assistant Discovery**: Auto-discovers sensors, switches and number entities in Home Assistant
 - **Derived Calculations**: Calculates derived values (e.g., zuluftabluftprozent, co2luefterstufe4)
 - **Configurable Logging**: Supports debug, info, warn, and error log levels
 - **Graceful Shutdown**: Handles SIGINT and SIGTERM signals for clean shutdown
@@ -167,6 +167,7 @@ For detailed information about the application flow and timing diagrams, see:
 |--------|-------------|---------|
 | `-config` | Path to config file | `config.yaml` |
 | `-registers` | Path to registers file | `registers.yaml` |
+| `-validate` | Validate both files and exit, without opening the port or the broker | `false` |
 | `-version` | Show version information | `false` |
 
 ## Configuration Options
@@ -191,7 +192,7 @@ All timeouts are in milliseconds.
 | `serial.health_check_interval` | How often port health is polled | `1000` |
 | `serial.write_priority_timeout` | Upper bound on how long a write may hold reads off | `10000` |
 | `serial.write_settle_delay` | Wait after writing before reading the register back | `50` |
-| `serial.write_resettle_delay` | Wait before a second read-back, for values that trail the command; 0 disables | `5000` |
+| `serial.write_resettle_delay` | Wait before a second read-back, for values that trail the command; `0` disables it | `5000` |
 | `serial.xonxoff` | Software flow control. **Not supported by the driver**; `true` is reported as a warning and has no effect | `false` |
 | `serial.dsrdtr` | Hardware flow control. **Not supported by the driver**; warned about, no effect | `false` |
 
@@ -227,7 +228,7 @@ a configuration from an earlier release still starts — it just tells you what 
 | `mqtt.connect_retry_max_delay_ms` | Maximum delay for exponential backoff | `30000ms` |
 | `mqtt.connect_retry_jitter_percent` | Jitter percentage for backoff | `25%` |
 
-> **MQTT Resilience Note:** The gateway uses the configured QoS level (default: 1, at-least-once delivery) for subscriptions and publishes to ensure message reliability. Persistent sessions (CleanSession=false) preserve subscriptions across reconnects. KeepAlive is set to 30 seconds for fast disconnect detection.
+> **MQTT Resilience Note:** The gateway uses the configured QoS level (default: 1, at-least-once delivery) for subscriptions and publishes. A **clean session** is used deliberately: a persistent session lets the broker queue commands while the gateway is offline and replay them at startup, which would apply an hours-old fan command to a running unit. Subscriptions are therefore restored explicitly in the connect handler rather than by the broker. KeepAlive is 30 seconds for fast disconnect detection.
 
 ### Application Configuration
 
@@ -238,6 +239,7 @@ a configuration from an earlier release still starts — it just tells you what 
 | `read_interval` | Read interval (seconds) | `60` |
 | `ha_discovery.enabled` | Enable HA discovery | `true` |
 | `ha_discovery.prefix` | HA discovery topic prefix | `homeassistant` |
+| `ha_discovery.expire_after` | Seconds without an update before an entity is shown unavailable; `0` omits it, so entities never expire | `2.5 x read_interval` |
 | `ha_discovery.device_info.name` | Device display name | `Aerosmart Gateway` |
 | `ha_discovery.device_info.manufacturer` | Device manufacturer | `Drexel und Weiss` |
 | `ha_discovery.device_info.model` | Device model | `aerosmartPI` |
@@ -285,7 +287,8 @@ The gateway calculates and publishes derived values:
 When `ha_discovery.enabled` is set to `true`, the gateway automatically publishes discovery configurations to Home Assistant. This creates:
 
 - **Sensors**: For all read registers (temperature, CO2, fan speed, etc.)
-- **Switches**: For write registers (fan stage, boiler heating element)
+- **Switches**: For write registers spanning exactly `0`-`1` (boiler heating element)
+- **Numbers**: For write registers spanning a wider range (fan stage, `0`-`5`). Publishing these as switches made Home Assistant send `ON`/`OFF`, which the device rejects
 
 The devices will appear in Home Assistant with the name "Aerosmart Gateway".
 
@@ -318,8 +321,10 @@ Example of Home Assistant dashboard:
    mode the unit changed by itself - party mode expiring, or the panel being used - reaches
    Home Assistant, and the entities are restored after a restart
 5. Derived values are computed from that same snapshot and published
-6. A cancelled cycle publishes nothing, including one cancelled after its last read, so a
-   preempting write's fresher values are not overwritten
+6. A cancelled cycle publishes nothing, whether it was cancelled during the reads, after
+   the last one, or partway through publishing. A write preempting the publish phase — 30+
+   broker round trips — would otherwise have its fresher values overwritten by the rest of
+   the stale snapshot
 
 ### Write Operation
 
@@ -425,14 +430,39 @@ The `registers.yaml` file defines:
 - **Write Registers**: Values that can be written to the device
 - **Derived Registers**: Calculated values based on read registers
 
-Each register has:
-- `name`: Unique identifier
-- `command`: Serial command to send
-- `topic`: MQTT topic for publishing/subscribing
+Fields common to every register:
+
+- `name`: Unique identifier, and the name other entries refer to
+- `topic`: MQTT topic the value is published on
+- `ha`: Home Assistant discovery configuration (`name`, and for read/derived registers
+  `device_class` and `unit`)
+
+Read registers additionally take:
+
+- `command`: Serial command to send, as `<node> <register>`
 - `divisor`: Value divisor (for float conversion)
-- `type`: Value type (integer or float)
-- `min_value` / `max_value`: Valid range
-- `ha`: Home Assistant configuration
+- `type`: Value type (`integer` or `float`)
+- `min_value` / `max_value`: Valid range; a reading outside it is not published
+
+Write registers additionally take:
+
+- `command_template`: Serial command with a `{value}` placeholder
+- `subscribe_topic`: MQTT topic the gateway accepts commands on. This is also the Home
+  Assistant command topic, so the two cannot drift apart
+- `min_value` / `max_value`: Accepted range. A span of exactly `0`-`1` becomes a switch,
+  anything wider becomes a number entity
+- `state_from`: The read register that carries this register's real value. The unit reports
+  a setpoint on a different address than the one it is written to — `luefterstufe` is
+  written on `5002` and read back on `5003` — so this is what makes the state topic show
+  what the unit actually holds rather than what was asked of it. Optional; without it the
+  commanded value is published
+- `verify_registers`: Read registers to read back and publish after a write, used to
+  confirm the write took effect
+
+Derived registers additionally take:
+
+- `formula`: Expression evaluated over the current snapshot
+- `sources`: The read registers the formula needs
 
 ## License
 

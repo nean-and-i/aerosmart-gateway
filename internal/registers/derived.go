@@ -1,6 +1,7 @@
 package registers
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math"
@@ -163,10 +164,15 @@ func (d *DerivedCalculator) Validate() error {
 	return nil
 }
 
-// PublishAll publishes valid derived register values.
-func (d *DerivedCalculator) PublishAll(values map[string]*RegisterValue) error {
+// PublishAll publishes valid derived register values, stopping if the cycle is
+// cancelled partway through: these are computed from a snapshot a preempting
+// write has already moved past.
+func (d *DerivedCalculator) PublishAll(ctx context.Context, values map[string]*RegisterValue) error {
 	var firstErr error
 	for name, regVal := range values {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if regVal == nil || !regVal.Valid {
 			continue
 		}

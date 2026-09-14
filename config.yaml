@@ -24,7 +24,10 @@ serial:
 
   # Attempts per register operation, and the delay between them. This is the
   # only retry level in the stack: worst case per register is
-  # retries * (response_timeout + retry_backoff) = 3 * 400ms = 1.2s.
+  # retries * (response_timeout + read_timeout + retry_backoff)
+  #   = 3 * (300 + 200 + 100) = 1.8s.
+  # An attempt can pass its response deadline only after a read that already
+  # started, and that read blocks for a whole read_timeout, hence its term.
   retries: 3
   retry_backoff: 100
 
@@ -48,7 +51,8 @@ serial:
   # values trail the command: 60ms after a stage change the actual fan stage
   # (130 1067) still reported the previous value, so the first read-back
   # publishes a number the unit is already moving away from. Repeated changes
-  # restart this wait, so one read happens after they stop. 0 disables it.
+  # restart this wait, so one read happens after they stop. Set to 0 to
+  # disable the second read entirely.
   write_resettle_delay: 5000
 
 mqtt:
@@ -98,7 +102,8 @@ ha_discovery:
   prefix: "homeassistant"
 
   # Seconds without an update before an entity is shown unavailable rather
-  # than displaying a stale retained value. Defaults to 2.5x read_interval.
+  # than displaying a stale retained value. Defaults to 2.5x read_interval;
+  # set to 0 to leave entities available indefinitely.
   expire_after: 300
 
   device_info:

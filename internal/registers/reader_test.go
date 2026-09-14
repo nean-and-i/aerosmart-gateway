@@ -88,6 +88,9 @@ type fakePublisher struct {
 	published map[string]string
 	order     []string
 	err       error
+	// beforePublish fires before each publish is recorded, so a test can
+	// disturb the cycle partway through its publish phase.
+	beforePublish func(topic string)
 }
 
 func newFakePublisher() *fakePublisher {
@@ -96,6 +99,13 @@ func newFakePublisher() *fakePublisher {
 
 func (p *fakePublisher) Publish(topic, value string) error {
 	p.mu.Lock()
+	hook := p.beforePublish
+	p.mu.Unlock()
+	if hook != nil {
+		hook(topic)
+	}
+
+	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.err != nil {
 		return p.err
@@ -103,6 +113,13 @@ func (p *fakePublisher) Publish(topic, value string) error {
 	p.published[topic] = value
 	p.order = append(p.order, topic+"="+value)
 	return nil
+}
+
+// count reports how many publishes were recorded.
+func (p *fakePublisher) count() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.order)
 }
 
 func (p *fakePublisher) get(topic string) (string, bool) {
@@ -302,7 +319,7 @@ func TestPublishAllSkipsInvalidValues(t *testing.T) {
 	r := NewReader(&fakeDevice{}, pub, testLogger(),
 		[]config.ReadRegisterConfig{fanReg, tempReg}, 1, time.Millisecond)
 
-	_ = r.PublishAll(map[string]*RegisterValue{
+	_ = r.PublishAll(context.Background(), map[string]*RegisterValue{
 		"luefterstatus": {Name: "luefterstatus", Value: "3", Valid: true},
 		"innentemp":     {Name: "innentemp", Value: "", Valid: false},
 	})
@@ -575,7 +592,7 @@ func TestDerivedSkipsRegistersWithMissingSources(t *testing.T) {
 	if v := values["co2luefterstufe4"]; v == nil || v.Valid {
 		t.Errorf("co2luefterstufe4 = %+v, want invalid", v)
 	}
-	if err := d.PublishAll(values); err != nil {
+	if err := d.PublishAll(context.Background(), values); err != nil {
 		t.Fatalf("PublishAll() error = %v", err)
 	}
 	if _, ok := pub.get("aerosmart/co2luefterstufe4"); ok {

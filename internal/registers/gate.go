@@ -21,6 +21,12 @@ type ReadGate struct {
 	cycleID uint64
 	until   time.Time
 	timeout time.Duration
+
+	// holds counts the callers currently suppressing reads. The command
+	// worker and the settle re-read run on separate goroutines and can hold
+	// the gate at the same time, so a plain flag let whichever finished first
+	// lift the other's hold and admit a cycle mid-write.
+	holds int
 }
 
 // NewReadGate returns a gate whose suppression expires after timeout.
@@ -63,11 +69,16 @@ func (g *ReadGate) TryBeginCycle(parent context.Context) (context.Context, conte
 }
 
 // Preempt cancels the in-flight read cycle and suppresses further cycles until
-// Release, or until the timeout elapses.
+// a matching Release, or until the timeout elapses.
+//
+// Each Preempt must be paired with exactly one Release.
 func (g *ReadGate) Preempt() {
 	g.mu.Lock()
 	cancel := g.cancel
 	g.cancel = nil
+	// Re-read the expiry from now: the deadline covers the newest holder's
+	// work, not whatever remained of an earlier one's.
+	g.holds++
 	g.until = time.Now().Add(g.timeout)
 	g.mu.Unlock()
 
@@ -76,10 +87,15 @@ func (g *ReadGate) Preempt() {
 	}
 }
 
-// Release lifts suppression so read cycles can resume.
+// Release gives up one hold, lifting suppression once the last one is gone.
 func (g *ReadGate) Release() {
 	g.mu.Lock()
-	g.until = time.Time{}
+	if g.holds > 0 {
+		g.holds--
+	}
+	if g.holds == 0 {
+		g.until = time.Time{}
+	}
 	g.mu.Unlock()
 }
 
@@ -91,12 +107,16 @@ func (g *ReadGate) Suppressed() bool {
 }
 
 // suppressedLocked clears expired suppression as a side effect.
+//
+// The deadline also drops every outstanding hold: it exists so a Release that
+// never happens cannot wedge polling, which a surviving count would defeat.
 func (g *ReadGate) suppressedLocked() bool {
 	if g.until.IsZero() {
 		return false
 	}
 	if !time.Now().Before(g.until) {
 		g.until = time.Time{}
+		g.holds = 0
 		return false
 	}
 	return true

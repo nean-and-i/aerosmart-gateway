@@ -76,15 +76,35 @@ func (p *Poller) RunCycle(ctx context.Context) error {
 		return err
 	}
 
-	if err := p.reader.PublishAll(values); err != nil {
-		p.logger.Error("Failed to publish some register values: %v", err)
+	// The same applies once publishing has started. It is 30+ broker round
+	// trips, each bounded only by op_timeout, so a write has plenty of room to
+	// land mid-phase; every phase below stops as soon as that happens.
+	preempted := func() bool {
+		if cycleCtx.Err() == nil {
+			return false
+		}
+		p.logger.Info("=== Read cycle preempted while publishing, discarding the rest of the snapshot ===")
+		return true
 	}
 
-	p.publishWriteRegisterState(values)
+	if err := p.reader.PublishAll(cycleCtx, values); err != nil && cycleCtx.Err() == nil {
+		p.logger.Error("Failed to publish some register values: %v", err)
+	}
+	if preempted() {
+		return cycleCtx.Err()
+	}
+
+	p.publishWriteRegisterState(cycleCtx, values)
+	if preempted() {
+		return cycleCtx.Err()
+	}
 
 	if p.derived != nil {
-		if err := p.derived.PublishAll(p.derived.Calculate(values)); err != nil {
+		if err := p.derived.PublishAll(cycleCtx, p.derived.Calculate(values)); err != nil && cycleCtx.Err() == nil {
 			p.logger.Error("Failed to publish derived register values: %v", err)
+		}
+		if preempted() {
+			return cycleCtx.Err()
 		}
 	}
 
@@ -93,8 +113,15 @@ func (p *Poller) RunCycle(ctx context.Context) error {
 
 // publishWriteRegisterState republishes each write register's state from the
 // read register that carries its real value.
-func (p *Poller) publishWriteRegisterState(values map[string]*RegisterValue) {
+//
+// It stops on cancellation for the same reason as the rest of the publish
+// phase: a preempting write has just published a fresher value to exactly
+// these topics.
+func (p *Poller) publishWriteRegisterState(ctx context.Context, values map[string]*RegisterValue) {
 	for _, reg := range p.writeRegisters {
+		if ctx.Err() != nil {
+			return
+		}
 		if reg.StateFrom == "" || reg.Topic == "" {
 			continue
 		}

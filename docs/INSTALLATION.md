@@ -101,7 +101,9 @@ serial:
   response_timeout: 300
 
   # Attempts per register operation and the delay between them. This is the
-  # only retry level: worst case per register is 3 x (300 + 100) = 1.2s.
+  # only retry level: worst case per register is
+  # retries x (response_timeout + read_timeout + retry_backoff)
+  #   = 3 x (300 + 200 + 100) = 1.8s.
   retries: 3
   retry_backoff: 100
 
@@ -114,6 +116,17 @@ serial:
 
   # Upper bound on how long an in-flight write may hold reads off.
   write_priority_timeout: 10000
+
+  # How long to wait after writing a register before reading it back. The
+  # unit applies writes but does not reliably echo them, so the read-back is
+  # what confirms a write took effect.
+  write_settle_delay: 50
+
+  # How long after a write to read the affected registers a second time.
+  # Some values trail the command, so the first read-back can publish a
+  # number the unit is already moving away from. Repeated changes restart
+  # this wait. Set to 0 to disable the second read.
+  write_resettle_delay: 5000
 
 # MQTT broker configuration
 mqtt:
@@ -302,17 +315,19 @@ If you're using Home Assistant with the built-in MQTT broker:
 
 The gateway implements several features to ensure reliable MQTT communication:
 
-#### Persistent Session
-The gateway uses `CleanSession=false` to preserve subscriptions across reconnects. This means:
-- Subscriptions are automatically restored when the connection is re-established
-- No manual re-subscription is needed after network interruptions or broker restarts
+#### Clean Session
+The gateway connects with `CleanSession=true`, deliberately. A persistent session lets the
+broker queue commands while the gateway is offline and deliver them all at once on reconnect,
+which would apply an hours-old fan command to a running unit. The broker therefore keeps no
+state for the gateway, and subscriptions are restored by the gateway itself.
 
 #### Auto-Recovery
 When the MQTT connection is lost, the gateway automatically:
 1. Detects the disconnection (via KeepAlive or connection lost handler)
 2. Initiates reconnection with exponential backoff
-3. Re-subscribes to all previously subscribed topics
-4. Continues normal operation
+3. Re-subscribes to every tracked topic in its connect handler, continuing past individual
+   failures so one bad topic cannot leave the rest unsubscribed
+4. Re-announces `online` on the availability topic and continues normal operation
 
 #### KeepAlive Monitoring
 The gateway sends periodic keepalive packets every 30 seconds to:
@@ -323,11 +338,11 @@ The gateway sends periodic keepalive packets every 30 seconds to:
 #### Connection State Logging
 The gateway logs connection state changes for monitoring:
 ```
-MQTT attempting to reconnect...
-MQTT connection state: Connecting
-MQTT connection state: Connected
-MQTT recovering X subscriptions...
-MQTT all subscriptions recovered
+MQTT connection lost: <error>
+MQTT reconnecting to tcp://192.168.1.20:1883...
+MQTT connected to tcp://192.168.1.20:1883
+MQTT restoring 2 subscription(s)...
+MQTT all subscriptions restored
 ```
 
 #### Publish Retry
@@ -528,9 +543,16 @@ When `ha_discovery.enabled: true` is set in the configuration, the gateway autom
 - Fan speeds and percentages
 - Status flags
 
-**Switches** (for each write register):
-- Fan stage control
+**Switches** (for a write register spanning exactly `0`-`1`):
 - Boiler heating element control
+
+**Numbers** (for a write register spanning a wider range):
+- Fan stage control (`0`-`5`). This is a number rather than a switch because a switch made
+  Home Assistant send `ON`/`OFF`, which the device rejects
+
+Each write register's state topic is republished on every read cycle from its `state_from`
+register, so a change made at the unit's own panel — or party mode expiring by itself —
+reaches Home Assistant instead of the entity showing the last value written.
 
 ### Manual Configuration
 
@@ -548,7 +570,7 @@ Check the MQTT topics for discovery messages:
 mosquitto_sub -t "homeassistant/#" -v
 ```
 
-You should see config messages for each sensor and switch.
+You should see config messages for each sensor, switch and number entity.
 
 ---
 
@@ -591,15 +613,17 @@ sudo usermod -a -G dialout $USER
 - Check network connectivity
 - The application will automatically reconnect
 - Check logs for reconnection progress:
-  - "MQTT attempting to reconnect..."
-  - "MQTT connection state: Connected"
-  - "MQTT all subscriptions recovered"
+  - "MQTT reconnecting to ..."
+  - "MQTT connected to ..."
+  - "MQTT all subscriptions restored"
 
 **Problem**: Subscriptions not restored after reconnect
 
-- Ensure broker supports persistent sessions
-- Check that CleanSession is not being cleared on the broker
-- Verify logs show "MQTT all subscriptions recovered"
+- The gateway uses a clean session, so restoring subscriptions is its own job, not the
+  broker's; broker-side session persistence is irrelevant here
+- Look for "MQTT failed to restore subscription to <topic>", which names the topic and the
+  error, and for "MQTT restored N/M subscription(s)"
+- Verify logs show "MQTT all subscriptions restored"
 
 **Problem**: Slow disconnect detection
 
@@ -607,10 +631,15 @@ sudo usermod -a -G dialout $USER
 - Network failures may take 30-60 seconds to detect
 - This is by design to avoid false positives
 
-**Problem**: Messages not delivered after reconnect
+**Problem**: Commands sent while the gateway was offline never arrive
 
-- Ensure broker persistence is enabled
-- Check publish retry count in configuration
+- This is intended. The clean session means the broker discards commands published while
+  the gateway is down, rather than replaying an hours-old fan command at startup
+- Re-send the command once the logs show "MQTT all subscriptions restored"
+
+**Problem**: Published values not reaching Home Assistant after reconnect
+
+- Check `mqtt.publish_retry_count` and `mqtt.op_timeout` in the configuration
 - Verify QoS settings match your requirements
 
 ### Data Issues

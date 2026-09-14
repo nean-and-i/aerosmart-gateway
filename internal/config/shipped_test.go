@@ -39,3 +39,33 @@ func TestShippedConfigsValidate(t *testing.T) {
 		t.Logf("deprecated: %s", note)
 	}
 }
+
+// TestExampleConfigIsCurrent checks config/config.yaml.example, which the README
+// tells users to copy over config.yaml. It went stale once, still carrying keys
+// from the pre-rework retry scheme, so a fresh copy started with a screen of
+// deprecation warnings. Validating it here keeps it in step with the schema.
+func TestExampleConfigIsCurrent(t *testing.T) {
+	const path = "../../config/config.yaml.example"
+	if _, err := os.Stat(path); err != nil {
+		t.Skipf("%s not present: %v", path, err)
+	}
+
+	ac, err := LoadAppConfig(path)
+	if err != nil {
+		t.Fatalf("LoadAppConfig() error = %v", err)
+	}
+	if err := ac.Validate(); err != nil {
+		t.Errorf("config.yaml.example is invalid:\n%v", err)
+	}
+	// Copying the example must not produce a configuration that immediately
+	// complains: every warning here is a key the example should not ship.
+	for _, note := range ac.Warnings() {
+		t.Errorf("config.yaml.example still carries a warned-about setting: %s", note)
+	}
+
+	if rc, err := LoadRegistersConfig("../../registers.yaml"); err == nil {
+		if err := ac.ValidateCycleBudget(len(rc.ReadRegisters)); err != nil {
+			t.Errorf("example retry budget does not fit its read interval:\n%v", err)
+		}
+	}
+}

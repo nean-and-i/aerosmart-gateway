@@ -131,13 +131,34 @@ make a dead sensor look alive.
          ├─ parse + range-check         (BEFORE touching the read cycle)
          ├─ dedupe check
          ├─ Preempt ──────────────▶│    cancels any in-flight cycle
- ~1ms    ├─ "130 5002 3" ───────────────────────────▶│
-         │◀─ echo "130 5002 3" ─────────────────────┤ ~40ms
- ~45ms   ├─ publish own state topic ──────────────────────────────▶│
-         ├─ read luefterstatus ─────────────────────▶│ ~40ms
-         ├─ publish verified value ──────────────────────────────▶│
- ~130ms  └─ Release (deferred: happens on EVERY exit path)
+         ├─ bump write sequence          (supersedes an earlier settle re-read)
+ ~1ms    ├─ "130 5002 3" ───────────────────────────▶│  sent ONCE, no echo awaited
+         ├─ remember as sent             (dedupe compares against what went out)
+ ~50ms   ├─ wait write_settle_delay
+         ├─ read lueftermode ───────────────────────▶│ ~40ms   state_from
+         ├─ read luefterstatus ─────────────────────▶│ ~40ms   verify_registers
+         │                                  (each read-back register read ONCE)
+ ~130ms  ├─ publish lueftermode's value to the state topic ──────▶│
+         ├─ publish each read-back register to its own topic ────▶│
+         └─ Release (deferred: happens on EVERY exit path)
+         ┆
+         ┆  schedule(register, seq)                 write_resettle_delay
+         ┆
+ ~5.1s   ├─ still the newest command for this register? ── no ──▶ skip
+         ├─ Preempt, re-read lueftermode + luefterstatus ──▶│
+         └─ republish ──────────────────────────────────────────▶│
 ```
+
+Nothing waits for an echo: the unit applies a write whether or not it confirms it, so the
+read-back of `state_from` and `verify_registers` is what makes a write trustworthy, and the
+command is never re-sent. The value published to the state topic is `state_from`'s — what
+the unit actually holds — not the value that was asked for, so a rejected command shows up
+as the unit's own value rather than a lie.
+
+The second pass exists because some values trail the command: 60 ms after a stage change,
+`luefterstatus` still reported the previous stage. A further command for the same register
+bumps the sequence and cancels the pending re-read, so a burst of changes costs one extra
+read after it stops rather than one per command.
 
 A malformed payload (`"ON"`, out of range, unknown topic) returns before `Preempt`, so it
 never disturbs a readout.
@@ -270,7 +291,8 @@ Completion is signalled *after* teardown, so the watchdog covers the real work.
 | One register including retries | ~40ms | `retries x (response_timeout + read_timeout + retry_backoff)` = 1.8s |
 | Full cycle, 29 registers, healthy | ~1.2s | — |
 | Full cycle, silent device | — | 52.2s (must fit `read_interval`) |
-| Write with verification | ~130ms | ~2.4s (command + one verify register) |
+| Write with read-back | ~130ms | command + one register per read-back, each up to 1.8s |
+| Settle re-read after a write | ~80ms, `write_resettle_delay` later | restarted by a further command for the same register |
 | Write preempting a cycle | ~300ms to yield | one `response_timeout` |
 | Cycle skipped (write pending / port recovering) | immediate | retried after 5s |
 | MQTT publish | ~1ms | `op_timeout` (hand-off) + `op_timeout` (ack), x `publish_retry_count` |

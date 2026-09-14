@@ -187,11 +187,19 @@ func (r *Reader) ReadAll(ctx context.Context) (map[string]*RegisterValue, error)
 // PublishAll publishes valid register values. Invalid values are skipped: with
 // retained MQTT messages, republishing a stale reading would make a dead
 // sensor look alive. Home Assistant's expire_after handles the rest.
-func (r *Reader) PublishAll(values map[string]*RegisterValue) error {
+//
+// Publishing 30+ registers is 30+ bounded broker round trips, so a write can
+// preempt the cycle partway through. It stops there and reports the
+// cancellation: the rest of the snapshot is older than the values that write
+// has just published, and would overwrite them.
+func (r *Reader) PublishAll(ctx context.Context, values map[string]*RegisterValue) error {
 	var firstErr error
 	skipped := 0
 
 	for name, regVal := range values {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if regVal == nil || !regVal.Valid {
 			skipped++
 			continue
