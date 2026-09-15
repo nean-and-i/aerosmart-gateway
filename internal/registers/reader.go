@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"math"
 	"strconv"
-	"sync"
 	"time"
 
 	"github.com/nean/aerosmart-gateway/internal/config"
@@ -52,9 +51,6 @@ type Reader struct {
 	// only retry level: nesting retries multiplies the worst case into hours.
 	retries int
 	backoff time.Duration
-
-	mu     sync.RWMutex
-	values map[string]*RegisterValue
 }
 
 // NewReader creates a register reader. retries counts total attempts per
@@ -75,7 +71,6 @@ func NewReader(dev Transactor, pub Publisher, log *logger.Logger, registers []co
 		byName:    byName,
 		retries:   retries,
 		backoff:   backoff,
-		values:    make(map[string]*RegisterValue),
 	}
 }
 
@@ -122,11 +117,17 @@ func (r *Reader) readSingleRaw(ctx context.Context, register config.ReadRegister
 		}
 
 		lastErr = err
-		r.logger.SerialOperation("READ", register.Command, "", duration, err)
 
+		// A write preempting this read cancels ctx, and Transact reports that
+		// as an ordinary error. Logging it through SerialOperation - the
+		// documented primary flaky-link diagnostic, at WARN - would mean
+		// every write pollutes it with a false alarm, drowning out genuine
+		// device problems. Check before logging, not after.
 		if ctx.Err() != nil {
+			r.logger.Debug("Read of %s cancelled: %v", register.Name, ctx.Err())
 			return "", "", ctx.Err()
 		}
+		r.logger.SerialOperation("READ", register.Command, "", duration, err)
 		if serial.IsPortError(err) {
 			break
 		}
@@ -176,10 +177,6 @@ func (r *Reader) ReadAll(ctx context.Context) (map[string]*RegisterValue, error)
 	}
 
 	r.logger.Info("=== SERIAL: Register read cycle completed in %v ===", time.Since(cycleStart))
-
-	r.mu.Lock()
-	r.values = results
-	r.mu.Unlock()
 
 	return results, nil
 }
@@ -236,7 +233,17 @@ func (r *Reader) processValue(rawValue string, register config.ReadRegisterConfi
 		floatVal /= float64(register.Divisor)
 	}
 
-	if register.Type == "float" {
+	return formatByType(floatVal, register.Type)
+}
+
+// formatByType renders a value the same way processValue does, once the
+// divisor - if any - has already been applied. It is also what a write
+// register's commanded value is formatted through before being compared
+// against a state_from reading: the command value is already in the read
+// register's processed (post-divisor) units, so only the type formatting,
+// not the divisor, applies to it.
+func formatByType(floatVal float64, registerType string) string {
+	if registerType == "float" {
 		return fmt.Sprintf("%.1f", math.Round(floatVal*10)/10)
 	}
 	return fmt.Sprintf("%.0f", math.Round(floatVal))

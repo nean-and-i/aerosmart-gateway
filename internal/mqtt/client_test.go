@@ -168,12 +168,31 @@ func TestPublishFailsFastWhileDisconnected(t *testing.T) {
 	if err := c.Publish("aerosmart/co2", "812"); err == nil {
 		t.Fatal("Publish() error = nil, want a not-connected error")
 	}
-	// No broker interaction, so only the retry sleeps elapse (250+500ms).
-	if elapsed := time.Since(start); elapsed > 2*time.Second {
-		t.Errorf("Publish() took %v while disconnected, want well under 2s", elapsed)
+	// A disconnected broker is not going to reconnect faster because this
+	// call waited: retrying inline only stalls the caller, which runs on the
+	// serial read path. There must be no retry sleep at all.
+	if elapsed := time.Since(start); elapsed > 50*time.Millisecond {
+		t.Errorf("Publish() took %v while disconnected, want near-instant (no retry sleeps)", elapsed)
 	}
 	if fake.publishCount("aerosmart/co2") != 0 {
 		t.Error("published while disconnected")
+	}
+}
+
+// A cycle publishes dozens of topics; sleeping through the retry backoff on
+// every one of them while the broker is known to be down would stall the
+// serial read path for tens of seconds for nothing. One disconnected publish
+// must cost nothing beyond the call itself, whatever the retry count.
+func TestPublishDoesNotSleepAcrossRetriesWhileDisconnected(t *testing.T) {
+	fake := &fakePaho{connected: false}
+	c := testClient(t, fake)
+
+	start := time.Now()
+	for i := 0; i < 20; i++ {
+		_ = c.Publish("aerosmart/co2", "812")
+	}
+	if elapsed := time.Since(start); elapsed > 200*time.Millisecond {
+		t.Errorf("20 disconnected publishes took %v, want near-instant", elapsed)
 	}
 }
 
@@ -287,6 +306,73 @@ func TestPublishDiscoveryMarshalsAndRetains(t *testing.T) {
 	}
 	if !fake.publishes[0].retain {
 		t.Error("discovery was not retained; Home Assistant would lose entities on restart")
+	}
+}
+
+// Clearing a stale discovery entry is a retained publish of an empty payload:
+// that is what tells Home Assistant to forget it, rather than merely stop
+// updating it.
+func TestClearDiscoveryPublishesEmptyRetainedPayload(t *testing.T) {
+	fake := &fakePaho{connected: true}
+	c := testClient(t, fake)
+
+	topic := "homeassistant/switch/aerosmart/aerosmart_luefterstufe/config"
+	if err := c.ClearDiscovery(topic); err != nil {
+		t.Fatalf("ClearDiscovery() error = %v", err)
+	}
+
+	if len(fake.publishes) != 1 {
+		t.Fatalf("publishes = %d, want 1", len(fake.publishes))
+	}
+	got := fake.publishes[0]
+	if got.topic != topic {
+		t.Errorf("topic = %q, want %q", got.topic, topic)
+	}
+	if got.payload != "" {
+		t.Errorf("payload = %q, want empty; a non-empty payload would not remove the entity", got.payload)
+	}
+	if !got.retain {
+		t.Error("clear was not retained; Home Assistant would not forget the stale entity")
+	}
+}
+
+// Publishing a write register's discovery config must also clear whatever
+// component it is NOT published as, or an upgrade that moves a register
+// between switch and number leaves the stale entity retained forever.
+func TestPublishCommandConfigClearsTheStaleComponent(t *testing.T) {
+	fake := &fakePaho{connected: true}
+	c := testClient(t, fake)
+	d := Discovery{DeviceID: "aerosmart", Prefix: "homeassistant"}
+	reg := config.WriteRegisterConfig{Name: "luefterstufe", MinValue: 0, MaxValue: 5}
+
+	component, err := c.PublishCommandConfig(d, reg)
+	if err != nil {
+		t.Fatalf("PublishCommandConfig() error = %v", err)
+	}
+	if component != "number" {
+		t.Errorf("component = %q, want number", component)
+	}
+
+	wantCurrent := "homeassistant/number/aerosmart/aerosmart_luefterstufe/config"
+	wantStale := "homeassistant/switch/aerosmart/aerosmart_luefterstufe/config"
+
+	if fake.publishCount(wantCurrent) != 1 {
+		t.Errorf("publishes to %s = %d, want 1", wantCurrent, fake.publishCount(wantCurrent))
+	}
+	if fake.publishCount(wantStale) != 1 {
+		t.Errorf("publishes to %s = %d, want 1 (the stale switch entry must be cleared)", wantStale, fake.publishCount(wantStale))
+	}
+
+	fake.mu.Lock()
+	var stalePayload string
+	for _, p := range fake.publishes {
+		if p.topic == wantStale {
+			stalePayload = p.payload
+		}
+	}
+	fake.mu.Unlock()
+	if stalePayload != "" {
+		t.Errorf("stale clear payload = %q, want empty", stalePayload)
 	}
 }
 

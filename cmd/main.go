@@ -203,11 +203,6 @@ func run() error {
 
 	derivedCalc = registers.NewDerivedCalculator(mqttClient, log, registersConfig.DerivedRegisters)
 
-	if appConfig.HADiscovery.Enabled {
-		log.Info("Publishing Home Assistant discovery configs...")
-		publishHADiscovery(mqttClient, registersConfig, appConfig, log)
-	}
-
 	gate := registers.NewReadGate(msDuration(appConfig.Serial.WritePriorityTimeout))
 	retries := appConfig.Serial.Retries
 	backoff := msDuration(appConfig.Serial.RetryBackoff)
@@ -232,6 +227,11 @@ func run() error {
 		commands.run(ctx, writer.HandleMessage)
 	})
 
+	// Subscribed before discovery is published: with CleanSession(true) the
+	// broker holds no state for us, so a command arriving in the window
+	// between an entity being discovered and us actually listening for it is
+	// simply not delivered, silently, while Home Assistant already shows the
+	// entity as available.
 	if topics := writer.GetSubscribeTopics(); len(topics) > 0 {
 		log.Info("Subscribing to command topics: %v", topics)
 		for _, topic := range topics {
@@ -239,6 +239,11 @@ func run() error {
 				log.Error("Failed to subscribe to %s: %v", topic, err)
 			}
 		}
+	}
+
+	if appConfig.HADiscovery.Enabled {
+		log.Info("Publishing Home Assistant discovery configs...")
+		publishHADiscovery(mqttClient, registersConfig, appConfig, log)
 	}
 
 	log.Info("Starting periodic read loop (interval: %ds)", appConfig.ReadInterval)
@@ -465,9 +470,14 @@ func publishHADiscovery(client *mqtt.Client, registersConfig *config.RegistersCo
 		if reg.HA.Name == "" {
 			continue
 		}
-		component, topic, payload := discovery.CommandConfig(reg)
+		component, err := client.PublishCommandConfig(discovery, reg)
+		if err != nil {
+			log.Warn("Failed to publish discovery for %s: %v", reg.Name, err)
+			failed++
+			continue
+		}
 		log.Debug("Discovery: %s -> %s entity", reg.Name, component)
-		publish(reg.Name, topic, payload)
+		published++
 	}
 
 	for _, reg := range registersConfig.DerivedRegisters {

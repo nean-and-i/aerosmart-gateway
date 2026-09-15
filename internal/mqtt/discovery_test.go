@@ -151,3 +151,24 @@ func TestParseWriteRegisterCommand(t *testing.T) {
 		t.Errorf("ParseWriteRegisterCommand() = %q, want %q", got, "130 5002 3")
 	}
 }
+
+// A write register spanning exactly 0-1 becomes a switch; everything wider
+// becomes a number. Whichever it isn't must be cleared, so an install that
+// upgrades across that boundary - or across the switch-to-number change this
+// register went through - does not keep a stale retained entity that still
+// accepts commands the device rejects.
+func TestStaleCommandTopicsNamesTheOtherComponent(t *testing.T) {
+	numberReg := config.WriteRegisterConfig{Name: "luefterstufe", MinValue: 0, MaxValue: 5}
+	stale := testDiscovery().StaleCommandTopics(numberReg)
+
+	if len(stale) != 1 || stale[0] != "homeassistant/switch/aerosmart/aerosmart_luefterstufe/config" {
+		t.Errorf("stale topics = %v, want exactly the switch topic for a number entity", stale)
+	}
+
+	switchReg := config.WriteRegisterConfig{Name: "boilerheizstab", MinValue: 0, MaxValue: 1}
+	stale = testDiscovery().StaleCommandTopics(switchReg)
+
+	if len(stale) != 1 || stale[0] != "homeassistant/number/aerosmart/aerosmart_boilerheizstab/config" {
+		t.Errorf("stale topics = %v, want exactly the number topic for a switch entity", stale)
+	}
+}

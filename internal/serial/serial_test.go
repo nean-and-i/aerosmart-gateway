@@ -1,6 +1,9 @@
 package serial
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestParseResponse(t *testing.T) {
 	tests := []struct {
@@ -77,5 +80,17 @@ func TestParseResponseEdgeCases(t *testing.T) {
 	}
 	if value != "3" {
 		t.Errorf("Expected value 3, got %s", value)
+	}
+}
+
+// A ReopenBackoff configured above the 30s default must not make the
+// supervisor's doubling loop shrink on its first step: applyDefaults must
+// never leave MaxReopenBackoff below ReopenBackoff.
+func TestApplyDefaultsKeepsMaxReopenBackoffAboveReopenBackoff(t *testing.T) {
+	cfg := &Config{ReopenBackoff: time.Minute}
+	cfg.applyDefaults(nopLogger{})
+
+	if cfg.MaxReopenBackoff < cfg.ReopenBackoff {
+		t.Errorf("MaxReopenBackoff = %v, want at least ReopenBackoff (%v)", cfg.MaxReopenBackoff, cfg.ReopenBackoff)
 	}
 }

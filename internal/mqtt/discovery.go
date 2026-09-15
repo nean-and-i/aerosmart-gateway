@@ -66,6 +66,30 @@ type Discovery struct {
 	ExpireAfter int
 }
 
+// StaleCommandTopics returns the discovery topics of every component a write
+// register is NOT currently published as.
+//
+// A register can change which entity type it is published as - luefterstufe
+// moved from a switch to a number when this became range-aware rather than
+// always emitting a switch - and Home Assistant keeps a retained discovery
+// payload until something clears it. Left alone, an upgraded install ends up
+// with both entities: the stale one still accepts commands the device
+// rejects, which is the exact failure a range-aware component was meant to
+// fix.
+func (d Discovery) StaleCommandTopics(reg config.WriteRegisterConfig) []string {
+	_, current, _ := d.CommandConfig(reg)
+
+	stale := make([]string, 0, len(commandComponents)-1)
+	for _, component := range commandComponents {
+		topic := d.topic(component, d.uniqueID(reg.Name))
+		if topic == current {
+			continue
+		}
+		stale = append(stale, topic)
+	}
+	return stale
+}
+
 func (d Discovery) uniqueID(name string) string {
 	return fmt.Sprintf("%s_%s", d.DeviceID, name)
 }
@@ -113,6 +137,11 @@ func (d Discovery) DerivedSensorConfig(reg config.DerivedRegisterConfig) (string
 //
 // The command topic is always the writer's subscribe topic, so commands cannot
 // be sent somewhere nothing is listening.
+// commandComponents lists every discovery component a write register could
+// ever be published as. CommandConfig picks one of these; StaleCommandTopics
+// clears the rest.
+var commandComponents = []string{"switch", "number"}
+
 func (d Discovery) CommandConfig(reg config.WriteRegisterConfig) (string, string, any) {
 	uid := d.uniqueID(reg.Name)
 

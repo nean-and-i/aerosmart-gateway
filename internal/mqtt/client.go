@@ -10,6 +10,8 @@ import (
 	"time"
 
 	paho "github.com/eclipse/paho.mqtt.golang"
+
+	"github.com/nean/aerosmart-gateway/internal/config"
 )
 
 // Logger is the subset of logging this package needs.
@@ -305,16 +307,22 @@ func (c *Client) publishRetained(topic string, value string, retain bool) error 
 
 	var lastErr error
 	for attempt := 1; attempt <= attempts; attempt++ {
+		client := c.handle()
+		if client == nil || !client.IsConnected() {
+			// A disconnected broker will not reconnect any faster for this
+			// call having waited: reconnection is paho's own goroutine, and
+			// this runs on the serial read path. Retrying immediately just
+			// wastes the round trip; sleeping through every remaining
+			// attempt's backoff first would waste 750ms per topic, on every
+			// one of the dozens published each cycle.
+			return fmt.Errorf("publish to %s: not connected", topic)
+		}
+
 		if attempt > 1 {
 			if c.shuttingDown.Load() {
 				return lastErr
 			}
 			time.Sleep(time.Duration(attempt-1) * 250 * time.Millisecond)
-		}
-		client := c.handle()
-		if client == nil || !client.IsConnected() {
-			lastErr = fmt.Errorf("publish to %s: not connected", topic)
-			continue
 		}
 
 		token := client.Publish(topic, byte(c.config.QOS), retain, value)
@@ -372,6 +380,38 @@ func (c *Client) PublishDiscovery(topic string, payload any) error {
 	// Discovery is always retained so Home Assistant rediscovers the entities
 	// after a restart without the gateway republishing.
 	return c.publishRetained(topic, string(data), true)
+}
+
+// ClearDiscovery removes a discovery entry Home Assistant has retained.
+//
+// An empty retained payload is the documented way to tell Home Assistant to
+// forget an entity, as opposed to simply no longer updating it: a topic this
+// gateway stops publishing to otherwise keeps whatever was last retained
+// there forever, including across a broker restart.
+func (c *Client) ClearDiscovery(topic string) error {
+	return c.publishRetained(topic, "", true)
+}
+
+// PublishCommandConfig publishes a write register's discovery config and
+// clears any component it is not currently published as.
+//
+// A register can change which entity type it is published as - luefterstufe
+// moved from a switch to a number when component selection became
+// range-aware - and Home Assistant keeps whatever was last retained at the
+// old component's topic until something clears it. Left alone, an upgraded
+// install ends up with both entities, and the stale one still accepts
+// commands the device rejects.
+func (c *Client) PublishCommandConfig(d Discovery, reg config.WriteRegisterConfig) (string, error) {
+	component, topic, payload := d.CommandConfig(reg)
+	if err := c.PublishDiscovery(topic, payload); err != nil {
+		return component, err
+	}
+	for _, stale := range d.StaleCommandTopics(reg) {
+		if err := c.ClearDiscovery(stale); err != nil {
+			return component, fmt.Errorf("clear stale discovery %s: %w", stale, err)
+		}
+	}
+	return component, nil
 }
 
 // ParseWriteRegisterCommand fills a command template with a value.

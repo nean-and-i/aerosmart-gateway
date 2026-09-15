@@ -246,8 +246,22 @@ func (w *Writer) HandleMessage(ctx context.Context, topic string, message string
 		}
 	}
 
+	// actual has gone through the read pipeline's divisor and type
+	// formatting (e.g. "22.0" for a float register), while valueStr is the
+	// untouched MQTT payload (e.g. "22", or "022"). Comparing them directly
+	// only worked by coincidence, for every state_from register that happens
+	// to be a divisor-1 integer. expected renders the commanded value through
+	// the same type formatting state_from's reading went through, so the two
+	// are compared in the same representation.
+	expected := valueStr
+	if resolved && w.reader != nil {
+		if readReg, ok := w.reader.Register(register.StateFrom); ok {
+			expected = formatByType(float64(value), readReg.Type)
+		}
+	}
+
 	switch {
-	case resolved && actual != valueStr:
+	case resolved && actual != expected:
 		// The command went out but the unit is holding a different value.
 		w.logger.Warn("Wrote %s = %d but %s reports %s; the unit did not take the value",
 			register.Name, value, register.StateFrom, actual)
