@@ -96,7 +96,11 @@ func (c *Config) applyDefaults(log Logger) {
 		c.ReopenBackoff = 500 * time.Millisecond
 	}
 	if c.MaxReopenBackoff < c.ReopenBackoff {
-		c.MaxReopenBackoff = 30 * time.Second
+		// The 30s default only applies when it does not itself invert the
+		// bound: a ReopenBackoff configured above 30s must still get a
+		// MaxReopenBackoff at or above it, or the doubling loop shrinks on
+		// its very first step.
+		c.MaxReopenBackoff = max(30*time.Second, c.ReopenBackoff)
 	}
 	if c.HealthCheckInterval <= 0 {
 		c.HealthCheckInterval = time.Second

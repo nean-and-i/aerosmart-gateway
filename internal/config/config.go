@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -672,17 +671,4 @@ func (c *RegistersConfig) Warnings() []string {
 	}
 
 	return notes
-}
-
-// GetConfigPaths returns the default config file paths.
-func GetConfigPaths() (appConfigPath, registersConfigPath string) {
-	cwd, _ := os.Getwd()
-
-	appConfigPath = filepath.Join(cwd, "config", "config.yaml")
-	if _, err := os.Stat(appConfigPath); os.IsNotExist(err) {
-		appConfigPath = filepath.Join(cwd, "config.yaml")
-	}
-	registersConfigPath = filepath.Join(cwd, "registers.yaml")
-
-	return appConfigPath, registersConfigPath
 }

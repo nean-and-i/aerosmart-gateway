@@ -1,14 +1,40 @@
 package registers
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"io"
+	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/nean/aerosmart-gateway/internal/config"
+	"github.com/nean/aerosmart-gateway/internal/logger"
 )
+
+// captureStdout runs fn with os.Stdout redirected, and returns what it wrote.
+// Only safe because this package's tests never run in parallel.
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe() error = %v", err)
+	}
+	orig := os.Stdout
+	os.Stdout = w
+
+	fn()
+
+	os.Stdout = orig
+	w.Close()
+	var buf bytes.Buffer
+	io.Copy(&buf, r)
+	r.Close()
+	return buf.String()
+}
 
 // seqRecorder captures which write sequence each refresh was asked for.
 type seqRecorder struct {
@@ -219,5 +245,101 @@ func TestReadGateIgnoresUnmatchedRelease(t *testing.T) {
 
 	if !gate.Suppressed() {
 		t.Error("an unmatched release left the gate unable to suppress")
+	}
+}
+
+// A holder whose deadline expired must not be able to steal a later, still
+// live holder's suppression when it finally calls Release. Sequence: the
+// command worker Preempts and overruns write_priority_timeout; the deadline
+// sweep lifts suppression so polling can resume; the settle re-read then
+// Preempts for its own re-read; the overrun write finally returns and runs
+// its deferred Release. That Release must not lift the settle re-read's hold.
+func TestReadGateExpiredHolderReleaseDoesNotStealALaterHold(t *testing.T) {
+	gate := NewReadGate(30 * time.Millisecond)
+
+	gate.Preempt() // the command worker takes the gate
+
+	// The write overruns write_priority_timeout.
+	time.Sleep(50 * time.Millisecond)
+
+	// The poll loop observes the gate; the deadline sweep lifts suppression.
+	if gate.Suppressed() {
+		t.Fatal("expected suppression to have expired")
+	}
+
+	// The settle re-read now takes the gate.
+	gate.Preempt()
+
+	// The overrunning write finally finishes and runs its deferred Release.
+	gate.Release()
+
+	if !gate.Suppressed() {
+		t.Error("an expired holder's Release lifted a later holder's suppression")
+	}
+	if _, _, ok := gate.TryBeginCycle(context.Background()); ok {
+		t.Error("a read cycle started while the settle re-read still held the gate")
+	}
+}
+
+// The confirmation comparison must compare like with like: the raw MQTT
+// payload against a state_from value that has gone through the read
+// pipeline's divisor and type formatting. A state_from register with type
+// "float" formats even a whole-number reading with a decimal ("22.0"), which
+// never equals an unformatted payload ("22"), so a write that fully succeeded
+// would otherwise be reported as refused.
+func TestHandleMessageConfirmsAgainstAFloatStateFromRegister(t *testing.T) {
+	writeReg := config.WriteRegisterConfig{
+		Name:            "raumsolltempset",
+		CommandTemplate: "130 5017 {value}",
+		SubscribeTopic:  "dw/aerosmart/raumsolltempset",
+		Topic:           "aerosmart/raumsolltempset_state",
+		MinValue:        15,
+		MaxValue:        30,
+		StateFrom:       "raumsolltemp",
+	}
+	floatReadReg := config.ReadRegisterConfig{
+		Name: "raumsolltemp", Command: "130 5017", Topic: "aerosmart/raumsolltemp",
+		Divisor: 1, Type: "float", MinValue: 15, MaxValue: 40,
+	}
+
+	// The unit reports back exactly the commanded value, unscaled.
+	dev := &fakeDevice{responses: map[string]string{"130 5017": "22"}}
+	pub := newFakePublisher()
+	log := testLogger()
+	w := NewWriter(dev, pub, log, []config.WriteRegisterConfig{writeReg}, NewReadGate(time.Second), 3, time.Millisecond, time.Millisecond)
+	w.SetReader(NewReader(dev, pub, log, []config.ReadRegisterConfig{floatReadReg}, 1, time.Millisecond))
+
+	if err := w.HandleMessage(context.Background(), writeReg.SubscribeTopic, "22"); err != nil {
+		t.Fatalf("HandleMessage() error = %v, want a successful write confirmed by its float state_from", err)
+	}
+	if v, ok := pub.get(writeReg.Topic); !ok || v != "22.0" {
+		t.Errorf("state topic = %q (%v), want the formatted 22.0", v, ok)
+	}
+}
+
+// A read cancelled by a preempting write is routine, not a device failure.
+// SerialOperation logs a failed exchange at WARN, which is the documented
+// primary flaky-link diagnostic; every write would otherwise pollute it with
+// a false alarm, drowning out genuine device problems.
+func TestPreemptedReadDoesNotLogAsSerialFailure(t *testing.T) {
+	dev := &fakeDevice{block: make(chan struct{})}
+
+	var r *Reader
+	out := captureStdout(t, func() {
+		// The logger captures os.Stdout at construction time, so it must be
+		// built after the redirect, or its output bypasses the capture.
+		log := logger.NewWithConfig(logger.Config{Level: "warn", ConsoleLogging: true})
+		r = NewReader(dev, newFakePublisher(), log, []config.ReadRegisterConfig{fanReg}, 3, time.Millisecond)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() {
+			time.Sleep(10 * time.Millisecond)
+			cancel()
+		}()
+		_, _ = r.ReadSingle(ctx, fanReg)
+	})
+
+	if strings.Contains(out, "SERIAL") && strings.Contains(out, "FAILED") {
+		t.Errorf("a cancelled read was logged as a serial failure: %q", out)
 	}
 }

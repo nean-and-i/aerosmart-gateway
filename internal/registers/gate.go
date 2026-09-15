@@ -26,6 +26,13 @@ type ReadGate struct {
 	// worker and the settle re-read run on separate goroutines and can hold
 	// the gate at the same time, so a plain flag let whichever finished first
 	// lift the other's hold and admit a cycle mid-write.
+	//
+	// The deadline sweep never resets this: it only lifts suppression once
+	// its own window has passed. Zeroing it there let a holder whose window
+	// had already expired steal a later, still-live holder's suppression the
+	// moment its own deferred Release finally ran - Release is a plain
+	// decrement, so the sweep clearing it out from under a live holder is
+	// exactly what let that happen.
 	holds int
 }
 
@@ -106,17 +113,17 @@ func (g *ReadGate) Suppressed() bool {
 	return g.suppressedLocked()
 }
 
-// suppressedLocked clears expired suppression as a side effect.
-//
-// The deadline also drops every outstanding hold: it exists so a Release that
-// never happens cannot wedge polling, which a surviving count would defeat.
+// suppressedLocked clears an expired deadline as a side effect, which is what
+// stops a release that never happens from wedging polling. It leaves holds
+// untouched: a hold whose window has expired is still a real hold, and its
+// eventual Release must only ever decrement its own count, never zero a
+// count a later holder has since added to.
 func (g *ReadGate) suppressedLocked() bool {
 	if g.until.IsZero() {
 		return false
 	}
 	if !time.Now().Before(g.until) {
 		g.until = time.Time{}
-		g.holds = 0
 		return false
 	}
 	return true
