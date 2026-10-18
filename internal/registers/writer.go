@@ -169,8 +169,7 @@ func (w *Writer) HandleMessage(ctx context.Context, topic string, message string
 		return nil
 	}
 
-	valueStr := strings.TrimSpace(message)
-	value, err := strconv.Atoi(valueStr)
+	value, err := strconv.Atoi(strings.TrimSpace(message))
 	if err != nil {
 		w.logger.Error("MQTT: %s expects an integer, got %q", register.Name, message)
 		return fmt.Errorf("invalid value %q for %s: %w", message, register.Name, err)
@@ -180,6 +179,10 @@ func (w *Writer) HandleMessage(ctx context.Context, topic string, message string
 			value, register.Name, register.MinValue, register.MaxValue)
 		return fmt.Errorf("value %d out of range for %s", value, register.Name)
 	}
+
+	// The parsed number, not the payload, is what goes to the unit and what
+	// deduplication compares: "+3" and "03" are both 3.
+	valueStr := strconv.Itoa(value)
 
 	if w.isDuplicate(topic, valueStr) {
 		w.logger.Info("MQTT: dropping %s=%s, an identical command succeeded within %v",
@@ -199,95 +202,137 @@ func (w *Writer) HandleMessage(ctx context.Context, topic string, message string
 	// an earlier command knows it has been superseded.
 	seq := w.nextWriteSequence(register.Name)
 
-	sendStart := time.Now()
-	if err := w.sendCommand(ctx, command); err != nil {
-		w.logger.SerialSend(command, time.Since(sendStart), err)
-		w.logger.Error("Failed to send %s after %d attempt(s): %v", register.Name, w.retries, err)
-		// The sequence bump above already superseded any re-read the previous
-		// command scheduled, so returning here would drop it with nothing in
-		// its place and leave a lagging value unpublished until the next full
-		// cycle. A partial write may also have reached the unit, so reading
-		// the register again is the only way to learn what it is holding.
-		if w.resettle != nil {
-			w.resettle.schedule(register, seq)
+	// Whatever the outcome, read the register again once things settle. The
+	// sequence bump above cancelled any re-read an earlier command scheduled,
+	// some values trail the command, and after a failed, refused or
+	// unconfirmed write a later read is the only way to learn what the unit
+	// is actually holding.
+	if w.resettle != nil {
+		defer w.resettle.schedule(register, seq)
+	}
+
+	var result writeResult
+	for attempt := 1; attempt <= writeAttempts; attempt++ {
+		if attempt > 1 {
+			// A collision on the shared bus can corrupt the command on its
+			// way to the unit. Writes set an absolute value, so sending it
+			// again is harmless.
+			w.logger.Warn("Re-sending %s = %d: %v", register.Name, value, result.err)
 		}
-		return fmt.Errorf("write %s: %w", register.Name, err)
+
+		sendStart := time.Now()
+		if err := w.sendCommand(ctx, command); err != nil {
+			w.logger.SerialSend(command, time.Since(sendStart), err)
+			w.logger.Error("Failed to send %s after %d attempt(s): %v", register.Name, w.retries, err)
+			return fmt.Errorf("write %s: %w", register.Name, err)
+		}
+		w.logger.SerialSend(command, time.Since(sendStart), nil)
+
+		// The command reached the wire, and this unit applies writes whether
+		// or not it confirms them. Remembering it here rather than only on
+		// success keeps deduplication comparing against what was actually
+		// sent; comparing against an older value made a user's correction
+		// back to it look like a redelivery and dropped it.
+		w.rememberSent(topic, valueStr)
+
+		// Give the unit a moment to apply the value before reading it back.
+		if !sleepCtx(ctx, w.settleDelay) {
+			return ctx.Err()
+		}
+
+		result = w.verify(ctx, register, value)
+		if result.err == nil {
+			break
+		}
 	}
-	w.logger.SerialSend(command, time.Since(sendStart), nil)
 
-	// The command reached the wire, and this unit applies writes whether or
-	// not it confirms them. Remembering it here rather than only on success
-	// keeps deduplication comparing against what was actually sent; comparing
-	// against an older value made a user's correction back to it look like a
-	// redelivery and dropped it.
-	w.rememberSent(topic, valueStr)
-
-	// Give the unit a moment to apply the value before reading it back.
-	if !sleepCtx(ctx, w.settleDelay) {
-		return ctx.Err()
+	w.publishState(register, valueStr, result)
+	if result.err != nil {
+		w.logger.Warn("%v", result.err)
+		return result.err
 	}
 
+	w.logger.Info("=== Write of %s completed in %v ===", register.Name, time.Since(received))
+	return nil
+}
+
+// writeAttempts is how many times a command is sent when its read-back
+// disagrees or cannot be read at all: the original and one re-send.
+const writeAttempts = 2
+
+// writeResult is what reading a write back established.
+type writeResult struct {
+	// actual is state_from's trusted reading, when resolved.
+	actual   string
+	resolved bool
+	// err is set when the write was refused or could not be confirmed.
+	err error
+}
+
+// verify reads the registers that confirm a write and judges the outcome.
+func (w *Writer) verify(ctx context.Context, register config.WriteRegisterConfig, value int) writeResult {
 	// One read per register: state_from is often also a verify register, and
 	// reading it twice puts an avoidable transaction on the wire per write.
 	values, confirmed, checkable := w.readBack(ctx, register)
 
-	actual, resolved := "", false
+	var result writeResult
 	if register.StateFrom != "" {
-		actual, resolved = values[register.StateFrom]
-	}
-
-	state := valueStr
-	if resolved {
-		state = actual
-	}
-	if register.Topic != "" {
-		if err := w.pub.Publish(register.Topic, state); err != nil {
-			w.logger.Error("Failed to publish state for %s to %s: %v", register.Name, register.Topic, err)
-		}
+		result.actual, result.resolved = values[register.StateFrom]
 	}
 
 	// actual has gone through the read pipeline's divisor and type
-	// formatting (e.g. "22.0" for a float register), while valueStr is the
-	// untouched MQTT payload (e.g. "22", or "022"). Comparing them directly
-	// only worked by coincidence, for every state_from register that happens
-	// to be a divisor-1 integer. expected renders the commanded value through
-	// the same type formatting state_from's reading went through, so the two
-	// are compared in the same representation.
-	expected := valueStr
-	if resolved && w.reader != nil {
+	// formatting (e.g. "22.0" for a float register), while the command is a
+	// plain integer. expected renders the commanded value through the same
+	// type formatting, so the two are compared in the same representation.
+	expected := strconv.Itoa(value)
+	if result.resolved && w.reader != nil {
 		if readReg, ok := w.reader.Register(register.StateFrom); ok {
 			expected = formatByType(float64(value), readReg.Type)
 		}
 	}
 
 	switch {
-	case resolved && actual != expected:
+	case result.resolved && result.actual != expected:
 		// The command went out but the unit is holding a different value.
-		w.logger.Warn("Wrote %s = %d but %s reports %s; the unit did not take the value",
-			register.Name, value, register.StateFrom, actual)
-		return fmt.Errorf("write %s: unit reports %s, not %d", register.Name, actual, value)
-	case resolved:
+		result.err = fmt.Errorf("write %s: unit reports %s = %s, not %d",
+			register.Name, register.StateFrom, result.actual, value)
+	case result.resolved:
 		w.logger.Info("Wrote %s = %d, confirmed by %s", register.Name, value, register.StateFrom)
 	case checkable && !confirmed:
-		// The command went out, so it may still have taken effect; the next
-		// read cycle will show the truth.
-		w.logger.Warn("Could not confirm %s = %d by reading back %v",
-			register.Name, value, register.VerifyRegisters)
-		return fmt.Errorf("write %s: sent but could not confirm it took effect", register.Name)
+		// The command went out, so it may still have taken effect; the
+		// settle re-read and the next cycle will show the truth.
+		result.err = fmt.Errorf("write %s: sent but could not confirm it took effect by reading back %v",
+			register.Name, append([]string{register.StateFrom}, register.VerifyRegisters...))
 	case checkable:
 		w.logger.Info("Wrote %s = %d, confirmed by read-back", register.Name, value)
 	default:
 		w.logger.Warn("Wrote %s = %d; no state_from or verify_registers configured, "+
 			"so it cannot be confirmed", register.Name, value)
 	}
+	return result
+}
 
-	// Some values trail the command; read them again once things settle.
-	if w.resettle != nil {
-		w.resettle.schedule(register, seq)
+// publishState publishes the write register's state: what the unit reported
+// through state_from, even if it refused the command. Without state_from
+// there is nothing to read, so the commanded value is the only state there
+// is. With state_from that could not be read, nothing is published: the
+// commanded value would show a state nobody verified, and the settle re-read
+// will publish the real one.
+func (w *Writer) publishState(register config.WriteRegisterConfig, commanded string, result writeResult) {
+	if register.Topic == "" {
+		return
 	}
-
-	w.logger.Info("=== Write of %s completed in %v ===", register.Name, time.Since(received))
-	return nil
+	state := commanded
+	switch {
+	case result.resolved:
+		state = result.actual
+	case register.StateFrom != "":
+		w.logger.Warn("Not publishing a state for %s: %s could not be read back", register.Name, register.StateFrom)
+		return
+	}
+	if err := w.pub.Publish(register.Topic, state); err != nil {
+		w.logger.Error("Failed to publish state for %s to %s: %v", register.Name, register.Topic, err)
+	}
 }
 
 // readBack reads every register needed to confirm this write - state_from plus
