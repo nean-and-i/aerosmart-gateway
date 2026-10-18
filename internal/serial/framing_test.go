@@ -16,7 +16,7 @@ type readResult struct {
 
 // scriptedPort is a Port whose reads are pre-programmed, so framing
 // behaviour can be tested without hardware. Once the script is exhausted it
-// behaves like an idle tty: zero bytes and io.EOF (what tarm/serial returns
+// behaves like an idle tty: zero bytes and io.EOF (what a tty read returns
 // when VTIME expires with VMIN=0).
 type scriptedPort struct {
 	reads   []readResult
@@ -47,13 +47,15 @@ func (s *scriptedPort) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func (s *scriptedPort) Flush() error { s.flushes++; return nil }
-func (s *scriptedPort) Close() error { s.closed = true; return nil }
+func (s *scriptedPort) ResetInputBuffer() error            { s.flushes++; return nil }
+func (s *scriptedPort) Drain() error                       { return nil }
+func (s *scriptedPort) SetReadTimeout(time.Duration) error { return nil }
+func (s *scriptedPort) Close() error                       { s.closed = true; return nil }
 
 func shortDeadline() time.Time { return time.Now().Add(30 * time.Millisecond) }
 
 func TestReadFrameSingleRead(t *testing.T) {
-	fr := newFrameReader(&scriptedPort{reads: []readResult{{data: "130 1067 3\r\n"}}})
+	fr := newFrameReader(&scriptedPort{reads: []readResult{{data: "130 1067 3\r\n"}}}, 100*time.Millisecond)
 
 	got, err := fr.readFrame(shortDeadline())
 	if err != nil {
@@ -68,7 +70,7 @@ func TestReadFrameReassemblesSplitFrame(t *testing.T) {
 	fr := newFrameReader(&scriptedPort{reads: []readResult{
 		{data: "130 10"},
 		{data: "67 3\r\n"},
-	}})
+	}}, 100*time.Millisecond)
 
 	got, err := fr.readFrame(shortDeadline())
 	if err != nil {
@@ -83,7 +85,7 @@ func TestReadFrameReassemblesSplitFrame(t *testing.T) {
 func TestReadFrameKeepsSecondFrameBuffered(t *testing.T) {
 	fr := newFrameReader(&scriptedPort{reads: []readResult{
 		{data: "130 1067 3\r\n130 5003 2\r\n"},
-	}})
+	}}, 100*time.Millisecond)
 
 	first, err := fr.readFrame(shortDeadline())
 	if err != nil {
@@ -106,7 +108,7 @@ func TestReadFrameKeepsSecondFrameBuffered(t *testing.T) {
 // away, or the tail arrives alone and every later frame is one behind.
 func TestReadFrameRetainsPartialDataAcrossTimeout(t *testing.T) {
 	sp := &scriptedPort{reads: []readResult{{data: "130 10"}}}
-	fr := newFrameReader(sp)
+	fr := newFrameReader(sp, 100*time.Millisecond)
 
 	if _, err := fr.readFrame(shortDeadline()); !errors.Is(err, ErrReadTimeout) {
 		t.Fatalf("readFrame() error = %v, want ErrReadTimeout", err)
@@ -124,7 +126,7 @@ func TestReadFrameRetainsPartialDataAcrossTimeout(t *testing.T) {
 }
 
 func TestReadFrameBareLF(t *testing.T) {
-	fr := newFrameReader(&scriptedPort{reads: []readResult{{data: "130 1067 3\n"}}})
+	fr := newFrameReader(&scriptedPort{reads: []readResult{{data: "130 1067 3\n"}}}, 100*time.Millisecond)
 
 	got, err := fr.readFrame(shortDeadline())
 	if err != nil {
@@ -141,7 +143,7 @@ func TestReadFrameOverflowResyncs(t *testing.T) {
 		long[i] = 'x'
 	}
 	sp := &scriptedPort{reads: []readResult{{data: string(long)}}}
-	fr := newFrameReader(sp)
+	fr := newFrameReader(sp, 100*time.Millisecond)
 
 	if _, err := fr.readFrame(shortDeadline()); !errors.Is(err, ErrFrameOverflow) {
 		t.Fatalf("readFrame() error = %v, want ErrFrameOverflow", err)
@@ -159,7 +161,7 @@ func TestReadFrameOverflowResyncs(t *testing.T) {
 }
 
 func TestReadFrameSurfacesIOError(t *testing.T) {
-	fr := newFrameReader(&scriptedPort{reads: []readResult{{err: syscall.EIO}}})
+	fr := newFrameReader(&scriptedPort{reads: []readResult{{err: syscall.EIO}}}, 100*time.Millisecond)
 
 	_, err := fr.readFrame(shortDeadline())
 	if !errors.Is(err, syscall.EIO) {
@@ -170,7 +172,7 @@ func TestReadFrameSurfacesIOError(t *testing.T) {
 // A zero-byte read is how a VTIME expiry surfaces; it must not be reported as
 // a broken port, or the supervisor would reopen on every idle poll.
 func TestReadFrameTreatsEOFAsTimeout(t *testing.T) {
-	fr := newFrameReader(&scriptedPort{})
+	fr := newFrameReader(&scriptedPort{}, 100*time.Millisecond)
 
 	_, err := fr.readFrame(shortDeadline())
 	if !errors.Is(err, ErrReadTimeout) {
@@ -185,7 +187,7 @@ func TestReadFrameTreatsEOFAsTimeout(t *testing.T) {
 func TestReadFrameConsumesDataDeliveredWithEOF(t *testing.T) {
 	fr := newFrameReader(&scriptedPort{reads: []readResult{
 		{data: "130 1067 3\r\n", err: io.EOF},
-	}})
+	}}, 100*time.Millisecond)
 
 	got, err := fr.readFrame(shortDeadline())
 	if err != nil {

@@ -1,16 +1,23 @@
 // Package serial implements framed request/response communication with an
 // Aerosmart unit over a serial link.
 //
-// The link is assumed to be lossy: frames arrive split across reads, stale or
-// unsolicited frames appear on the wire, and the USB adapter can disappear
-// entirely. Three rules keep it stable:
+// The link is assumed to be lossy and shared: frames arrive split across
+// reads, the unit's panel talks on the same bus, so frames from other
+// conversations appear on the wire and a collision can corrupt one, and the
+// USB adapter can disappear entirely. Five rules keep it stable:
 //
 //  1. Received bytes are buffered persistently, so a frame interrupted by a
 //     timeout is completed rather than discarded (discarding it desyncs the
 //     stream permanently).
-//  2. One transaction reads until it sees the frame matching its own command,
-//     discarding anything else, and never re-sends the command to resync.
-//  3. Closing and reopening the port is reserved for genuine port failures and
+//  2. A command is only transmitted once the bus has been quiet for a moment,
+//     and is drained before its reply is awaited, so it neither collides with
+//     a frame in progress nor is still queued when the next exchange begins.
+//  3. One transaction reads until it sees a strictly well-formed frame
+//     matching its own command, discarding anything else, and never re-sends
+//     the command to resync.
+//  4. Only input is ever discarded. Discarding output loses a command that
+//     has been written but not yet transmitted.
+//  5. Closing and reopening the port is reserved for genuine port failures and
 //     performed by a single supervisor, because a reopen toggles DTR/RTS and
 //     can reset the attached device.
 package serial
@@ -23,7 +30,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/tarm/serial"
+	"go.bug.st/serial"
 )
 
 // ErrPortNotOpen is returned when an operation needs an open port and has none.
@@ -46,9 +53,7 @@ type Config struct {
 	Parity   string // "N", "O", "E"
 	StopBits int    // 1 or 2
 
-	// ReadTimeout is the per-syscall block time. The driver programs this into
-	// termios VTIME, which has 100ms granularity, so it is rounded up to a
-	// multiple of 100ms.
+	// ReadTimeout is how long one read may block with no data.
 	ReadTimeout time.Duration
 
 	// ResponseTimeout is the total budget for one transaction: how long to
@@ -63,6 +68,15 @@ type Config struct {
 	// HealthCheckInterval is how often the supervisor polls port health.
 	HealthCheckInterval time.Duration
 
+	// BusQuietGap is how long the line must be silent before a command is
+	// transmitted. Another device shares the bus, and transmitting into one of
+	// its frames corrupts both.
+	BusQuietGap time.Duration
+
+	// BusQuietMaxWait bounds the wait for a quiet bus, so a device that never
+	// pauses delays commands rather than blocking them.
+	BusQuietMaxWait time.Duration
+
 	// XonXoff and DsrDtr are rejected at construction: the driver has no flow
 	// control support, and pretending otherwise corrupts frames.
 	XonXoff bool
@@ -72,9 +86,6 @@ type Config struct {
 	// device is opened with the settings above.
 	Opener func() (Port, error)
 }
-
-// vtimeGranularity is the resolution of termios VTIME (one decisecond).
-const vtimeGranularity = 100 * time.Millisecond
 
 func (c *Config) applyDefaults(log Logger) {
 	if c.BaudRate == 0 {
@@ -105,20 +116,17 @@ func (c *Config) applyDefaults(log Logger) {
 	if c.HealthCheckInterval <= 0 {
 		c.HealthCheckInterval = time.Second
 	}
-
-	// The kernel cannot express a read timeout finer than 100ms, so a smaller
-	// value would silently become 100ms while the caller budgeted for less.
-	if c.ReadTimeout < vtimeGranularity {
-		if c.ReadTimeout > 0 {
-			log.Warn("serial: read_timeout %v is below the %v kernel granularity, using %v",
-				c.ReadTimeout, vtimeGranularity, vtimeGranularity)
-		}
-		c.ReadTimeout = vtimeGranularity
-	} else if r := c.ReadTimeout % vtimeGranularity; r != 0 {
-		rounded := c.ReadTimeout - r + vtimeGranularity
-		log.Warn("serial: read_timeout %v is not a multiple of %v, rounding up to %v",
-			c.ReadTimeout, vtimeGranularity, rounded)
-		c.ReadTimeout = rounded
+	if c.ReadTimeout <= 0 {
+		c.ReadTimeout = 100 * time.Millisecond
+	}
+	if c.BusQuietGap <= 0 {
+		c.BusQuietGap = 20 * time.Millisecond
+	}
+	if c.BusQuietMaxWait <= 0 {
+		c.BusQuietMaxWait = 250 * time.Millisecond
+	}
+	if c.BusQuietMaxWait < c.BusQuietGap {
+		c.BusQuietMaxWait = c.BusQuietGap
 	}
 
 	// A response can never arrive faster than one read cycle.
@@ -161,34 +169,35 @@ func New(cfg Config, log Logger) *SerialPort {
 	s := &SerialPort{cfg: cfg, log: log}
 	s.opener = cfg.Opener
 	if s.opener == nil {
-		s.opener = s.openTarm
+		s.opener = s.openDevice
 	}
 	return s
 }
 
-// openTarm opens the real device with every configured line setting applied.
-func (s *SerialPort) openTarm() (Port, error) {
-	var parity serial.Parity
+// openDevice opens the real device with every configured line setting applied.
+func (s *SerialPort) openDevice() (Port, error) {
+	parity := serial.NoParity
 	switch strings.ToUpper(s.cfg.Parity) {
 	case "O":
-		parity = serial.ParityOdd
+		parity = serial.OddParity
 	case "E":
-		parity = serial.ParityEven
-	default:
-		parity = serial.ParityNone
+		parity = serial.EvenParity
 	}
-	stop := serial.Stop1
+	stop := serial.OneStopBit
 	if s.cfg.StopBits == 2 {
-		stop = serial.Stop2
+		stop = serial.TwoStopBits
 	}
-	return serial.OpenPort(&serial.Config{
-		Name:        s.cfg.Port,
-		Baud:        s.cfg.BaudRate,
-		ReadTimeout: s.cfg.ReadTimeout,
-		Size:        byte(s.cfg.DataBits),
-		Parity:      parity,
-		StopBits:    stop,
+	port, err := serial.Open(s.cfg.Port, &serial.Mode{
+		BaudRate: s.cfg.BaudRate,
+		DataBits: s.cfg.DataBits,
+		Parity:   parity,
+		StopBits: stop,
 	})
+	if err != nil {
+		// The driver's errors do not name the device.
+		return nil, fmt.Errorf("open %s: %w", s.cfg.Port, err)
+	}
+	return port, nil
 }
 
 // Open opens the port. It is idempotent.
@@ -204,11 +213,10 @@ func (s *SerialPort) openLocked() error {
 	}
 	port, err := s.opener()
 	if err != nil {
-		// The driver error already names the device path.
 		return err
 	}
 	s.port = port
-	s.fr = newFrameReader(port)
+	s.fr = newFrameReader(port, s.cfg.ReadTimeout)
 	s.open = true
 	s.healthy = true
 	return nil
@@ -295,21 +303,11 @@ func (s *SerialPort) Transact(ctx context.Context, command string) (string, erro
 		return "", err
 	}
 
-	// Discard anything stale before asking a question, so the first frame back
-	// belongs to this command.
-	fr.reset()
-	if err := port.Flush(); err != nil {
-		if IsPortError(err) {
-			s.markUnhealthy(err)
-		}
-		return "", fmt.Errorf("flush before %q: %w", command, err)
-	}
-
-	if _, err := port.Write([]byte(command + "\r\n")); err != nil {
-		if IsPortError(err) {
-			s.markUnhealthy(err)
-		}
-		return "", fmt.Errorf("write %q: %w", command, err)
+	// Discarding stale input before asking means the first frame back belongs
+	// to this command, or to someone else's conversation, never to an earlier
+	// one of ours.
+	if err := s.transmit(ctx, port, fr, command); err != nil {
+		return "", err
 	}
 
 	want := commandPrefix(command)
@@ -353,23 +351,51 @@ func (s *SerialPort) Send(ctx context.Context, command string) error {
 		return err
 	}
 
-	// Discard anything stale so the reply to the following read-back cannot be
-	// satisfied by a frame that predates this command.
-	fr.reset()
-	if err := port.Flush(); err != nil {
+	// Discarding stale input means the reply to the following read-back
+	// cannot be satisfied by a frame that predates this command.
+	return s.transmit(ctx, port, fr, command)
+}
+
+// transmit puts one command on the wire: it waits for a quiet bus, discards
+// stale input, writes the command and waits until it has left the port.
+// Callers must hold txMu.
+func (s *SerialPort) transmit(ctx context.Context, port Port, fr *frameReader, command string) error {
+	fail := func(what string, err error) error {
 		if IsPortError(err) {
 			s.markUnhealthy(err)
 		}
-		return fmt.Errorf("flush before %q: %w", command, err)
+		return fmt.Errorf("%s %q: %w", what, command, err)
 	}
 
-	if _, err := port.Write([]byte(command + "\r\n")); err != nil {
-		if IsPortError(err) {
-			s.markUnhealthy(err)
+	quiet, err := fr.waitQuiet(ctx, s.cfg.BusQuietGap, s.cfg.BusQuietMaxWait)
+	if err != nil {
+		if isCancellation(err) {
+			return err
 		}
-		return fmt.Errorf("write %q: %w", command, err)
+		return fail("wait for a quiet bus before", err)
+	}
+	if !quiet {
+		s.log.Debug("serial: bus still busy after %v, transmitting %q anyway", s.cfg.BusQuietMaxWait, command)
+	}
+
+	fr.reset()
+	if err := port.ResetInputBuffer(); err != nil {
+		return fail("discard stale input before", err)
+	}
+	if _, err := port.Write([]byte(command + "\r\n")); err != nil {
+		return fail("write", err)
+	}
+	// Until the command has actually been transmitted, the next exchange
+	// could start, and "sent" would only mean "queued in the kernel".
+	if err := port.Drain(); err != nil {
+		return fail("drain", err)
 	}
 	return nil
+}
+
+// isCancellation reports whether err is a context cancellation or deadline.
+func isCancellation(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 // Supervise reopens the port whenever it becomes unhealthy, with exponential
@@ -434,6 +460,9 @@ func (s *SerialPort) reopen() error {
 
 // sleepCtx waits for d, reporting false if ctx finished first.
 func sleepCtx(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		return ctx.Err() == nil
+	}
 	t := time.NewTimer(d)
 	defer t.Stop()
 	select {
@@ -457,11 +486,20 @@ func commandPrefix(command string) string {
 // ParseResponse extracts the value from a response frame, verifying that the
 // frame answers the expected command.
 //
-// Frames look like "130 1067 3": node address, register address, value.
+// Frames look like "130 1067 3": node address, register address, integer
+// value. The protocol has no checksum and the bus is shared, so a collision
+// can splice two frames or corrupt bytes while the prefix still matches. Only
+// a frame of exactly that shape is accepted. Line noise around a frame is
+// tolerated, since it cannot change the value, but anything unexpected inside
+// one rejects it.
 func ParseResponse(response string, expectedCommand string) (string, bool) {
 	for line := range strings.SplitSeq(response, "\n") {
+		line = strings.TrimFunc(line, func(r rune) bool { return r == ' ' || !isPrintableASCII(r) })
+		if strings.IndexFunc(line, func(r rune) bool { return !isPrintableASCII(r) }) >= 0 {
+			continue
+		}
 		parts := strings.Fields(line)
-		if len(parts) < 3 {
+		if len(parts) != 3 || !isInteger(parts[2]) {
 			continue
 		}
 		if parts[0]+" "+parts[1] == expectedCommand {
@@ -469,4 +507,23 @@ func ParseResponse(response string, expectedCommand string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// isPrintableASCII reports whether r is a printable ASCII character. Invalid
+// UTF-8 decodes to utf8.RuneError, which is not.
+func isPrintableASCII(r rune) bool { return r >= 0x20 && r <= 0x7e }
+
+// isInteger reports whether s is an optionally negative run of digits, the
+// only value format the unit sends.
+func isInteger(s string) bool {
+	s = strings.TrimPrefix(s, "-")
+	if s == "" {
+		return false
+	}
+	for _, c := range []byte(s) {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
 }

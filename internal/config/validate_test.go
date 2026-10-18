@@ -276,11 +276,12 @@ serial:
 		t.Fatalf("LoadAppConfig() error = %v", err)
 	}
 
-	// 3 attempts x 400ms = 1.2s per register; 40 registers is 48s > 30s.
+	// 3 attempts x (300ms + 100ms quiet-bus wait + 150ms jittered backoff)
+	// = 1.65s per register; 40 registers is 66s > 30s.
 	if err := cfg.ValidateCycleBudget(40); err == nil {
 		t.Fatal("ValidateCycleBudget(40) = nil, want an error: the worst-case cycle overruns the interval")
 	}
-	// 10 registers is 12s, comfortably inside 30s.
+	// 10 registers is 16.5s, comfortably inside 30s.
 	if err := cfg.ValidateCycleBudget(10); err != nil {
 		t.Errorf("ValidateCycleBudget(10) error = %v, want nil", err)
 	}
@@ -329,6 +330,8 @@ func TestValidateRejectsNegativeDurations(t *testing.T) {
 		"serial:\n  read_timeout: -100\n",
 		"serial:\n  health_check_interval: -1\n",
 		"serial:\n  write_priority_timeout: -1\n",
+		"serial:\n  bus_quiet_gap: -1\n",
+		"serial:\n  bus_quiet_max_wait: -1\n",
 		"mqtt:\n  broker: \"x\"\n  op_timeout: -1\n",
 	} {
 		t.Run(body, func(t *testing.T) {
@@ -347,27 +350,91 @@ func TestValidateRejectsNegativeDurations(t *testing.T) {
 	}
 }
 
-// One Transact attempt can start a read just before its deadline and then
-// block for a whole read_timeout, so the budget must charge for both.
-func TestValidateCycleBudgetChargesReadTimeoutPerAttempt(t *testing.T) {
+// Upgrading must not make a default installation refuse to start: the full
+// shipped register set has to fit the default 60s read interval.
+func TestDefaultConfigFitsTheDefaultIntervalWithTheShippedRegisterCount(t *testing.T) {
+	cfg, err := LoadAppConfig(writeConfig(t, "mqtt:\n  broker: \"x\"\n"))
+	if err != nil {
+		t.Fatalf("LoadAppConfig() error = %v", err)
+	}
+	if err := cfg.ValidateCycleBudget(29); err != nil {
+		t.Errorf("ValidateCycleBudget(29) with defaults: %v", err)
+	}
+}
+
+// Before every command the serial layer waits for the shared bus to go quiet,
+// for up to bus_quiet_max_wait, so each attempt can cost that much more.
+func TestValidateCycleBudgetChargesTheQuietBusWait(t *testing.T) {
 	cfg, err := LoadAppConfig(writeConfig(t, `
 mqtt:
   broker: "x"
 read_interval: 61
 serial:
   retries: 3
-  read_timeout: 500
-  response_timeout: 600
-  retry_backoff: 0
+  response_timeout: 300
+  retry_backoff: 1
+  bus_quiet_max_wait: 500
 `))
 	if err != nil {
 		t.Fatalf("LoadAppConfig() error = %v", err)
 	}
 
-	// Charging response_timeout alone gives 29 x 3 x 600ms = 52.2s, which fits
-	// 61s. The real cost is 3 x 1100ms per register, about 96s.
+	// Charging response_timeout alone gives 29 x 3 x 300ms = 26.1s. The real
+	// worst case is 29 x 3 x 801ms = 69.7s.
 	if err := cfg.ValidateCycleBudget(29); err == nil {
-		t.Fatal("ValidateCycleBudget(29) = nil; the real cycle overruns the 61s interval")
+		t.Fatal("ValidateCycleBudget(29) = nil; the quiet-bus wait makes the real cycle overrun 61s")
+	}
+}
+
+// The delay between attempts is jittered by up to half again, so the backoff
+// can cost 1.5x its configured value.
+func TestValidateCycleBudgetChargesTheBackoffJitter(t *testing.T) {
+	cfg, err := LoadAppConfig(writeConfig(t, `
+mqtt:
+  broker: "x"
+read_interval: 60
+serial:
+  retries: 3
+  read_timeout: 100
+  response_timeout: 100
+  retry_backoff: 400
+  bus_quiet_max_wait: 20
+`))
+	if err != nil {
+		t.Fatalf("LoadAppConfig() error = %v", err)
+	}
+
+	// Without jitter: 29 x 3 x 520ms = 45.2s. With it: 29 x 3 x 720ms = 62.6s.
+	if err := cfg.ValidateCycleBudget(29); err == nil {
+		t.Fatal("ValidateCycleBudget(29) = nil; the jittered backoff makes the real cycle overrun 60s")
+	}
+}
+
+// A changed value is only trusted once a second read agrees, so a register
+// gets at least two attempts even when retries is 1.
+func TestValidateCycleBudgetChargesTwoAttemptsWhenRetriesIsOne(t *testing.T) {
+	cfg, err := LoadAppConfig(writeConfig(t, `
+mqtt:
+  broker: "x"
+read_interval: 60
+serial:
+  retries: 1
+  response_timeout: 850
+  retry_backoff: 100
+  bus_quiet_max_wait: 20
+`))
+	if err != nil {
+		t.Fatalf("LoadAppConfig() error = %v", err)
+	}
+
+	// An attempt is 850ms + 20ms + 150ms jittered backoff = 1020ms. One per
+	// register would be 29.6s; two is 59.2s, still inside 60s.
+	if err := cfg.ValidateCycleBudget(29); err != nil {
+		t.Fatalf("ValidateCycleBudget(29) error = %v, want nil", err)
+	}
+	// 30 registers at two attempts is 61.2s.
+	if err := cfg.ValidateCycleBudget(30); err == nil {
+		t.Fatal("ValidateCycleBudget(30) = nil; two attempts per register overrun 60s")
 	}
 }
 

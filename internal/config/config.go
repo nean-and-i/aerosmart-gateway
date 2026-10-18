@@ -14,9 +14,7 @@ var ErrInvalidConfig = errors.New("invalid configuration")
 
 // SerialConfig holds serial port configuration.
 //
-// Timeouts are milliseconds. Note that the kernel expresses a serial read
-// timeout in deciseconds, so ReadTimeout is rounded up to a multiple of 100ms
-// by the serial layer.
+// Timeouts are milliseconds.
 type SerialConfig struct {
 	Port     string `yaml:"port"`
 	BaudRate int    `yaml:"baudrate"`
@@ -24,8 +22,8 @@ type SerialConfig struct {
 	Parity   string `yaml:"parity"`   // N, O or E
 	StopBits int    `yaml:"stopbits"` // 1 or 2
 
-	// ReadTimeout is how long a single read may block, in milliseconds.
-	// Rounded up to a multiple of 100 (kernel VTIME granularity).
+	// ReadTimeout is how long a single read may block, in milliseconds. A
+	// read is also cut short at the response deadline.
 	ReadTimeout int `yaml:"read_timeout"`
 
 	// ResponseTimeout is the budget for one command/response exchange, in
@@ -69,7 +67,16 @@ type SerialConfig struct {
 	// WriteResettleDelay is the resolved value, filled in by applyDefaults.
 	WriteResettleDelay int `yaml:"-"`
 
-	// Flow control. The tarm/serial driver supports neither, so a true value
+	// BusQuietGap is how long the line must be silent before a command is
+	// transmitted, in milliseconds. The unit's panel shares the bus, and
+	// transmitting into one of its frames corrupts both.
+	BusQuietGap int `yaml:"bus_quiet_gap"`
+
+	// BusQuietMaxWait bounds the wait for a quiet bus, in milliseconds, so a
+	// device that never pauses delays commands rather than blocking them.
+	BusQuietMaxWait int `yaml:"bus_quiet_max_wait"`
+
+	// Flow control. The serial driver supports neither, so a true value
 	// is rejected by Validate rather than silently ignored.
 	XonXoff bool `yaml:"xonxoff"`
 	DsrDtr  bool `yaml:"dsrdtr"`
@@ -260,8 +267,8 @@ func (c *AppConfig) applyDefaults() {
 	if c.Serial.StopBits == 0 {
 		c.Serial.StopBits = 1
 	}
-	// 200ms is two VTIME ticks: enough for the unit to answer without the
-	// caller waiting a full second on a silent link.
+	// Enough for the unit to answer without the caller waiting a full second
+	// on a silent link.
 	if c.Serial.ReadTimeout == 0 {
 		c.Serial.ReadTimeout = 200
 	}
@@ -288,6 +295,14 @@ func (c *AppConfig) applyDefaults() {
 	}
 	if c.Serial.WriteSettleDelay == 0 {
 		c.Serial.WriteSettleDelay = 50
+	}
+	// The panel's frames are a few characters at 115200 baud, well under a
+	// millisecond each, so 20ms of silence means it has finished talking.
+	if c.Serial.BusQuietGap == 0 {
+		c.Serial.BusQuietGap = 20
+	}
+	if c.Serial.BusQuietMaxWait == 0 {
+		c.Serial.BusQuietMaxWait = 100
 	}
 	if c.Serial.WriteResettleDelaySet != nil {
 		c.Serial.WriteResettleDelay = *c.Serial.WriteResettleDelaySet
@@ -403,6 +418,8 @@ func (c *AppConfig) Validate() error {
 		{"serial.write_priority_timeout", c.Serial.WritePriorityTimeout},
 		{"serial.write_settle_delay", c.Serial.WriteSettleDelay},
 		{"serial.write_resettle_delay", c.Serial.WriteResettleDelay},
+		{"serial.bus_quiet_gap", c.Serial.BusQuietGap},
+		{"serial.bus_quiet_max_wait", c.Serial.BusQuietMaxWait},
 		{"mqtt.op_timeout", c.MQTT.OpTimeout},
 		{"mqtt.connect_retry_initial_delay_ms", c.MQTT.ConnectRetryInitialDelayMs},
 		{"mqtt.connect_retry_max_delay_ms", c.MQTT.ConnectRetryMaxDelayMs},
@@ -440,32 +457,18 @@ func (c *AppConfig) Validate() error {
 	return nil
 }
 
-// EffectiveReadTimeout is the per-read block time the serial layer will
-// actually use: the kernel expresses it as termios VTIME in deciseconds, so it
-// is rounded up to a multiple of 100ms with that as the floor.
-func (c *AppConfig) EffectiveReadTimeout() int {
-	readTimeout := c.Serial.ReadTimeout
-	if readTimeout < serialReadGranularityMs {
-		return serialReadGranularityMs
-	}
-	if r := readTimeout % serialReadGranularityMs; r != 0 {
-		readTimeout += serialReadGranularityMs - r
-	}
-	return readTimeout
-}
-
 // EffectiveResponseTimeout is the response budget the serial layer will
-// actually use. A response can never arrive faster than one read, so a smaller
-// response_timeout is raised to the effective read timeout.
+// actually use: a response_timeout below read_timeout is raised to it.
 func (c *AppConfig) EffectiveResponseTimeout() int {
-	if readTimeout := c.EffectiveReadTimeout(); c.Serial.ResponseTimeout < readTimeout {
-		return readTimeout
-	}
-	return c.Serial.ResponseTimeout
+	return max(c.Serial.ResponseTimeout, c.Serial.ReadTimeout)
 }
 
-// serialReadGranularityMs mirrors the kernel's termios VTIME resolution.
-const serialReadGranularityMs = 100
+// EffectiveAttempts is how many attempts a register read may take. A changed
+// value is only trusted once a second read agrees with it, so there are at
+// least two even when retries is 1.
+func (c *AppConfig) EffectiveAttempts() int {
+	return max(c.Serial.Retries, 2)
+}
 
 // ValidateCycleBudget reports a retry budget that cannot finish a full readout
 // within one read interval.
@@ -478,12 +481,12 @@ func (c *AppConfig) ValidateCycleBudget(registerCount int) error {
 		return nil
 	}
 
-	// An attempt can pass its response deadline only after a read that already
-	// started, and that read blocks for a whole read_timeout, so one attempt
-	// costs up to response_timeout + read_timeout.
-	perAttemptMs := c.EffectiveResponseTimeout() + c.EffectiveReadTimeout() + c.Serial.RetryBackoff
-	perRegisterMs := c.Serial.Retries * perAttemptMs
-	worstCycleMs := perRegisterMs * registerCount
+	// One attempt waits for a quiet bus, then for its reply until the
+	// response deadline (reads are cut short there), then backs off for up to
+	// half again the configured delay, which is jittered.
+	perAttemptMs := c.Serial.BusQuietMaxWait + c.EffectiveResponseTimeout() + c.Serial.RetryBackoff*3/2
+	attempts := c.EffectiveAttempts()
+	worstCycleMs := attempts * perAttemptMs * registerCount
 	if worstCycleMs <= c.ReadInterval*1000 {
 		return nil
 	}
@@ -491,7 +494,7 @@ func (c *AppConfig) ValidateCycleBudget(registerCount int) error {
 	return fmt.Errorf("%w: worst-case read cycle is %d registers x %d attempts x %dms = %.1fs, "+
 		"which exceeds read_interval (%ds); lower serial.retries or serial.response_timeout, "+
 		"or raise read_interval",
-		ErrInvalidConfig, registerCount, c.Serial.Retries, perAttemptMs,
+		ErrInvalidConfig, registerCount, attempts, perAttemptMs,
 		float64(worstCycleMs)/1000, c.ReadInterval)
 }
 

@@ -72,14 +72,36 @@ func TestParseResponse(t *testing.T) {
 	}
 }
 
-func TestParseResponseEdgeCases(t *testing.T) {
-	// Test with more than 3 parts - should get the last value
-	value, ok := ParseResponse("130 1067 3 extra", "130 1067")
-	if !ok {
-		t.Error("Expected true for response with extra parts")
+// The bus is shared with another device and carries no checksum, so a
+// collision can splice two frames or corrupt bytes while the prefix still
+// matches. Only a frame of exactly "<node> <register> <integer>" is trusted.
+func TestParseResponseRejectsCorruptedFrames(t *testing.T) {
+	tests := []struct {
+		name      string
+		response  string
+		wantValue string
+		wantOk    bool
+	}{
+		{"two frames spliced by a lost newline", "130 1067 3 130 5003 4", "", false},
+		{"trailing garbage field", "130 1067 3 extra", "", false},
+		{"garbage glued to the value", "130 1067 3x", "", false},
+		{"sign that the unit never sends", "130 1067 +3", "", false},
+		{"control byte inside the value", "130 1067 2\x001", "", false},
+		{"non-ASCII byte inside the value", "130 1067 2\xff1", "", false},
+		{"decimal point", "130 1067 2.5", "", false},
+		{"negative value", "130 1067 -1250", "-1250", true},
+		{"line noise before the frame", "\x00\xfe130 1067 3", "3", true},
+		{"line noise after the frame", "130 1067 3\x00", "3", true},
+		{"leading zero", "130 1067 03", "03", true},
 	}
-	if value != "3" {
-		t.Errorf("Expected value 3, got %s", value)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			value, ok := ParseResponse(tt.response, "130 1067")
+			if ok != tt.wantOk || value != tt.wantValue {
+				t.Errorf("ParseResponse(%q) = (%q, %v), want (%q, %v)",
+					tt.response, value, ok, tt.wantValue, tt.wantOk)
+			}
+		})
 	}
 }
 
