@@ -5,13 +5,19 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/rand/v2"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/nean/aerosmart-gateway/internal/config"
 	"github.com/nean/aerosmart-gateway/internal/logger"
 	"github.com/nean/aerosmart-gateway/internal/serial"
 )
+
+// ErrUnconfirmed means a register answered, but no reading could be trusted:
+// it changed and no second read agreed with it.
+var ErrUnconfirmed = errors.New("reading could not be confirmed")
 
 // Transactor performs one request/response exchange with the device.
 type Transactor interface {
@@ -47,18 +53,27 @@ type Reader struct {
 	registers []config.ReadRegisterConfig
 	byName    map[string]config.ReadRegisterConfig
 
-	// retries is the number of attempts per register. It is deliberately the
-	// only retry level: nesting retries multiplies the worst case into hours.
+	// retries is the number of attempts per register, shared between retrying
+	// failures and confirming readings. It is deliberately the only retry
+	// level: nesting retries multiplies the worst case into hours.
 	retries int
 	backoff time.Duration
+
+	// trusted holds the last trusted value of each register, in processed
+	// units. A reading that agrees with it needs no confirmation. The command
+	// worker and settle re-reads read registers concurrently with the poll
+	// cycle, hence the lock.
+	trustMu sync.Mutex
+	trusted map[string]float64
 }
 
 // NewReader creates a register reader. retries counts total attempts per
 // register (not additional ones) and backoff is the delay between them.
+//
+// Confirming a changed value takes a second read, so there are always at
+// least two attempts; with one, no value could ever change.
 func NewReader(dev Transactor, pub Publisher, log *logger.Logger, registers []config.ReadRegisterConfig, retries int, backoff time.Duration) *Reader {
-	if retries < 1 {
-		retries = 1
-	}
+	retries = max(retries, 2)
 	byName := make(map[string]config.ReadRegisterConfig, len(registers))
 	for _, reg := range registers {
 		byName[reg.Name] = reg
@@ -71,6 +86,7 @@ func NewReader(dev Transactor, pub Publisher, log *logger.Logger, registers []co
 		byName:    byName,
 		retries:   retries,
 		backoff:   backoff,
+		trusted:   make(map[string]float64),
 	}
 }
 
@@ -83,7 +99,7 @@ func (r *Reader) Register(name string) (config.ReadRegisterConfig, bool) {
 	return reg, ok
 }
 
-// ReadSingle reads one register, retrying transient failures.
+// ReadSingle reads one register and returns a trusted, validated value.
 //
 // It gives up immediately on context cancellation (a write is waiting) and on
 // a port-level error (the supervisor owns reconnection; retrying here would
@@ -93,17 +109,32 @@ func (r *Reader) ReadSingle(ctx context.Context, register config.ReadRegisterCon
 	return processed, err
 }
 
-// readSingleRaw reads one register and returns both the processed value and
-// the value the device actually reported, which is what makes a suspicious
-// reading traceable.
+// sample is one validated reading.
+type sample struct {
+	value float64
+	text  string // processed and formatted
+	raw   string // as the device reported it
+}
+
+// readSingleRaw reads one register until a reading can be trusted, and
+// returns both the processed value and the value the device actually
+// reported, which is what makes a suspicious reading traceable.
+//
+// The unit's panel shares the bus and frames carry no checksum, so a
+// collision can turn a reply into a different but well-formed number. A
+// reading is trusted when it is within confirm_step of the last trusted value,
+// or when another reading in this call agrees with it. Out-of-range readings
+// are treated as corrupted. Failures, confirmations and tie-breaks all share
+// one budget of attempts, so confirming never lengthens the worst case.
 func (r *Reader) readSingleRaw(ctx context.Context, register config.ReadRegisterConfig) (string, string, error) {
 	var lastErr error
+	var samples []sample
 
 	for attempt := 1; attempt <= r.retries; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return "", "", err
 		}
-		if attempt > 1 && !sleepCtx(ctx, r.backoff) {
+		if attempt > 1 && !sleepCtx(ctx, jittered(r.backoff)) {
 			return "", "", ctx.Err()
 		}
 
@@ -111,30 +142,96 @@ func (r *Reader) readSingleRaw(ctx context.Context, register config.ReadRegister
 		value, err := r.dev.Transact(ctx, register.Command)
 		duration := time.Since(start)
 
-		if err == nil {
-			r.logger.SerialOperation("READ", register.Command, value, duration, nil)
-			return r.processValue(value, register), value, nil
-		}
+		if err != nil {
+			lastErr = err
 
-		lastErr = err
+			// A write preempting this read cancels ctx, and Transact reports
+			// that as an ordinary error. Logging it through SerialOperation -
+			// the documented primary flaky-link diagnostic, at WARN - would
+			// mean every write pollutes it with a false alarm, drowning out
+			// genuine device problems. Check before logging, not after.
+			if ctx.Err() != nil {
+				r.logger.Debug("Read of %s cancelled: %v", register.Name, ctx.Err())
+				return "", "", ctx.Err()
+			}
+			r.logger.SerialOperation("READ", register.Command, "", duration, err)
+			if serial.IsPortError(err) {
+				break
+			}
+			r.logger.Debug("Read of %s failed (attempt %d/%d): %v", register.Name, attempt, r.retries, err)
+			continue
+		}
+		r.logger.SerialOperation("READ", register.Command, value, duration, nil)
 
-		// A write preempting this read cancels ctx, and Transact reports that
-		// as an ordinary error. Logging it through SerialOperation - the
-		// documented primary flaky-link diagnostic, at WARN - would mean
-		// every write pollutes it with a false alarm, drowning out genuine
-		// device problems. Check before logging, not after.
-		if ctx.Err() != nil {
-			r.logger.Debug("Read of %s cancelled: %v", register.Name, ctx.Err())
-			return "", "", ctx.Err()
+		s, err := r.toSample(value, register)
+		if err != nil {
+			lastErr = err
+			continue
 		}
-		r.logger.SerialOperation("READ", register.Command, "", duration, err)
-		if serial.IsPortError(err) {
-			break
+		if r.isTrusted(register, s.value) {
+			r.trust(register.Name, s.value)
+			return s.text, s.raw, nil
 		}
-		r.logger.Debug("Read of %s failed (attempt %d/%d): %v", register.Name, attempt, r.retries, err)
+		for _, earlier := range samples {
+			if earlier.text == s.text {
+				r.trust(register.Name, s.value)
+				return s.text, s.raw, nil
+			}
+		}
+		samples = append(samples, s)
 	}
 
+	if len(samples) > 0 {
+		readings := make([]string, len(samples))
+		for i, s := range samples {
+			readings[i] = s.raw
+		}
+		r.logger.Warn("Read of %s: readings %v disagree, keeping the last trusted value", register.Name, readings)
+		return "", "", fmt.Errorf("read register %s (%s): %w: readings %v disagree",
+			register.Name, register.Command, ErrUnconfirmed, readings)
+	}
 	return "", "", fmt.Errorf("read register %s (%s): %w", register.Name, register.Command, lastErr)
+}
+
+// toSample processes and validates one reading. An out-of-range value is an
+// error: on a shared bus it is most likely a corrupted frame.
+func (r *Reader) toSample(raw string, register config.ReadRegisterConfig) (sample, error) {
+	text := r.processValue(raw, register)
+	valid, checked := r.ValidateValue(text, register)
+	if !valid {
+		return sample{}, fmt.Errorf("value %q out of range for %s", raw, register.Name)
+	}
+	value, err := strconv.ParseFloat(checked, 64)
+	if err != nil {
+		return sample{}, fmt.Errorf("value %q for %s is not a number: %w", raw, register.Name, err)
+	}
+	return sample{value: value, text: checked, raw: raw}, nil
+}
+
+// isTrusted reports whether value is close enough to the register's last
+// trusted value to need no confirmation.
+func (r *Reader) isTrusted(register config.ReadRegisterConfig, value float64) bool {
+	r.trustMu.Lock()
+	defer r.trustMu.Unlock()
+	last, ok := r.trusted[register.Name]
+	return ok && math.Abs(value-last) <= register.ConfirmStep
+}
+
+// trust records a register's latest trusted value.
+func (r *Reader) trust(name string, value float64) {
+	r.trustMu.Lock()
+	defer r.trustMu.Unlock()
+	r.trusted[name] = value
+}
+
+// jittered returns d stretched by a random amount of up to half again. A fixed
+// delay between attempts can keep landing on the panel's own polling rhythm
+// and collide every time.
+func jittered(d time.Duration) time.Duration {
+	if d <= 0 {
+		return d
+	}
+	return d + rand.N(d/2+1)
 }
 
 // ReadAll reads every configured register.
@@ -166,14 +263,13 @@ func (r *Reader) ReadAll(ctx context.Context) (map[string]*RegisterValue, error)
 			continue
 		}
 
-		valid, processed := r.ValidateValue(value, register)
 		results[register.Name] = &RegisterValue{
 			Name:     register.Name,
-			Value:    processed,
+			Value:    value,
 			RawValue: raw,
-			Valid:    valid,
+			Valid:    true,
 		}
-		r.logger.Debug("Register %s = %s (valid: %v)", register.Name, processed, valid)
+		r.logger.Debug("Register %s = %s", register.Name, value)
 	}
 
 	r.logger.Info("=== SERIAL: Register read cycle completed in %v ===", time.Since(cycleStart))
@@ -257,14 +353,11 @@ func (r *Reader) ValidateValue(value string, register config.ReadRegisterConfig)
 	}
 
 	if floatVal < float64(register.MinValue) || floatVal > float64(register.MaxValue) {
+		// Out-of-range values used to be clamped for luefterstatus. On a
+		// shared bus most of them are corrupted frames, and clamping turned
+		// garbage into a confident "highest stage".
 		r.logger.Warn("Value %s out of range for %s (min: %d, max: %d)",
 			value, register.Name, register.MinValue, register.MaxValue)
-
-		// The unit reports a transient status above the documented maximum
-		// while the fan is ramping; clamping keeps the entity usable.
-		if register.Name == "luefterstatus" && floatVal > float64(register.MaxValue) {
-			return true, strconv.Itoa(register.MaxValue)
-		}
 		return false, value
 	}
 

@@ -182,7 +182,15 @@ type ReadRegisterConfig struct {
 	Type     string `yaml:"type"` // "integer" or "float"
 	MinValue int    `yaml:"min_value"`
 	MaxValue int    `yaml:"max_value"`
-	HA       struct {
+
+	// ConfirmStep is how far, in processed units, a reading may move from
+	// the last trusted value and still be trusted on its own. A larger
+	// change - or any change, at the default of 0 - is only trusted once a
+	// second read agrees. The bus is shared and frames carry no checksum, so
+	// a corrupted reply can still parse as a plausible number.
+	ConfirmStep float64 `yaml:"confirm_step"`
+
+	HA struct {
 		Name        string `yaml:"name"`
 		DeviceClass string `yaml:"device_class"`
 		Unit        string `yaml:"unit"`
@@ -581,6 +589,9 @@ func (c *RegistersConfig) Validate() error {
 		}
 		if reg.MinValue > reg.MaxValue {
 			problems = append(problems, fmt.Sprintf("read_registers[%s]: min_value %d exceeds max_value %d", reg.Name, reg.MinValue, reg.MaxValue))
+		}
+		if reg.ConfirmStep < 0 {
+			problems = append(problems, fmt.Sprintf("read_registers[%s]: confirm_step %g must not be negative", reg.Name, reg.ConfirmStep))
 		}
 		if reg.MinValue == 0 && reg.MaxValue == 0 {
 			problems = append(problems, fmt.Sprintf("read_registers[%s]: min_value and max_value are both 0, so every reading is rejected", reg.Name))

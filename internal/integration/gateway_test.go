@@ -197,9 +197,19 @@ func TestFullCyclePublishesAllRegistersOverAByteAtATimeLink(t *testing.T) {
 // A stale frame sitting on the wire must be discarded without re-sending the
 // command, and must not shift every later reading onto the wrong register.
 func TestStaleFrameDoesNotDesyncTheStream(t *testing.T) {
-	dev := &lossyDevice{chunk: 3, noise: "130 9999 42\r\n"}
+	dev := &lossyDevice{chunk: 3}
 	poller, pub, sp := newStack(t, dev)
 	defer func() { _ = sp.Close() }()
+
+	// A first cycle reads every register twice to confirm it. Prime the
+	// trusted values, so the cycle under test is one command per register.
+	if err := poller.RunCycle(context.Background()); err != nil {
+		t.Fatalf("priming RunCycle() error = %v", err)
+	}
+	dev.mu.Lock()
+	dev.noise = "130 9999 42\r\n"
+	before := len(dev.writes)
+	dev.mu.Unlock()
 
 	if err := poller.RunCycle(context.Background()); err != nil {
 		t.Fatalf("RunCycle() error = %v", err)
@@ -211,7 +221,7 @@ func TestStaleFrameDoesNotDesyncTheStream(t *testing.T) {
 	if got, _ := pub.get("aerosmart/innentemp"); got != "21.5" {
 		t.Errorf("innentemp = %q, want 21.5", got)
 	}
-	if n := dev.writeCount(); n != len(readRegisters) {
+	if n := dev.writeCount() - before; n != len(readRegisters) {
 		t.Errorf("commands written = %d, want %d (a stale frame must not trigger a re-send)", n, len(readRegisters))
 	}
 }

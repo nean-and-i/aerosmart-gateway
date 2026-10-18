@@ -207,6 +207,17 @@ func TestRegistersValidateRejectsInvertedRange(t *testing.T) {
 	}
 }
 
+// A negative confirm_step would make no reading ever trusted on its own, not
+// even an unchanged one, doubling every read for no gain.
+func TestRegistersValidateRejectsNegativeConfirmStep(t *testing.T) {
+	cfg := &RegistersConfig{ReadRegisters: []ReadRegisterConfig{
+		{Name: "a", Command: "130 1", Topic: "t/a", MinValue: 0, MaxValue: 5, ConfirmStep: -1},
+	}}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("Validate() = nil, want an error about a negative confirm_step")
+	}
+}
+
 func TestValidateErrorsAreWrapped(t *testing.T) {
 	cfg := &AppConfig{}
 	cfg.applyDefaults()
