@@ -361,6 +361,15 @@ func (c *Client) subscribe(topic string, handler MessageHandler) error {
 	}
 
 	callback := func(_ paho.Client, msg paho.Message) {
+		// The broker hands a retained message to every new subscription, and
+		// every reconnect re-subscribes. A command published with the retain
+		// flag would be applied again after each connection blip - an
+		// hours-old party mode coming back. Only live commands are applied.
+		if msg.Retained() {
+			c.logger.Warn("MQTT: ignoring retained command %s=%s; publish commands without the retain flag",
+				msg.Topic(), msg.Payload())
+			return
+		}
 		handler(msg.Topic(), string(msg.Payload()))
 	}
 

@@ -148,10 +148,11 @@ func TestDerivedCalculator_DivisionByZero(t *testing.T) {
 
 	results := calc.Calculate(sourceValues)
 
-	// Should return 100 as fallback
+	// A stopped exhaust fan has no ratio: no division by zero, and no
+	// misleading "balanced" 100 either.
 	if val, ok := results["zuluftabluftprozent"]; !ok {
 		t.Error("Expected zuluftabluftprozent in results")
-	} else if val.Value != "100.0" {
-		t.Errorf("Expected zuluftabluftprozent = 100.0, got %s", val.Value)
+	} else if val.Valid {
+		t.Errorf("zuluftabluftprozent = %q (valid), want it marked invalid", val.Value)
 	}
 }

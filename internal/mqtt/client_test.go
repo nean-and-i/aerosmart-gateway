@@ -47,6 +47,7 @@ type fakePaho struct {
 	connected bool
 	publishes []publishCall
 	subs      []string
+	handlers  map[string]paho.MessageHandler
 	disconns  int
 
 	// token decides the outcome of each Publish.
@@ -82,9 +83,13 @@ func (f *fakePaho) Publish(topic string, _ byte, retained bool, payload any) pah
 	return &fakeToken{completes: true}
 }
 
-func (f *fakePaho) Subscribe(topic string, _ byte, _ paho.MessageHandler) paho.Token {
+func (f *fakePaho) Subscribe(topic string, _ byte, handler paho.MessageHandler) paho.Token {
 	f.mu.Lock()
 	f.subs = append(f.subs, topic)
+	if f.handlers == nil {
+		f.handlers = map[string]paho.MessageHandler{}
+	}
+	f.handlers[topic] = handler
 	f.mu.Unlock()
 	return &fakeToken{completes: true}
 }
@@ -107,6 +112,29 @@ func (f *fakePaho) publishCount(topic string) int {
 	}
 	return n
 }
+
+// deliver hands a message to the callback subscribed for topic, the way
+// paho's router does.
+func (f *fakePaho) deliver(topic, payload string, retained bool) {
+	f.mu.Lock()
+	handler := f.handlers[topic]
+	f.mu.Unlock()
+	handler(f, fakeMessage{topic: topic, payload: payload, retained: retained})
+}
+
+// fakeMessage satisfies paho.Message.
+type fakeMessage struct {
+	topic, payload string
+	retained       bool
+}
+
+func (m fakeMessage) Duplicate() bool   { return false }
+func (m fakeMessage) Qos() byte         { return 1 }
+func (m fakeMessage) Retained() bool    { return m.retained }
+func (m fakeMessage) Topic() string     { return m.topic }
+func (m fakeMessage) MessageID() uint16 { return 1 }
+func (m fakeMessage) Payload() []byte   { return []byte(m.payload) }
+func (m fakeMessage) Ack()              {}
 
 type nopLogger struct{}
 
@@ -273,6 +301,26 @@ func TestSubscribeTracksTopicForRecovery(t *testing.T) {
 	fake.mu.Unlock()
 	if len(got) != 1 || got[0] != "dw/aerosmart/luefterstufe" {
 		t.Errorf("resubscribed topics = %v, want the tracked topic", got)
+	}
+}
+
+// The broker delivers a retained message on every subscribe, and the gateway
+// re-subscribes after every reconnect. A command someone published with the
+// retain flag would be applied again each time the connection blipped.
+func TestRetainedCommandsAreNotDelivered(t *testing.T) {
+	fake := &fakePaho{connected: true}
+	c := testClient(t, fake)
+
+	var got []string
+	if err := c.Subscribe("dw/aerosmart/luefterstufe", func(_, payload string) { got = append(got, payload) }); err != nil {
+		t.Fatalf("Subscribe() error = %v", err)
+	}
+
+	fake.deliver("dw/aerosmart/luefterstufe", "5", true)
+	fake.deliver("dw/aerosmart/luefterstufe", "2", false)
+
+	if len(got) != 1 || got[0] != "2" {
+		t.Errorf("handler received %v, want only the live command [2]", got)
 	}
 }
 
