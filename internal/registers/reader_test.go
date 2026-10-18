@@ -791,17 +791,34 @@ func TestDerivedSkipsRegistersWithMissingSources(t *testing.T) {
 	}
 }
 
-func TestDerivedDivisionByZeroGuard(t *testing.T) {
+// Both fans idle is balanced airflow.
+func TestDerivedRatioOfTwoIdleFansIsBalanced(t *testing.T) {
 	d := NewDerivedCalculator(newFakePublisher(), testLogger(), []config.DerivedRegisterConfig{
 		{Name: "zuluftabluftprozent", Topic: "aerosmart/z", Sources: []string{"zuluftumin", "abluftumin"}},
 	})
 
 	values := d.Calculate(map[string]*RegisterValue{
-		"zuluftumin": {Name: "zuluftumin", Value: "120", Valid: true},
+		"zuluftumin": {Name: "zuluftumin", Value: "0", Valid: true},
 		"abluftumin": {Name: "abluftumin", Value: "0", Valid: true},
 	})
 	if v := values["zuluftabluftprozent"]; v == nil || !v.Valid || v.Value != "100.0" {
 		t.Errorf("zuluftabluftprozent = %+v, want valid 100.0", v)
+	}
+}
+
+// A stopped exhaust fan with the supply fan running is exactly the fault this
+// ratio should expose; reporting it as a balanced 100% hid it.
+func TestDerivedRatioWithAStoppedExhaustFanIsInvalid(t *testing.T) {
+	d := NewDerivedCalculator(newFakePublisher(), testLogger(), []config.DerivedRegisterConfig{
+		{Name: "zuluftabluftprozent", Topic: "aerosmart/z", Sources: []string{"zuluftumin", "abluftumin"}},
+	})
+
+	values := d.Calculate(map[string]*RegisterValue{
+		"zuluftumin": {Name: "zuluftumin", Value: "1200", Valid: true},
+		"abluftumin": {Name: "abluftumin", Value: "0", Valid: true},
+	})
+	if v := values["zuluftabluftprozent"]; v == nil || v.Valid {
+		t.Errorf("zuluftabluftprozent = %+v, want invalid", v)
 	}
 }
 

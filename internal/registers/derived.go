@@ -86,6 +86,9 @@ func (d *DerivedCalculator) calculateSingle(derived config.DerivedRegisterConfig
 		return "", fmt.Errorf("%w: %s", ErrNoFormula, derived.Name)
 	}
 	result := fn(sources)
+	if math.IsNaN(result) || math.IsInf(result, 0) {
+		return "", fmt.Errorf("no meaningful value from sources %v", sources)
+	}
 
 	// Format result
 	return fmt.Sprintf("%.1f", result), nil
@@ -104,8 +107,13 @@ var derivedFormulas = map[string]func(src map[string]float64) float64{
 	"zuluftabluftprozent": func(src map[string]float64) float64 {
 		abluft := src["abluftumin"]
 		if abluft == 0 {
-			// Both fans idle: report balanced rather than dividing by zero.
-			return 100
+			if src["zuluftumin"] == 0 {
+				// Both fans idle: balanced.
+				return 100
+			}
+			// The exhaust fan has stopped while the supply fan runs. There
+			// is no ratio, and calling it balanced would hide the fault.
+			return math.NaN()
 		}
 		return math.Round((src["zuluftumin"]/abluft)*100*10) / 10
 	},
