@@ -108,7 +108,6 @@ cp config/config.yaml.example config.yaml
 serial:
   port: "/dev/ttyUSB0"
   baudrate: 115200
-  # Rounded up to a multiple of 100ms (kernel VTIME granularity)
   read_timeout: 200
   response_timeout: 300
   retries: 3
@@ -183,10 +182,12 @@ All timeouts are in milliseconds.
 | `serial.bytesize` | Data bits (5-8) | `8` |
 | `serial.parity` | Parity: `N`, `O` or `E` | `N` |
 | `serial.stopbits` | Stop bits (1 or 2) | `1` |
-| `serial.read_timeout` | How long one read may block. The kernel expresses this as termios `VTIME` in deciseconds, so it is rounded up to a multiple of 100 | `200` |
+| `serial.read_timeout` | How long one read may block. A read is also cut short at the response deadline | `200` |
 | `serial.response_timeout` | Budget for one command/response exchange. Stale or unmatched frames are discarded within this window | `300` |
-| `serial.retries` | Attempts per register operation. This is the only retry level in the stack | `3` |
-| `serial.retry_backoff` | Delay between attempts | `100` |
+| `serial.bus_quiet_gap` | How long the bus must be silent before a command is transmitted, so it does not collide with the control panel's traffic | `20` |
+| `serial.bus_quiet_max_wait` | Upper bound on the wait for a quiet bus | `100` |
+| `serial.retries` | Attempts per register operation. This is the only retry level in the stack, and it also pays for confirming a changed reading, so there are always at least 2 | `3` |
+| `serial.retry_backoff` | Delay between attempts, jittered by up to half again | `100` |
 | `serial.reopen_backoff` | Initial delay between port reopen attempts | `500` |
 | `serial.reopen_max_backoff` | Maximum reopen delay | `30000` |
 | `serial.health_check_interval` | How often port health is polled | `1000` |
@@ -197,12 +198,11 @@ All timeouts are in milliseconds.
 | `serial.dsrdtr` | Hardware flow control. **Not supported by the driver**; warned about, no effect | `false` |
 
 Worst-case time for one register is
-`retries x (response_timeout + read_timeout + retry_backoff)`, so with the defaults
-3 x 600ms = 1.8s. The `read_timeout` term is there because an attempt can pass its response
-deadline only after a read that has already started, and that read blocks for a full
-`read_timeout`. Startup rejects a configuration whose worst-case full cycle (that figure
-times the number of read registers) does not fit inside `read_interval`; with the shipped
-29 registers that is 52.2s against a 120s interval.
+`max(retries, 2) x (bus_quiet_max_wait + response_timeout + 1.5 x retry_backoff)`, so with
+the defaults 3 x 550ms = 1.65s. Startup rejects a configuration whose worst-case full cycle
+(that figure times the number of read registers) does not fit inside `read_interval`; with
+the shipped 29 registers that is 47.9s, inside both the shipped 120s interval and the 60s
+default.
 
 Options from earlier versions (`max_retries`, `read_max_retries`, `write_max_retries`,
 `device_response_delay`, `read_with_retry_delay`, `write_with_retry_delay`, `deadline_timeout`,
@@ -315,8 +315,11 @@ Example of Home Assistant dashboard:
    previous cycle so an overrunning readout still leaves the device an idle gap
 2. The cycle is skipped if a write is in flight or the port is being recovered, and retried
    shortly afterwards rather than after a full interval
-3. Registers are read sequentially: send command → read matching frame → apply divisor →
-   validate range → publish
+3. Registers are read sequentially: wait for a quiet bus → send command → read matching
+   frame → apply divisor → validate range → confirm → publish. A reading is trusted when it
+   is within `confirm_step` of the last trusted value; otherwise it is read again and
+   trusted only if the two agree, with a third read to break a tie. A register whose
+   readings never agree is not published that cycle, so its previous value stands
 4. Each write register's state topic is republished from its `state_from` register, so a
    mode the unit changed by itself - party mode expiring, or the panel being used - reaches
    Home Assistant, and the entities are restored after a restart
@@ -335,29 +338,44 @@ Example of Home Assistant dashboard:
    read cycle
 3. A duplicate of the last command accepted for that topic, within one second, is dropped
 4. The read cycle is preempted, and released again on every exit path
-5. The command is sent **once**. The unit applies writes but does not reliably echo them,
-   so nothing waits for an echo and a landed command is never re-sent
+5. The command is sent, with the value as parsed (`"03"` goes out as `3`). The unit applies
+   writes but does not reliably echo them, so nothing waits for an echo
 6. After `write_settle_delay`, the register named by `state_from` is read back. Its value —
    what the unit actually holds — is published to the write register's state topic, so Home
    Assistant shows reality rather than the request. Any `verify_registers` are read and
-   published to their own topics too. A value differing from the request is reported as an
-   error, with the actual value published
-7. After `write_resettle_delay` the same registers are read once more, because
+   published to their own topics too
+7. If the read-back disagrees with the command, or nothing could be read back, the command
+   is sent **once more** and read back again: a collision on the shared bus can corrupt a
+   command on its way to the unit, and writes set an absolute value, so a re-send is
+   harmless. A value still differing after that is reported as an error, with the actual
+   value published. With `state_from` configured, a state that could not be read back is
+   not published at all; without it, the commanded value is the only state there is
+8. After `write_resettle_delay` the same registers are read once more, whatever the
+   outcome of the write, because
    some values trail the command — the actual fan stage still reported the old value 60 ms
    after a stage change. Repeated commands restart that wait, so one read happens after the
    changes stop rather than one per command
 
 ### Reliability
 
-The serial link is treated as lossy throughout.
+The serial link is treated as lossy and shared: the unit's control panel talks on the same
+bus, does not coordinate with the gateway, and the protocol carries no checksum.
 
 - **Framing**: received bytes are buffered persistently, so a frame split across reads is
   reassembled rather than discarded. Discarding a partial frame leaves its tail to arrive
   alone, which desyncs every later frame.
-- **Frame matching**: a transaction reads until it sees the frame whose `<node> <register>`
-  prefix matches its own command, discarding stale or unsolicited frames. The command is
-  never re-sent to resync, which keeps writes idempotent.
-- **Retries**: one level, bounded by a wall-clock budget per register.
+- **Listen before talking**: a command is only transmitted once the bus has been quiet for
+  `bus_quiet_gap`, and is drained before its reply is awaited. Only input is ever discarded;
+  discarding output as well used to lose a command that had been written but not yet sent.
+- **Frame matching**: a transaction reads until it sees a frame of exactly
+  `<node> <register> <integer>` whose prefix matches its own command, discarding stale,
+  unsolicited or corrupted frames. A lost newline that splices two frames, or a corrupted
+  byte inside one, rejects it. The command is never re-sent to resync.
+- **Confirmation**: a corrupted reply can still parse as a plausible number, so a reading
+  that moved more than `confirm_step` from the last trusted value is only trusted once a
+  second read agrees. Out-of-range readings are treated as corrupted, never clamped.
+- **Retries**: one level, shared between failures and confirmation, bounded by a wall-clock
+  budget per register, with jittered backoff so retries do not stay in step with the panel.
 - **Port recovery**: closing and reopening the port is reserved for genuine port errors
   (`EIO`, `ENODEV`, `ENXIO`) and performed by a single supervisor with exponential backoff.
   A reopen toggles DTR/RTS, which many devices treat as a reset, so it is never used as a
@@ -370,7 +388,9 @@ The serial link is treated as lossy throughout.
   not published.
 - **MQTT**: every broker interaction is bounded by `mqtt.op_timeout`; connection loss triggers
   automatic reconnection and re-subscription. A clean session is used so the broker does not
-  queue commands while the gateway is offline and replay them at startup.
+  queue commands while the gateway is offline and replay them at startup, and retained
+  messages on command topics are ignored, since the broker would hand them over again on
+  every reconnect.
 
 ## Running as a Service
 
@@ -443,6 +463,8 @@ Read registers additionally take:
 - `divisor`: Value divisor (for float conversion)
 - `type`: Value type (`integer` or `float`)
 - `min_value` / `max_value`: Valid range; a reading outside it is not published
+- `confirm_step`: How far a reading may move from the last trusted value and still be
+  trusted without a second read, in processed units (default `0`: any change is confirmed)
 
 Write registers additionally take:
 
@@ -470,5 +492,5 @@ This project is licensed under the GNU General Public License v3.0 - see the [LI
 
 ## Acknowledgments
 
-- Serial communication library: [tarm/serial](https://github.com/tarm/serial)
+- Serial communication library: [go.bug.st/serial](https://github.com/bugst/go-serial)
 - MQTT client library: [eclipse/paho.mqtt.golang](https://github.com/eclipse/paho.mqtt.golang)

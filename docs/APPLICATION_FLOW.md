@@ -90,10 +90,11 @@ against a scripted device (see `internal/integration`).
 2. Load `registers.yaml` and validate: duplicate names, missing topics, command templates
    without `{value}`, `verify_registers` naming registers that do not exist.
 3. Check the retry budget: the worst-case full cycle
-   (`retries x (response_timeout + read_timeout + retry_backoff) x read register count`)
-   must fit inside `read_interval`. The `read_timeout` term matters because an attempt can
-   pass its response deadline only after a read that has already started, and that read
-   blocks for a full `read_timeout`.
+   (`max(retries, 2) x (bus_quiet_max_wait + response_timeout + 1.5 x retry_backoff) x read
+   register count`) must fit inside `read_interval`. Reads are cut short at the response
+   deadline, so `read_timeout` adds nothing; the backoff is jittered by up to half again;
+   and confirming a changed reading needs a second attempt, so there are always at least
+   two.
 4. Check that every configured derived register has an implementation and lists every
    source its formula reads.
 5. Report anything that works but should be fixed as a warning — settings the driver cannot
@@ -123,9 +124,10 @@ readFrame(deadline):
         return the line, KEEP the remainder buffered
     if buffer > maxFrameLen:
         drop the buffer, report ErrFrameOverflow      # resync
-    if past deadline:
+    wait = min(read_timeout, time left until deadline)
+    if wait <= 0:
         return ErrReadTimeout                          # partial data stays buffered
-    n, err = port.Read(scratch)
+    n, err = port.Read(scratch) blocking at most wait  # never overruns the deadline
     if n > 0:
         append to buffer; continue                     # consume before judging err
     if err is a real I/O error:
@@ -136,30 +138,48 @@ Two details matter:
 
 - The scan is forward and keeps the remainder, so a burst carrying several frames yields
   them one at a time instead of only the last.
-- `tarm/serial` opens the tty with `VMIN=0`, so a read whose `VTIME` expires returns zero
-  bytes, which `os.File` reports as `io.EOF`. That is a timeout, not a broken port — it is
-  classified by `IsTimeout`, not `IsPortError`.
+- `go.bug.st/serial` reports a read timeout as zero bytes and no error; other transports
+  report it as `io.EOF` or a deadline. That is a timeout, not a broken port — it is
+  classified by `IsTimeout`, not `IsPortError`. The driver's own `PortError` does not wrap
+  an errno, so `IsPortError` recognises its closed / not-found / invalid-port codes
+  explicitly.
 
 ### Transactions
 
 ```
 Transact(ctx, command):
   hold txMu                       # one exchange on the wire at a time
+  read and discard until the bus has been silent for bus_quiet_gap,
+      or bus_quiet_max_wait has passed   # the panel shares the bus
   reset the software buffer
-  port.Flush()                    # TCIOFLUSH: discard stale input, instantly
+  port.ResetInputBuffer()         # TCIFLUSH: discard stale input only
   write command + "\r\n"
+  port.Drain()                    # wait until it has actually been transmitted
   deadline = now + response_timeout
   loop:
     check ctx                     # a write is waiting
     frame = readFrame(deadline)
-    if frame matches "<node> <register>" of the command:
+    if frame is exactly "<node> <register> <integer>" for this command:
         return its value
     discard the frame and keep reading
 ```
 
-`Flush` is the driver's `TCIOFLUSH` ioctl. The earlier implementation drained the input by
-performing timed reads, which cost roughly 330ms before every command and cleared nothing
-the ioctl would not.
+`Send`, used for register writes, does the same up to and including the drain.
+
+The unit's control panel talks on the same bus and does not coordinate with the gateway, and
+the protocol has no checksum. Three details follow from that:
+
+- **Listen before talking.** Transmitting into one of the panel's frames corrupts both. The
+  bytes discarded while waiting cannot be a reply to anything of ours: the previous
+  exchange has finished and this command has not been sent yet. The wait is bounded, so a
+  device that never pauses delays commands rather than blocking them.
+- **Only input is discarded.** The previous driver's `Flush` was `TCIOFLUSH`, which also
+  threw away output not yet transmitted — so a transaction starting right after `Send`
+  could delete the write `Send` had just reported as sent. Draining makes "sent" mean sent.
+- **Strict frames.** A collision can splice two frames (`130 1067 3 130 5003 4`) or corrupt
+  a byte inside one while the prefix still matches. Anything but exactly three fields with
+  an integer value is rejected. Non-printable line noise around a frame is trimmed, since
+  it cannot change the value; inside a frame it rejects it.
 
 ### Port health
 
@@ -192,16 +212,30 @@ Poller.RunCycle(ctx):
   DerivedCalculator on the same snapshot, then publish
 ```
 
-`ReadSingle` is the only retry level:
+`ReadSingle` is the only retry level, and it also confirms readings:
 
 ```
-for attempt in 1..retries:
-    check ctx; back off between attempts
+for attempt in 1..max(retries, 2):
+    check ctx; back off (jittered by up to half again) between attempts
     value = Transact(ctx, register.command)
-    on success: apply divisor, format by type, return
     on context cancellation: return
     on a port error: stop -- the supervisor owns recovery
+    on another error: next attempt
+    apply divisor, format by type, validate range
+    out of range: next attempt                     # most likely a corrupted frame
+    within confirm_step of the last trusted value: trust it, return
+    equal to an earlier reading in this call: trust it, return
+    otherwise keep it and read again
+readings that never agreed: ErrUnconfirmed (the register is invalid this cycle)
 ```
+
+A corrupted reply can still parse as a plausible number — a dropped digit turns 21.5 degrees
+into 2.15 — and passes a wide range check. So a reading is only trusted on its own when it
+is within `confirm_step` (default `0`) of the last trusted value; any other change needs a
+second read that agrees. Failures, confirmations and tie-breaks share one budget of
+attempts, so confirming never lengthens the worst case. Out-of-range readings are never
+clamped: `luefterstatus` used to be, which turned a corrupted frame into a confident
+"highest stage".
 
 A register that cannot be read is recorded as invalid and **not published**. With retained
 MQTT messages, republishing the last good value would make a dead sensor look alive;
@@ -231,15 +265,30 @@ HandleMessage(ctx, topic, payload):
   parse the payload as an integer              -> invalid: return an error
   range-check it                               -> out of range: return an error
   drop it if identical to the last accepted command for this topic within 1s
+                                               # compared as parsed: "03" == "3"
   gate.Preempt(); defer gate.Release()         # released on EVERY exit path
-  send the command ONCE                        # retried only on a write error
-  wait write_settle_delay
-  read state_from                              # what the unit actually holds
-  read back verify_registers
-  publish that actual value as the register's state, plus the verified values
-  report an error if the unit is holding something other than what was asked
-  schedule one more read after write_resettle_delay   # for values that lag
+  defer: schedule one more read after write_resettle_delay
+                                               # whatever the outcome
+  up to twice:
+      send the command                         # the parsed value; retried on a write error
+      wait write_settle_delay
+      read state_from                          # what the unit actually holds
+      read back verify_registers               # each confirmed like any other read
+      stop if the unit holds what was asked
+  publish state_from's value as the register's state, plus the verified values
+      (state_from configured but unreadable: publish nothing)
+  report an error if the unit still holds something else, or nothing could be read
 ```
+
+A disagreeing or missing read-back earns exactly one re-send. On the shared bus a collision
+can corrupt the command on its way to the unit, and since a write sets an absolute value,
+sending it again is harmless. A unit that genuinely refuses the value is reported after the
+second attempt, with the value it actually holds published.
+
+Retained messages on command topics are ignored. The broker hands a retained message to
+every new subscription, and the gateway re-subscribes after every reconnect, so a command
+published with the retain flag would otherwise be applied again after each connection
+blip.
 
 The command is remembered for deduplication as soon as it reaches the wire, not
 when it is confirmed. This unit applies writes whether or not it confirms them,
@@ -256,9 +305,10 @@ attempts and yet `140 1038 1`, the heating-element request status, appeared on
 the wire.
 
 Waiting for an echo therefore failed writes that had succeeded, and each retry
-re-applied a setting that was already in effect. A write is now sent once and
-confirmed by reading `verify_registers` back, which the unit answers reliably
-(measured 14-48ms, every read in a 58-read sample).
+re-applied a setting that was already in effect. A write is confirmed by reading
+`state_from` and `verify_registers` back instead, which the unit answers
+reliably (measured 14-48ms, every read in a 58-read sample), and is re-sent only
+when that read-back disputes it.
 
 A write register with no `state_from` or `verify_registers` cannot be confirmed;
 the command is still sent and a warning says so.
@@ -387,6 +437,9 @@ told to publish to cannot drift from the one the gateway listens on.
 |---------|----------|
 | Frame split across reads | Buffered and reassembled |
 | Stale or unsolicited frame | Discarded; reading continues within the response budget |
+| Panel transmitting when a command is due | Wait for `bus_quiet_gap` of silence, up to `bus_quiet_max_wait` |
+| Spliced or corrupted frame | Rejected by the strict frame format |
+| Corrupted reply that still parses | Not trusted until a second read agrees; never clamped |
 | No reply | Retried up to `retries`, then the register is marked invalid |
 | Frame with no terminator | Buffer dropped, stream resynced |
 | `EIO` / adapter unplugged | Port marked unhealthy; supervisor reopens with backoff; cycles are skipped meanwhile |
@@ -395,7 +448,8 @@ told to publish to cannot drift from the one the gateway listens on.
 | Broker stops acknowledging | Each operation fails after `op_timeout` |
 | Command arrives mid-cycle | Cycle cancelled, command applied, cycle retried shortly after |
 | Write not echoed by the unit | Expected; the write is confirmed by reading `state_from` and `verify_registers` back |
-| Write cannot be confirmed | Reported as an error, but the command was sent and may have taken effect; the next cycle shows the truth |
+| Write read-back disagrees or is unreadable | Re-sent once; then reported as an error, with the actual value (if any) published and a settle re-read scheduled |
+| Retained message on a command topic | Ignored with a warning |
 | Unsolicited broadcast frames | Discarded by the frame matcher, including from node addresses that are not configured registers |
 | Commands arriving faster than they can be applied | Queued up to 16, then dropped with an error; the MQTT router is never blocked |
 | Log file cannot be opened | Falls back to console logging, which is enabled for the fallback |
@@ -422,10 +476,12 @@ told to publish to cannot drift from the one the gateway listens on.
 | `port` | `/dev/ttyUSB0` | Device path |
 | `baudrate` | `115200` | Line speed |
 | `bytesize` / `parity` / `stopbits` | `8` / `N` / `1` | Line settings, all applied |
-| `read_timeout` | `200` | Per-read block time; rounded up to a multiple of 100 (kernel `VTIME`) |
+| `read_timeout` | `200` | Per-read block time; cut short at the response deadline |
 | `response_timeout` | `300` | Budget for one exchange; raised to `read_timeout` if smaller |
-| `retries` | `3` | Attempts per register operation |
-| `retry_backoff` | `100` | Delay between attempts |
+| `bus_quiet_gap` | `20` | Silence required on the shared bus before transmitting |
+| `bus_quiet_max_wait` | `100` | Upper bound on the wait for a quiet bus |
+| `retries` | `3` | Attempts per register operation, shared with confirmation; at least 2 |
+| `retry_backoff` | `100` | Delay between attempts, jittered by up to half again |
 | `reopen_backoff` / `reopen_max_backoff` | `500` / `30000` | Supervised reopen backoff |
 | `health_check_interval` | `1000` | Port health poll interval |
 | `write_priority_timeout` | `10000` | Maximum time a write may hold reads off |
