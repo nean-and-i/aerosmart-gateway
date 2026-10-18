@@ -343,3 +343,156 @@ func TestPreemptedReadDoesNotLogAsSerialFailure(t *testing.T) {
 		t.Errorf("a cancelled read was logged as a serial failure: %q", out)
 	}
 }
+
+// ---------- shared bus ----------
+
+// countCalls reports how many times command was put on the wire.
+func countCalls(dev *fakeDevice, command string) int {
+	dev.mu.Lock()
+	defer dev.mu.Unlock()
+	n := 0
+	for _, c := range dev.calls {
+		if c == command {
+			n++
+		}
+	}
+	return n
+}
+
+// pendingSeq reports the write sequence a settle re-read is scheduled for.
+func pendingSeq(w *Writer, name string) (uint64, bool) {
+	w.resettle.mu.Lock()
+	defer w.resettle.mu.Unlock()
+	entry, ok := w.resettle.pending[name]
+	return entry.seq, ok
+}
+
+// A collision on the shared bus can corrupt the command on its way to the
+// unit. Writes set an absolute value, so sending it again is harmless, and a
+// read-back that disagrees is the only sign the first one was lost.
+func TestHandleMessageResendsWhenTheReadBackDisagrees(t *testing.T) {
+	dev := &fakeDevice{
+		responses: map[string]string{"130 1067": "2"},
+		sequences: map[string][]string{"130 5003": {"4", "4", "2", "2"}},
+	}
+	pub := newFakePublisher()
+	w, reg := stateWriter(t, dev, pub, NewReadGate(time.Second))
+
+	if err := w.HandleMessage(context.Background(), reg.SubscribeTopic, "2"); err != nil {
+		t.Fatalf("HandleMessage() error = %v, want success after the re-send", err)
+	}
+	if n := countCalls(dev, "130 5002 2"); n != 2 {
+		t.Errorf("command sent %d times, want 2 (the original and one re-send)", n)
+	}
+	if v, _ := pub.get(reg.Topic); v != "2" {
+		t.Errorf("state topic = %q, want 2", v)
+	}
+}
+
+func TestHandleMessageResendsAtMostOnce(t *testing.T) {
+	// Asked for 2, but the unit stays on 4: it may simply refuse the value.
+	dev := &fakeDevice{responses: map[string]string{"130 1067": "4", "130 5003": "4"}}
+	pub := newFakePublisher()
+	w, reg := stateWriter(t, dev, pub, NewReadGate(time.Second))
+
+	if err := w.HandleMessage(context.Background(), reg.SubscribeTopic, "2"); err == nil {
+		t.Fatal("HandleMessage() error = nil, want the refusal reported")
+	}
+	if n := countCalls(dev, "130 5002 2"); n != 2 {
+		t.Errorf("command sent %d times, want 2", n)
+	}
+	if v, _ := pub.get(reg.Topic); v != "4" {
+		t.Errorf("state topic = %q, want the actual value 4", v)
+	}
+}
+
+func TestHandleMessageResendsWhenNothingCanBeReadBack(t *testing.T) {
+	dev := &fakeDevice{} // answers no reads
+	w, reg := stateWriter(t, dev, newFakePublisher(), NewReadGate(time.Second))
+
+	if err := w.HandleMessage(context.Background(), reg.SubscribeTopic, "3"); err == nil {
+		t.Fatal("HandleMessage() error = nil, want an unconfirmed-write error")
+	}
+	if n := countCalls(dev, "130 5002 3"); n != 2 {
+		t.Errorf("command sent %d times, want 2", n)
+	}
+}
+
+// With state_from configured, the state topic carries what the unit holds. If
+// that could not be read, publishing the commanded value would show Home
+// Assistant a state nobody verified.
+func TestHandleMessageDoesNotPublishAnUnverifiedState(t *testing.T) {
+	dev := &fakeDevice{}
+	pub := newFakePublisher()
+	w, reg := stateWriter(t, dev, pub, NewReadGate(time.Second))
+
+	_ = w.HandleMessage(context.Background(), reg.SubscribeTopic, "3")
+
+	if v, ok := pub.get(reg.Topic); ok {
+		t.Errorf("state topic = %q, want nothing published for an unverified write", v)
+	}
+}
+
+// A refused or unconfirmed write still needs the settle re-read: the command
+// bumped the write sequence, which cancelled any earlier one, and the value
+// may yet change.
+func TestHandleMessageSchedulesASettleReReadWhenTheWriteIsRefused(t *testing.T) {
+	dev := &fakeDevice{responses: map[string]string{"130 1067": "4", "130 5003": "4"}}
+	w, reg := stateWriter(t, dev, newFakePublisher(), NewReadGate(time.Second))
+	w.resettle = newResettler(time.Hour, (&seqRecorder{}).refresh, testLogger())
+
+	_ = w.HandleMessage(context.Background(), reg.SubscribeTopic, "2")
+
+	if seq, ok := pendingSeq(w, reg.Name); !ok || seq != w.WriteSequence(reg.Name) {
+		t.Errorf("pending re-read = (%d, %v), want one for sequence %d", seq, ok, w.WriteSequence(reg.Name))
+	}
+}
+
+func TestHandleMessageSchedulesASettleReReadWhenTheWriteIsUnconfirmed(t *testing.T) {
+	dev := &fakeDevice{}
+	w, reg := stateWriter(t, dev, newFakePublisher(), NewReadGate(time.Second))
+	w.resettle = newResettler(time.Hour, (&seqRecorder{}).refresh, testLogger())
+
+	_ = w.HandleMessage(context.Background(), reg.SubscribeTopic, "3")
+
+	if seq, ok := pendingSeq(w, reg.Name); !ok || seq != w.WriteSequence(reg.Name) {
+		t.Errorf("pending re-read = (%d, %v), want one for sequence %d", seq, ok, w.WriteSequence(reg.Name))
+	}
+}
+
+// The command is built from the parsed number, not the raw payload: "+3" and
+// "03" parse as 3 but would otherwise reach the unit as written.
+func TestHandleMessageSendsTheParsedValue(t *testing.T) {
+	for _, payload := range []string{"+3", "03", " 3 "} {
+		t.Run(payload, func(t *testing.T) {
+			dev := &fakeDevice{responses: map[string]string{"130 1067": "3", "130 5003": "3"}}
+			w, reg := stateWriter(t, dev, newFakePublisher(), NewReadGate(time.Second))
+
+			if err := w.HandleMessage(context.Background(), reg.SubscribeTopic, payload); err != nil {
+				t.Fatalf("HandleMessage(%q) error = %v", payload, err)
+			}
+			if n := countCalls(dev, "130 5002 3"); n != 1 {
+				dev.mu.Lock()
+				t.Errorf("calls = %q, want exactly one %q", dev.calls, "130 5002 3")
+				dev.mu.Unlock()
+			}
+		})
+	}
+}
+
+// "3" and "03" are the same command, so a redelivery spelled differently is
+// still a redelivery.
+func TestDedupeComparesParsedValues(t *testing.T) {
+	dev := &fakeDevice{responses: map[string]string{"130 1067": "3", "130 5003": "3"}}
+	w, reg := stateWriter(t, dev, newFakePublisher(), NewReadGate(time.Second))
+
+	if err := w.HandleMessage(context.Background(), reg.SubscribeTopic, "3"); err != nil {
+		t.Fatalf("HandleMessage(3) error = %v", err)
+	}
+	if err := w.HandleMessage(context.Background(), reg.SubscribeTopic, "03"); err != nil {
+		t.Fatalf("HandleMessage(03) error = %v", err)
+	}
+	if n := countCalls(dev, "130 5002 3") + countCalls(dev, "130 5002 03"); n != 1 {
+		t.Errorf("command sent %d times, want 1 (the second is a redelivery)", n)
+	}
+}

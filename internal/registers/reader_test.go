@@ -618,14 +618,17 @@ func TestHandleMessageAlwaysReleasesGate(t *testing.T) {
 // A failed command must remain retryable: deduplication may only remember
 // commands that actually reached the device.
 func TestHandleMessageRetryableAfterFailure(t *testing.T) {
-	dev := &fakeDevice{failFirst: 3} // fail the first attempt's retries, then succeed
-	dev.responses = map[string]string{"130 5002 3": "3", "130 1067": "3"}
+	dev := &fakeDevice{sendErr: serial.ErrPortNotOpen} // the first command never reaches the wire
+	dev.responses = map[string]string{"130 1067": "3"}
 	gate := NewReadGate(time.Second)
 	w := testWriter(dev, newFakePublisher(), gate)
 
 	if err := w.HandleMessage(context.Background(), fanWrite.SubscribeTopic, "3"); err == nil {
 		t.Fatal("first HandleMessage() error = nil, want failure")
 	}
+	dev.mu.Lock()
+	dev.sendErr = nil
+	dev.mu.Unlock()
 	if err := w.HandleMessage(context.Background(), fanWrite.SubscribeTopic, "3"); err != nil {
 		t.Fatalf("retry of the same command error = %v, want nil (it must not be deduplicated)", err)
 	}
@@ -1296,7 +1299,8 @@ func TestDedupeDoesNotSwallowACorrectionAfterAnUnconfirmedWrite(t *testing.T) {
 			sent = append(sent, c)
 		}
 	}
-	want := []string{"130 5002 2", "130 5002 4", "130 5002 2"}
+	// Each disagreeing read-back earns one re-send.
+	want := []string{"130 5002 2", "130 5002 2", "130 5002 4", "130 5002 4", "130 5002 2", "130 5002 2"}
 	if len(sent) != len(want) {
 		t.Fatalf("commands sent = %v, want %v; the correction was dropped as a duplicate", sent, want)
 	}
