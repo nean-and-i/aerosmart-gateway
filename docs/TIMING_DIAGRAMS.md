@@ -2,8 +2,8 @@
 
 Sequence and timing views of the flows described in
 [Application Flow](APPLICATION_FLOW.md). Figures use the shipped defaults:
-`read_timeout: 200`, `response_timeout: 300`, `retries: 3`, `retry_backoff: 100`,
-`read_interval: 120`.
+`read_timeout: 200`, `response_timeout: 300`, `bus_quiet_gap: 20`,
+`bus_quiet_max_wait: 100`, `retries: 3`, `retry_backoff: 100`, `read_interval: 120`.
 
 ## Table of Contents
 
@@ -52,7 +52,7 @@ The property that keeps a lossy link from desyncing. The buffer survives across 
 device sends:  "130 1067 3\r\n"
 
 read #1 ──▶ "130 10"              buffer: "130 10"        no '\n' yet
-read #2 ──▶ (VTIME expires, io.EOF)  buffer: "130 10"     RETAINED, reported as timeout
+read #2 ──▶ (read times out, 0 bytes) buffer: "130 10"    RETAINED, reported as timeout
 read #3 ──▶ "67 3\r\n"            buffer: "130 1067 3\r\n"
                                    ──▶ frame "130 1067 3", buffer emptied
 ```
@@ -70,29 +70,33 @@ read #1 ──▶ "130 1067 3\r\n130 5003 2\r\n"
 ```
  t=0        Transact("130 1067")
             ├─ take txMu                          (serialises the wire)
+            ├─ listen: panel bytes arrive ──▶     discard, keep listening
+ ~20ms      ├─ 20ms with nothing on the line      bus is quiet (gives up waiting at 100ms)
             ├─ reset software buffer
-            ├─ port.Flush()                       TCIOFLUSH, ~0ms
- ~0ms       ├─ write "130 1067\r\n"               13 bytes, ~1ms at 115200
-            │  deadline = t + 300ms
+            ├─ port.ResetInputBuffer()            TCIFLUSH: input only, ~0ms
+            ├─ write "130 1067\r\n"               13 bytes, ~1ms at 115200
+            ├─ port.Drain()                       returns once the bytes are out
+            │  deadline = now + 300ms
             │
             ├─ readFrame ──▶ "140 9999 1"         unsolicited: DISCARD, keep reading
-            ├─ readFrame ──▶ "130 1067 3"         prefix matches: return "3"
- ~40ms      └─ release txMu
+            ├─ readFrame ──▶ "130 1067 3 1"       not exactly 3 fields: DISCARD
+            ├─ readFrame ──▶ "130 1067 3"         well-formed, prefix matches: return "3"
+ ~60ms      └─ release txMu
 ```
 
-The command is written **once**. A non-matching frame is discarded rather than triggering a
-re-send, which is what keeps writes idempotent.
+The command is written **once** per transaction. A non-matching or malformed frame is
+discarded rather than triggering a re-send.
 
 Silent device:
 
 ```
  t=0    write, deadline = t + 300ms
-        readFrame blocks in the kernel up to read_timeout (200ms), returns io.EOF
-        readFrame again; deadline passes
+        readFrame blocks up to read_timeout (200ms), returns 0 bytes
+        readFrame again, blocking only the 100ms left until the deadline
  300ms  ErrReadTimeout  (any partial bytes stay buffered for the next attempt)
 
-        A read that starts just before the deadline still blocks a full
-        read_timeout, so one attempt can take up to 500ms.
+        Each read is cut short at the deadline, so an attempt never overruns
+        response_timeout.
 ```
 
 ## Periodic read cycle
@@ -103,11 +107,12 @@ Healthy link, 29 read registers:
  t          Poller              Reader             SerialPort        MQTT
  │
  0ms   ├─ health ok, gate ok ──▶│
-       │                        ├─ register 1 ────▶│ ~40ms
+       │                        ├─ register 1 ────▶│ ~60ms   unchanged: trusted
        │                        │◀─ value ─────────┤
-       │                        ├─ register 2 ────▶│ ~40ms
+       │                        ├─ register 2 ────▶│ ~60ms   changed...
+       │                        ├─ register 2 ────▶│ ~60ms   ...confirmed by a 2nd read
        │                        │ ...
- ~1.2s │                        │◀─ 29 registers done
+ ~2-3s │                        │◀─ 29 registers done
        │◀─ values ──────────────┤
        ├─ publish valid values ──────────────────────────────────▶│
        ├─ derived values from the same snapshot ─────────────────▶│
@@ -115,8 +120,10 @@ Healthy link, 29 read registers:
        └─ wait 120s from HERE, so the device always gets an idle gap
 ```
 
-Invalid readings are skipped, not republished — with retained messages a stale value would
-make a dead sensor look alive.
+A reading is trusted on its own only when it is within `confirm_step` of the last trusted
+value; a changed one costs a second read (and the very first cycle reads everything twice).
+Invalid or unconfirmed readings are skipped, not republished — with retained messages a
+stale value would make a dead sensor look alive.
 
 ## Write with verification
 
@@ -129,16 +136,18 @@ make a dead sensor look alive.
                       └──────▶│
          ├─ resolve register
          ├─ parse + range-check         (BEFORE touching the read cycle)
-         ├─ dedupe check
+         ├─ dedupe check                 (on the parsed value)
          ├─ Preempt ──────────────▶│    cancels any in-flight cycle
          ├─ bump write sequence          (supersedes an earlier settle re-read)
- ~1ms    ├─ "130 5002 3" ───────────────────────────▶│  sent ONCE, no echo awaited
+ ~20ms   ├─ "130 5002 3" ───────────────────────────▶│  after a quiet bus; no echo awaited
          ├─ remember as sent             (dedupe compares against what went out)
- ~50ms   ├─ wait write_settle_delay
-         ├─ read lueftermode ───────────────────────▶│ ~40ms   state_from
-         ├─ read luefterstatus ─────────────────────▶│ ~40ms   verify_registers
+ ~70ms   ├─ wait write_settle_delay
+         ├─ read lueftermode ───────────────────────▶│ ~120ms  state_from, changed: 2 reads
+         ├─ read luefterstatus ─────────────────────▶│ ~60ms   verify_registers
          │                                  (each read-back register read ONCE)
- ~130ms  ├─ publish lueftermode's value to the state topic ──────▶│
+         │  disagrees or unreadable? ── yes ──▶ send once more, read back again
+ ~250ms  ├─ publish lueftermode's value to the state topic ──────▶│
+         │                                  (unreadable state_from: publish nothing)
          ├─ publish each read-back register to its own topic ────▶│
          └─ Release (deferred: happens on EVERY exit path)
          ┆
@@ -150,8 +159,10 @@ make a dead sensor look alive.
 ```
 
 Nothing waits for an echo: the unit applies a write whether or not it confirms it, so the
-read-back of `state_from` and `verify_registers` is what makes a write trustworthy, and the
-command is never re-sent. The value published to the state topic is `state_from`'s — what
+read-back of `state_from` and `verify_registers` is what makes a write trustworthy. The
+command is re-sent exactly once, and only when that read-back disputes it: a collision on
+the shared bus can corrupt a command on its way to the unit. The settle re-read is
+scheduled whatever the outcome. The value published to the state topic is `state_from`'s — what
 the unit actually holds — not the value that was asked for, so a rejected command shows up
 as the unit's own value rather than a lie.
 
@@ -188,16 +199,16 @@ retried in seconds rather than costing a whole interval of data.
 One unresponsive register:
 
 ```
- t=0     attempt 1 ──▶ write, then read until the 300ms deadline
-                        a read starting at 299ms still blocks 200ms,
-                        so one attempt costs up to 500ms
- 600ms   attempt 2 ──▶ (after 100ms backoff) ──▶ ErrReadTimeout
- 1.2s    attempt 3 ──▶ ──▶ ErrReadTimeout
- 1.8s    give up: register marked invalid, nothing published, cycle continues
+ t=0     attempt 1 ──▶ wait up to 100ms for a quiet bus, write,
+                        read until the 300ms deadline ──▶ ErrReadTimeout
+ 550ms   attempt 2 ──▶ (after a 100-150ms jittered backoff) ──▶ ErrReadTimeout
+ 1.1s    attempt 3 ──▶ ──▶ ErrReadTimeout
+ 1.65s   give up: register marked invalid, nothing published, cycle continues
 ```
 
-The budget check charges `response_timeout + read_timeout + retry_backoff` per attempt for
-exactly that reason.
+The budget check charges `bus_quiet_max_wait + response_timeout + 1.5 x retry_backoff` per
+attempt, and at least two attempts, since confirming a changed reading needs a second one.
+Confirmation shares these attempts with retries, so it never lengthens the worst case.
 
 A dead port short-circuits, because the supervisor owns recovery:
 
@@ -205,8 +216,8 @@ A dead port short-circuits, because the supervisor owns recovery:
  t=0     attempt 1 ──▶ EIO ──▶ mark unhealthy ──▶ stop immediately
 ```
 
-Whole cycle against a silent device: 29 x 1.8s = 52.2s, inside the 120s interval. Startup
-rejects a configuration where that does not hold.
+Whole cycle against a silent device: 29 x 1.65s = 47.9s, inside the 120s interval (and the
+60s default). Startup rejects a configuration where that does not hold.
 
 ## Port loss and recovery
 
@@ -287,11 +298,11 @@ Completion is signalled *after* teardown, so the watchdog covers the real work.
 
 | Operation | Typical | Worst case |
 |-----------|---------|-----------|
-| One transaction (device answers) | ~40ms | `response_timeout` (300ms) |
-| One register including retries | ~40ms | `retries x (response_timeout + read_timeout + retry_backoff)` = 1.8s |
-| Full cycle, 29 registers, healthy | ~1.2s | — |
-| Full cycle, silent device | — | 52.2s (must fit `read_interval`) |
-| Write with read-back | ~130ms | command + one register per read-back, each up to 1.8s |
+| One transaction (device answers) | ~60ms | `bus_quiet_max_wait + response_timeout` (400ms) |
+| One register including retries | ~60ms, ~120ms if changed | `max(retries, 2) x (bus_quiet_max_wait + response_timeout + 1.5 x retry_backoff)` = 1.65s |
+| Full cycle, 29 registers, healthy | ~2-3s | — |
+| Full cycle, silent device | — | 47.9s (must fit `read_interval`) |
+| Write with read-back | ~250ms | two sends, each followed by one register per read-back, each up to 1.65s |
 | Settle re-read after a write | ~80ms, `write_resettle_delay` later | restarted by a further command for the same register |
 | Write preempting a cycle | ~300ms to yield | one `response_timeout` |
 | Cycle skipped (write pending / port recovering) | immediate | retried after 5s |

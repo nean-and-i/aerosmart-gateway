@@ -7,27 +7,34 @@ serial:
   parity: "N"
   stopbits: 1
 
-  # Software flow control is NOT supported by the tarm/serial driver, and never
+  # Software flow control is NOT supported by the serial driver, and never
   # has been. Setting it to true is reported as a warning at startup rather
   # than silently ignored, but it does nothing either way.
   xonxoff: false
   dsrdtr: false
 
-  # How long a single read may block, in milliseconds. The kernel expresses
-  # this as termios VTIME in deciseconds, so it is rounded up to a multiple of
-  # 100ms; anything below 100 is raised to 100 with a warning.
+  # How long a single read may block, in milliseconds. A read is also cut
+  # short at the response deadline.
   read_timeout: 200
 
   # Total budget for one command/response exchange, in milliseconds. Unmatched
   # or stale frames are discarded within this window without re-sending.
   response_timeout: 300
 
+  # The unit's control panel shares the bus. Before each command the gateway
+  # waits until the line has been silent for bus_quiet_gap milliseconds, so it
+  # does not transmit into one of the panel's frames, but never longer than
+  # bus_quiet_max_wait.
+  bus_quiet_gap: 20
+  bus_quiet_max_wait: 100
+
   # Attempts per register operation, and the delay between them. This is the
-  # only retry level in the stack: worst case per register is
-  # retries * (response_timeout + read_timeout + retry_backoff)
-  #   = 3 * (300 + 200 + 100) = 1.8s.
-  # An attempt can pass its response deadline only after a read that already
-  # started, and that read blocks for a whole read_timeout, hence its term.
+  # only retry level in the stack, and it also pays for confirming readings:
+  # a changed value is only trusted once a second read agrees, so there are
+  # always at least 2 attempts. The delay is jittered by up to half again, so
+  # retries do not stay in step with the panel. Worst case per register is
+  # max(retries, 2) * (bus_quiet_max_wait + response_timeout + 1.5 * retry_backoff)
+  #   = 3 * (100 + 300 + 150) = 1.65s.
   retries: 3
   retry_backoff: 100
 

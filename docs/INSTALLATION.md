@@ -93,17 +93,24 @@ serial:
   xonxoff: false
   dsrdtr: false
 
-  # How long one read may block. The kernel expresses this as termios VTIME in
-  # deciseconds, so it is rounded up to a multiple of 100ms.
+  # How long one read may block; a read is also cut short at the response
+  # deadline.
   read_timeout: 200
   # Budget for one command/response exchange. Stale or unmatched frames are
   # discarded within this window without re-sending the command.
   response_timeout: 300
 
+  # The control panel shares the bus: wait until the line has been silent
+  # this long before transmitting, but never longer than the maximum.
+  bus_quiet_gap: 20
+  bus_quiet_max_wait: 100
+
   # Attempts per register operation and the delay between them. This is the
-  # only retry level: worst case per register is
-  # retries x (response_timeout + read_timeout + retry_backoff)
-  #   = 3 x (300 + 200 + 100) = 1.8s.
+  # only retry level, and it also pays for confirming a changed reading with a
+  # second one (so there are always at least 2 attempts). The delay is
+  # jittered by up to half again. Worst case per register is
+  # max(retries, 2) x (bus_quiet_max_wait + response_timeout + 1.5 x retry_backoff)
+  #   = 3 x (100 + 300 + 150) = 1.65s.
   retries: 3
   retry_backoff: 100
 
