@@ -86,15 +86,17 @@ func (d *lossyDevice) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// Flush models TCIOFLUSH: pending input is discarded.
-func (d *lossyDevice) Flush() error {
+// ResetInputBuffer models TCIFLUSH: pending input is discarded.
+func (d *lossyDevice) ResetInputBuffer() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.pending = nil
 	return nil
 }
 
-func (d *lossyDevice) Close() error { return nil }
+func (d *lossyDevice) Close() error                       { return nil }
+func (d *lossyDevice) Drain() error                       { return nil }
+func (d *lossyDevice) SetReadTimeout(time.Duration) error { return nil }
 
 func (d *lossyDevice) writeCount() int {
 	d.mu.Lock()
@@ -368,21 +370,24 @@ func TestPollingSurvivesAWritePreemption(t *testing.T) {
 // silentPort never answers, so a transaction runs its full response budget.
 type silentPort struct{}
 
-func (silentPort) Read([]byte) (int, error)    { return 0, nil }
-func (silentPort) Write(p []byte) (int, error) { return len(p), nil }
-func (silentPort) Flush() error                { return nil }
-func (silentPort) Close() error                { return nil }
+func (silentPort) Read([]byte) (int, error)           { return 0, nil }
+func (silentPort) Write(p []byte) (int, error)        { return len(p), nil }
+func (silentPort) ResetInputBuffer() error            { return nil }
+func (silentPort) Drain() error                       { return nil }
+func (silentPort) SetReadTimeout(time.Duration) error { return nil }
+func (silentPort) Close() error                       { return nil }
 
 // config.EffectiveResponseTimeout predicts what the serial layer will actually
-// wait, and the cycle-budget check depends on that prediction. The two compute
-// the VTIME rounding separately, so this pins them together: an under-estimate
-// would let a config pass validation and then overrun its read interval.
+// wait, and the cycle-budget check depends on that prediction. The two apply
+// the same raising rule separately, so this pins them together: an
+// under-estimate would let a config pass validation and then overrun its read
+// interval.
 func TestConfigResponseBudgetMatchesSerialBehaviour(t *testing.T) {
 	cases := []struct{ readTimeout, responseTimeout int }{
 		{200, 300}, // response timeout dominates
 		{300, 100}, // read timeout dominates and is raised
-		{250, 100}, // read timeout is rounded up to 300
-		{10, 50},   // both below granularity, floor applies
+		{250, 100}, // no rounding: 250 is used as is
+		{10, 50},   // short timeouts are honoured exactly
 	}
 
 	for _, tc := range cases {
@@ -494,14 +499,16 @@ func (d *aerosmartDevice) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func (d *aerosmartDevice) Flush() error {
+func (d *aerosmartDevice) ResetInputBuffer() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.pending = nil
 	return nil
 }
 
-func (d *aerosmartDevice) Close() error { return nil }
+func (d *aerosmartDevice) Close() error                       { return nil }
+func (d *aerosmartDevice) Drain() error                       { return nil }
+func (d *aerosmartDevice) SetReadTimeout(time.Duration) error { return nil }
 
 func (d *aerosmartDevice) writeCount(command string) int {
 	d.mu.Lock()
@@ -654,14 +661,16 @@ func (d *laggingDevice) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func (d *laggingDevice) Flush() error {
+func (d *laggingDevice) ResetInputBuffer() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.pending = nil
 	return nil
 }
 
-func (d *laggingDevice) Close() error { return nil }
+func (d *laggingDevice) Close() error                       { return nil }
+func (d *laggingDevice) Drain() error                       { return nil }
+func (d *laggingDevice) SetReadTimeout(time.Duration) error { return nil }
 
 // The immediate read-back publishes the stale stage; the settle re-read must
 // correct it without waiting for the next full read cycle.

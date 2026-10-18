@@ -3,27 +3,45 @@ package serial
 import (
 	"context"
 	"errors"
+	"slices"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
+
+	bugst "go.bug.st/serial"
 )
 
 // fakeDevice answers commands the way the real unit does: a written command
-// queues a response frame to be read back. It also models TCIOFLUSH, which
-// discards bytes that have not been read yet.
+// queues a response frame to be read back. It also models TCIFLUSH, which
+// discards input that has not been read yet.
 type fakeDevice struct {
 	pending []byte
 	respond func(cmd string) string
 	writes  []string
-	flushes int
+	resets  int
 	opens   int
 	readErr error
 	closed  bool
+
+	// busyReads is how many more reads return another device's traffic,
+	// modelling a panel talking on the shared bus. A queued reply still
+	// takes priority, as it would on the wire once the panel pauses.
+	busyReads int
+
+	// ops records the order of port operations: "busy", "reset", "write",
+	// "drain" and "timeout=<d>".
+	ops []string
 }
 
 func (d *fakeDevice) Read(p []byte) (int, error) {
 	if d.readErr != nil {
 		return 0, d.readErr
+	}
+	if len(d.pending) == 0 && d.busyReads > 0 {
+		d.busyReads--
+		d.ops = append(d.ops, "busy")
+		return copy(p, "140 9999 1\r\n"), nil
 	}
 	if len(d.pending) == 0 {
 		return 0, nil // idle: no data, no error
@@ -36,15 +54,40 @@ func (d *fakeDevice) Read(p []byte) (int, error) {
 func (d *fakeDevice) Write(p []byte) (int, error) {
 	cmd := string(p)
 	d.writes = append(d.writes, cmd)
+	d.ops = append(d.ops, "write")
 	if d.respond != nil {
 		d.pending = append(d.pending, d.respond(cmd)...)
 	}
 	return len(p), nil
 }
 
-// Flush models TCIOFLUSH: undelivered input is discarded.
-func (d *fakeDevice) Flush() error { d.flushes++; d.pending = nil; return nil }
+// ResetInputBuffer models TCIFLUSH: undelivered input is discarded.
+func (d *fakeDevice) ResetInputBuffer() error {
+	d.resets++
+	d.ops = append(d.ops, "reset")
+	d.pending = nil
+	return nil
+}
+
+func (d *fakeDevice) Drain() error { d.ops = append(d.ops, "drain"); return nil }
+
+func (d *fakeDevice) SetReadTimeout(t time.Duration) error {
+	d.ops = append(d.ops, "timeout="+t.String())
+	return nil
+}
+
 func (d *fakeDevice) Close() error { d.closed = true; return nil }
+
+// opsFrom returns the recorded operations of the given kinds, in order.
+func (d *fakeDevice) opsFrom(kinds ...string) []string {
+	var out []string
+	for _, op := range d.ops {
+		if slices.Contains(kinds, op) {
+			out = append(out, op)
+		}
+	}
+	return out
+}
 
 // echoValue replies to "<node> <reg>[ v]" with "<node> <reg> <value>".
 func echoValue(value string) func(string) string {
@@ -60,6 +103,7 @@ func testPort(t *testing.T, d *fakeDevice) *SerialPort {
 		BaudRate:        115200,
 		ResponseTimeout: 60 * time.Millisecond,
 		ReopenBackoff:   time.Millisecond,
+		BusQuietMaxWait: 30 * time.Millisecond,
 		Opener:          func() (Port, error) { d.opens++; return d, nil },
 	}, nopLogger{})
 	if err := sp.Open(); err != nil {
@@ -118,7 +162,7 @@ func TestTransactSkipsUnmatchedFrames(t *testing.T) {
 	}
 }
 
-func TestTransactFlushesBeforeWriting(t *testing.T) {
+func TestTransactDiscardsStaleInputBeforeWriting(t *testing.T) {
 	d := &fakeDevice{respond: echoValue("7")}
 	sp := testPort(t, d)
 
@@ -133,11 +177,11 @@ func TestTransactFlushesBeforeWriting(t *testing.T) {
 	if got != "7" {
 		t.Errorf("Transact() = %q, want %q (stale data must be discarded)", got, "7")
 	}
-	if d.flushes == 0 {
-		t.Error("Flush() was never called; stale input was not discarded")
+	if d.resets == 0 {
+		t.Error("ResetInputBuffer() was never called; stale input was not discarded")
 	}
 	if len(sp.fr.buf) != 0 {
-		t.Errorf("software buffer = %q, want empty after flush", sp.fr.buf)
+		t.Errorf("software buffer = %q, want empty after the reset", sp.fr.buf)
 	}
 }
 
@@ -256,7 +300,7 @@ func TestSendWritesWithoutWaitingForAResponse(t *testing.T) {
 	if len(d.writes) != 1 || d.writes[0] != "130 5002 3\r\n" {
 		t.Errorf("writes = %q, want exactly one %q", d.writes, "130 5002 3\r\n")
 	}
-	if d.flushes == 0 {
+	if d.resets == 0 {
 		t.Error("Send() did not discard stale input before writing")
 	}
 }
@@ -278,5 +322,152 @@ func TestSendHonoursContextCancellation(t *testing.T) {
 
 	if err := sp.Send(ctx, "130 5002 3"); !errors.Is(err, context.Canceled) {
 		t.Fatalf("Send() error = %v, want context.Canceled", err)
+	}
+}
+
+// Send must not return while the command is still queued in the kernel: the
+// next exchange would start, and a write that has not left the port yet could
+// be lost or collide with it. Draining is what makes "sent" mean sent.
+func TestSendDrainsTheCommandBeforeReturning(t *testing.T) {
+	d := &fakeDevice{}
+	sp := testPort(t, d)
+
+	if err := sp.Send(context.Background(), "130 5002 3"); err != nil {
+		t.Fatalf("Send() error = %v, want nil", err)
+	}
+	if got := d.opsFrom("write", "drain"); !slices.Equal(got, []string{"write", "drain"}) {
+		t.Errorf("operations = %v, want write then drain", got)
+	}
+}
+
+func TestTransactDrainsTheCommandBeforeWaitingForTheReply(t *testing.T) {
+	d := &fakeDevice{respond: echoValue("3")}
+	sp := testPort(t, d)
+
+	if _, err := sp.Transact(context.Background(), "130 1067"); err != nil {
+		t.Fatalf("Transact() error = %v, want nil", err)
+	}
+	if got := d.opsFrom("write", "drain"); !slices.Equal(got, []string{"write", "drain"}) {
+		t.Errorf("operations = %v, want write then drain", got)
+	}
+}
+
+// Another device shares the bus. Transmitting while it is mid-frame corrupts
+// both, so a command waits until the line has been quiet for a moment.
+func TestTransactWaitsForAQuietBusBeforeWriting(t *testing.T) {
+	d := &fakeDevice{respond: echoValue("3"), busyReads: 3}
+	sp := testPort(t, d)
+
+	got, err := sp.Transact(context.Background(), "130 1067")
+	if err != nil {
+		t.Fatalf("Transact() error = %v, want nil", err)
+	}
+	if got != "3" {
+		t.Errorf("Transact() = %q, want %q", got, "3")
+	}
+	want := []string{"busy", "busy", "busy", "write"}
+	if ops := d.opsFrom("busy", "write"); !slices.Equal(ops, want) {
+		t.Errorf("operations = %v, want %v (the bus must be quiet before writing)", ops, want)
+	}
+}
+
+func TestSendWaitsForAQuietBusBeforeWriting(t *testing.T) {
+	d := &fakeDevice{busyReads: 2}
+	sp := testPort(t, d)
+
+	if err := sp.Send(context.Background(), "130 5002 3"); err != nil {
+		t.Fatalf("Send() error = %v, want nil", err)
+	}
+	want := []string{"busy", "busy", "write"}
+	if ops := d.opsFrom("busy", "write"); !slices.Equal(ops, want) {
+		t.Errorf("operations = %v, want %v (the bus must be quiet before writing)", ops, want)
+	}
+}
+
+// The quiet-bus wait is bounded: a device that never stops talking must not
+// stall every command forever.
+func TestBusyBusDelaysACommandOnlyUpToTheMaximumWait(t *testing.T) {
+	d := &fakeDevice{respond: echoValue("3"), busyReads: 1 << 30}
+	sp := testPort(t, d)
+
+	start := time.Now()
+	got, err := sp.Transact(context.Background(), "130 1067")
+	if err != nil {
+		t.Fatalf("Transact() error = %v, want nil", err)
+	}
+	if got != "3" {
+		t.Errorf("Transact() = %q, want %q", got, "3")
+	}
+	if elapsed := time.Since(start); elapsed > 200*time.Millisecond {
+		t.Errorf("Transact() took %v on a busy bus, want it bounded by the 30ms maximum wait", elapsed)
+	}
+}
+
+// slowPort blocks for its configured read timeout when it has nothing to
+// deliver, the way a real tty does.
+type slowPort struct {
+	mu      sync.Mutex
+	timeout time.Duration
+}
+
+func (p *slowPort) Read([]byte) (int, error) {
+	p.mu.Lock()
+	t := p.timeout
+	p.mu.Unlock()
+	time.Sleep(t)
+	return 0, nil
+}
+func (p *slowPort) Write(b []byte) (int, error) { return len(b), nil }
+func (p *slowPort) ResetInputBuffer() error     { return nil }
+func (p *slowPort) Drain() error                { return nil }
+func (p *slowPort) Close() error                { return nil }
+func (p *slowPort) SetReadTimeout(t time.Duration) error {
+	p.mu.Lock()
+	p.timeout = t
+	p.mu.Unlock()
+	return nil
+}
+
+// A read that starts just before the response deadline must not block for a
+// whole read timeout past it: that overrun is what the cycle budget would
+// otherwise have to charge for on every attempt.
+func TestTransactDoesNotBlockPastItsResponseDeadline(t *testing.T) {
+	sp := New(Config{
+		Port:            "/dev/fake",
+		ReadTimeout:     200 * time.Millisecond,
+		ResponseTimeout: 250 * time.Millisecond,
+		BusQuietGap:     10 * time.Millisecond,
+		Opener:          func() (Port, error) { return &slowPort{}, nil },
+	}, nopLogger{})
+	if err := sp.Open(); err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+
+	start := time.Now()
+	_, err := sp.Transact(context.Background(), "130 1067")
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, ErrReadTimeout) {
+		t.Fatalf("Transact() error = %v, want ErrReadTimeout", err)
+	}
+	// Quiet gap (10ms) + response timeout (250ms), plus scheduling slack.
+	// Without the cap the second read runs to 400ms.
+	if elapsed > 330*time.Millisecond {
+		t.Errorf("Transact() took %v, want it bounded by the 250ms response timeout", elapsed)
+	}
+}
+
+// go.bug.st/serial reports a vanished or unusable device as a *PortError that
+// does not wrap the errno, so it must be recognised explicitly or the
+// supervisor never reopens the port.
+func TestIsPortErrorRecognisesDriverPortErrors(t *testing.T) {
+	// /dev/null is not a tty, so the driver rejects it as an invalid port.
+	_, err := bugst.Open("/dev/null", &bugst.Mode{BaudRate: 115200})
+	var pe *bugst.PortError
+	if !errors.As(err, &pe) {
+		t.Skipf("opening /dev/null returned %v, not a *PortError", err)
+	}
+	if !IsPortError(err) {
+		t.Errorf("IsPortError(%v) = false, want true", err)
 	}
 }

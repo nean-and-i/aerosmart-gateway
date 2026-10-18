@@ -154,6 +154,8 @@ func run() error {
 		ReopenBackoff:       msDuration(appConfig.Serial.ReopenBackoff),
 		MaxReopenBackoff:    msDuration(appConfig.Serial.ReopenMaxBackoff),
 		HealthCheckInterval: msDuration(appConfig.Serial.HealthCheckInterval),
+		BusQuietGap:         msDuration(appConfig.Serial.BusQuietGap),
+		BusQuietMaxWait:     msDuration(appConfig.Serial.BusQuietMaxWait),
 		XonXoff:             appConfig.Serial.XonXoff,
 		DsrDtr:              appConfig.Serial.DsrDtr,
 	}, log)
