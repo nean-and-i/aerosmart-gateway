@@ -25,6 +25,10 @@ type fakeDevice struct {
 	afterCall func(n int)
 	calls     []string
 	block     chan struct{} // if set, Transact waits on it (or on ctx)
+
+	// sequences scripts successive answers per command, taking precedence
+	// over responses. The last answer repeats once the rest are used up.
+	sequences map[string][]string
 }
 
 func (f *fakeDevice) Transact(ctx context.Context, command string) (string, error) {
@@ -49,6 +53,15 @@ func (f *fakeDevice) Transact(ctx context.Context, command string) (string, erro
 	}
 	if f.err != nil {
 		return "", f.err
+	}
+	f.mu.Lock()
+	seq, scripted := f.sequences[command]
+	if scripted && len(seq) > 1 {
+		f.sequences[command] = seq[1:]
+	}
+	f.mu.Unlock()
+	if scripted && len(seq) > 0 {
+		return seq[0], nil
 	}
 	if v, ok := f.responses[command]; ok {
 		// Fires as this read succeeds, so a cancellation triggered here lands
@@ -212,7 +225,8 @@ func TestReadSingleAppliesDivisorAndType(t *testing.T) {
 }
 
 func TestReadSingleRetriesBoundedNumberOfTimes(t *testing.T) {
-	dev := &fakeDevice{responses: map[string]string{"130 1067": "3"}, failFirst: 2}
+	// One failure, then a first reading and the read that confirms it.
+	dev := &fakeDevice{responses: map[string]string{"130 1067": "3"}, failFirst: 1}
 	r := NewReader(dev, newFakePublisher(), testLogger(), []config.ReadRegisterConfig{fanReg}, 3, time.Millisecond)
 
 	got, err := r.ReadSingle(context.Background(), fanReg)
@@ -299,18 +313,192 @@ func TestReadAllReportsCancellation(t *testing.T) {
 	}
 }
 
-func TestReadAllClampsFanStatusAboveMax(t *testing.T) {
-	reg := fanReg
+// An out-of-range fan status used to be clamped to the maximum and published.
+// On a shared bus most such readings are corrupted frames, and clamping turned
+// garbage into a confident "highest stage".
+func TestReadAllDoesNotClampAnOutOfRangeFanStatus(t *testing.T) {
 	dev := &fakeDevice{responses: map[string]string{"130 1067": "9"}}
-	r := NewReader(dev, newFakePublisher(), testLogger(), []config.ReadRegisterConfig{reg}, 1, time.Millisecond)
+	r := NewReader(dev, newFakePublisher(), testLogger(), []config.ReadRegisterConfig{fanReg}, 3, time.Millisecond)
 
 	values, err := r.ReadAll(context.Background())
 	if err != nil {
 		t.Fatalf("ReadAll() error = %v", err)
 	}
-	v := values["luefterstatus"]
-	if v == nil || !v.Valid || v.Value != "5" {
-		t.Errorf("luefterstatus = %+v, want valid clamped to 5", v)
+	if v := values["luefterstatus"]; v == nil || v.Valid {
+		t.Errorf("luefterstatus = %+v, want invalid", v)
+	}
+}
+
+// ---------- Confirmation ----------
+//
+// The bus is shared with the unit's panel and frames carry no checksum, so a
+// corrupted reply can still parse. A reading is trusted only when it agrees
+// with the last trusted value, or a second read agrees with it.
+
+func TestReadSingleConfirmsAFirstReadingWithASecond(t *testing.T) {
+	dev := &fakeDevice{responses: map[string]string{"130 1067": "3"}}
+	r := NewReader(dev, newFakePublisher(), testLogger(), []config.ReadRegisterConfig{fanReg}, 3, time.Millisecond)
+
+	got, err := r.ReadSingle(context.Background(), fanReg)
+	if err != nil || got != "3" {
+		t.Fatalf("ReadSingle() = %q, %v; want 3, nil", got, err)
+	}
+	if n := dev.callCount(); n != 2 {
+		t.Errorf("device called %d times, want 2 (a first reading needs confirming)", n)
+	}
+}
+
+func TestReadSingleTrustsAnUnchangedValueAfterOneRead(t *testing.T) {
+	dev := &fakeDevice{responses: map[string]string{"130 1067": "3"}}
+	r := NewReader(dev, newFakePublisher(), testLogger(), []config.ReadRegisterConfig{fanReg}, 3, time.Millisecond)
+	if _, err := r.ReadSingle(context.Background(), fanReg); err != nil {
+		t.Fatalf("first ReadSingle() error = %v", err)
+	}
+	before := dev.callCount()
+
+	if got, err := r.ReadSingle(context.Background(), fanReg); err != nil || got != "3" {
+		t.Fatalf("ReadSingle() = %q, %v; want 3, nil", got, err)
+	}
+	if n := dev.callCount() - before; n != 1 {
+		t.Errorf("device called %d times, want 1 (an unchanged value needs no confirming)", n)
+	}
+}
+
+func TestReadSingleDiscardsAOneOffCorruptedReading(t *testing.T) {
+	dev := &fakeDevice{sequences: map[string][]string{"130 1067": {"3", "3", "1", "3"}}}
+	r := NewReader(dev, newFakePublisher(), testLogger(), []config.ReadRegisterConfig{fanReg}, 3, time.Millisecond)
+	if _, err := r.ReadSingle(context.Background(), fanReg); err != nil {
+		t.Fatalf("first ReadSingle() error = %v", err)
+	}
+
+	got, err := r.ReadSingle(context.Background(), fanReg)
+	if err != nil || got != "3" {
+		t.Fatalf("ReadSingle() = %q, %v; want the trusted 3, nil", got, err)
+	}
+}
+
+func TestReadSingleAcceptsAChangeOnceTwoReadsAgree(t *testing.T) {
+	dev := &fakeDevice{sequences: map[string][]string{"130 1067": {"3", "3", "1", "1"}}}
+	r := NewReader(dev, newFakePublisher(), testLogger(), []config.ReadRegisterConfig{fanReg}, 3, time.Millisecond)
+	if _, err := r.ReadSingle(context.Background(), fanReg); err != nil {
+		t.Fatalf("first ReadSingle() error = %v", err)
+	}
+
+	got, err := r.ReadSingle(context.Background(), fanReg)
+	if err != nil || got != "1" {
+		t.Fatalf("ReadSingle() = %q, %v; want the confirmed change to 1", got, err)
+	}
+}
+
+func TestReadSingleBreaksATieWithAThirdRead(t *testing.T) {
+	dev := &fakeDevice{sequences: map[string][]string{"130 1067": {"4", "2", "2"}}}
+	r := NewReader(dev, newFakePublisher(), testLogger(), []config.ReadRegisterConfig{fanReg}, 3, time.Millisecond)
+
+	got, err := r.ReadSingle(context.Background(), fanReg)
+	if err != nil || got != "2" {
+		t.Fatalf("ReadSingle() = %q, %v; want 2, the value two reads agreed on", got, err)
+	}
+}
+
+func TestReadSingleReportsReadingsThatNeverAgree(t *testing.T) {
+	dev := &fakeDevice{sequences: map[string][]string{"130 1067": {"1", "2", "3"}}}
+	r := NewReader(dev, newFakePublisher(), testLogger(), []config.ReadRegisterConfig{fanReg}, 3, time.Millisecond)
+
+	_, err := r.ReadSingle(context.Background(), fanReg)
+	if !errors.Is(err, ErrUnconfirmed) {
+		t.Fatalf("ReadSingle() error = %v, want ErrUnconfirmed", err)
+	}
+	if n := dev.callCount(); n != 3 {
+		t.Errorf("device called %d times, want 3 (confirmation shares the retry budget)", n)
+	}
+}
+
+func TestReadAllMarksAnUnconfirmedReadingInvalid(t *testing.T) {
+	dev := &fakeDevice{sequences: map[string][]string{"130 1067": {"1", "2", "3"}}}
+	r := NewReader(dev, newFakePublisher(), testLogger(), []config.ReadRegisterConfig{fanReg}, 3, time.Millisecond)
+
+	values, err := r.ReadAll(context.Background())
+	if err != nil {
+		t.Fatalf("ReadAll() error = %v", err)
+	}
+	if v := values["luefterstatus"]; v == nil || v.Valid {
+		t.Errorf("luefterstatus = %+v, want invalid", v)
+	}
+}
+
+// An out-of-range reading is almost certainly a corrupted frame: it uses up an
+// attempt rather than ending the read.
+func TestReadSingleRetriesPastAnOutOfRangeReading(t *testing.T) {
+	dev := &fakeDevice{sequences: map[string][]string{"130 1067": {"31", "3", "3"}}}
+	r := NewReader(dev, newFakePublisher(), testLogger(), []config.ReadRegisterConfig{fanReg}, 3, time.Millisecond)
+
+	got, err := r.ReadSingle(context.Background(), fanReg)
+	if err != nil || got != "3" {
+		t.Fatalf("ReadSingle() = %q, %v; want 3, nil", got, err)
+	}
+}
+
+// confirm_step lets a register drift by a small amount without a second read:
+// a temperature that moved by a tenth of a degree is not suspicious.
+func TestReadSingleTrustsAChangeWithinConfirmStep(t *testing.T) {
+	reg := tempReg
+	reg.ConfirmStep = 0.5
+	dev := &fakeDevice{sequences: map[string][]string{"130 201": {"21500", "21500", "21700"}}}
+	r := NewReader(dev, newFakePublisher(), testLogger(), []config.ReadRegisterConfig{reg}, 3, time.Millisecond)
+	if _, err := r.ReadSingle(context.Background(), reg); err != nil {
+		t.Fatalf("first ReadSingle() error = %v", err)
+	}
+	before := dev.callCount()
+
+	got, err := r.ReadSingle(context.Background(), reg)
+	if err != nil || got != "21.7" {
+		t.Fatalf("ReadSingle() = %q, %v; want 21.7, nil", got, err)
+	}
+	if n := dev.callCount() - before; n != 1 {
+		t.Errorf("device called %d times, want 1 (the change is within confirm_step)", n)
+	}
+}
+
+func TestReadSingleConfirmsAChangeBeyondConfirmStep(t *testing.T) {
+	reg := tempReg
+	reg.ConfirmStep = 0.5
+	dev := &fakeDevice{sequences: map[string][]string{"130 201": {"21500", "21500", "2150", "21500"}}}
+	r := NewReader(dev, newFakePublisher(), testLogger(), []config.ReadRegisterConfig{reg}, 3, time.Millisecond)
+	if _, err := r.ReadSingle(context.Background(), reg); err != nil {
+		t.Fatalf("first ReadSingle() error = %v", err)
+	}
+
+	got, err := r.ReadSingle(context.Background(), reg)
+	if err != nil || got != "21.5" {
+		t.Fatalf("ReadSingle() = %q, %v; want 21.5 (the 2.15 reading is a dropped digit)", got, err)
+	}
+}
+
+// Confirming needs a second read, so a register gets two attempts even when
+// retries is configured as 1. Otherwise no value could ever change.
+func TestReadSingleConfirmsEvenWithASingleRetry(t *testing.T) {
+	dev := &fakeDevice{responses: map[string]string{"130 1067": "3"}}
+	r := NewReader(dev, newFakePublisher(), testLogger(), []config.ReadRegisterConfig{fanReg}, 1, time.Millisecond)
+
+	if got, err := r.ReadSingle(context.Background(), fanReg); err != nil || got != "3" {
+		t.Fatalf("ReadSingle() = %q, %v; want 3, nil", got, err)
+	}
+}
+
+// A fixed backoff can keep landing on the panel's own polling rhythm and
+// collide every time; jitter breaks that lockstep.
+func TestRetryBackoffIsJitteredWithinHalfAgain(t *testing.T) {
+	base := 100 * time.Millisecond
+	seen := map[time.Duration]bool{}
+	for range 200 {
+		d := jittered(base)
+		if d < base || d > base*3/2 {
+			t.Fatalf("jittered(%v) = %v, want within [%v, %v]", base, d, base, base*3/2)
+		}
+		seen[d] = true
+	}
+	if len(seen) < 10 {
+		t.Errorf("jittered(%v) produced only %d distinct values in 200 draws", base, len(seen))
 	}
 }
 
@@ -966,7 +1154,19 @@ func TestVerifyRegistersArePublishedToTheirOwnTopics(t *testing.T) {
 	pub := newFakePublisher()
 	log := testLogger()
 	w := NewWriter(dev, pub, log, []config.WriteRegisterConfig{reg}, NewReadGate(time.Second), 3, time.Millisecond, time.Millisecond)
-	w.SetReader(NewReader(dev, pub, log, []config.ReadRegisterConfig{fanReg, modeReg}, 1, time.Millisecond))
+	reader := NewReader(dev, pub, log, []config.ReadRegisterConfig{fanReg, modeReg}, 1, time.Millisecond)
+	w.SetReader(reader)
+
+	// Establish trusted values, so each read below is one transaction rather
+	// than a reading plus its confirmation.
+	for _, rr := range []config.ReadRegisterConfig{fanReg, modeReg} {
+		if _, err := reader.ReadSingle(context.Background(), rr); err != nil {
+			t.Fatalf("priming ReadSingle(%s) error = %v", rr.Name, err)
+		}
+	}
+	dev.mu.Lock()
+	dev.calls = nil
+	dev.mu.Unlock()
 
 	if err := w.HandleMessage(context.Background(), reg.SubscribeTopic, "4"); err != nil {
 		t.Fatalf("HandleMessage() error = %v", err)
