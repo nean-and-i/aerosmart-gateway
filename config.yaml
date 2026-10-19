@@ -51,7 +51,7 @@ serial:
 
   # How long to wait after writing a register before reading it back. The unit
   # applies writes but does not reliably echo them, so the read-back of
-  # verify_registers is what confirms a write took effect.
+  # state_from and verify_registers is what confirms a write took effect.
   write_settle_delay: 50
 
   # How long after a write to read the affected registers a second time. Some

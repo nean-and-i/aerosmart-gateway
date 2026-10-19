@@ -80,7 +80,7 @@ against a scripted device (see `internal/integration`).
 | `internal/mqtt` | Broker connection with bounded operations, availability, HA discovery payloads |
 | `internal/config` | Loading, defaults, and startup validation of both YAML files |
 | `internal/logger` | Levelled logging to console and/or file |
-| `cmd` | Wiring, signal handling, the poll loop |
+| `cmd` | Wiring, signal handling, the poll loop, the command worker |
 
 ## Startup
 
@@ -104,9 +104,12 @@ against a scripted device (see `internal/integration`).
    without making anything safer.
 6. Open the serial port, retrying with backoff indefinitely — on an embedded gateway the
    USB adapter may appear after boot, so exiting would only crash-loop under systemd.
-6. Start the serial supervisor.
-7. Connect to MQTT with backoff and jitter, publish discovery, subscribe to command topics.
-8. Run the first read cycle, then enter the poll loop.
+7. Start the serial supervisor.
+8. Connect to MQTT with backoff and jitter, subscribe to command topics, then publish
+   discovery. Subscribing first matters: with a clean session the broker holds nothing for
+   the gateway, so a command sent between an entity appearing and the subscription would be
+   lost.
+9. Run the first read cycle, then enter the poll loop.
 
 `-validate` performs steps 1-5 and exits, so a configuration can be checked without
 touching hardware.
@@ -292,10 +295,11 @@ every new subscription, and the gateway re-subscribes after every reconnect, so 
 published with the retain flag would otherwise be applied again after each connection
 blip.
 
-The command is remembered for deduplication as soon as it reaches the wire, not
-when it is confirmed. This unit applies writes whether or not it confirms them,
-so remembering only confirmed ones left the previous value on record - and a
-user correcting back to it looked like a redelivery and was dropped.
+The command is remembered for deduplication once it reaches the wire, and
+forgotten again if the write is refused or cannot be confirmed. Deduplication is
+for broker redeliveries of a command that worked: a user retrying a value the
+unit refused must reach the wire, and so must a correction back to an earlier
+value, which only ever compares against the most recent command.
 
 ### Why a write is not confirmed by its echo
 
@@ -346,8 +350,8 @@ runs on its own goroutine, so without that a read cycle could start after the
 write, sample the register before it settled, and publish that stale value over
 the re-read's fresher one. Because the gate then has two independent holders,
 suppression is reference-counted: whichever finishes first releases only its
-own hold, and the `write_priority_timeout` deadline still drops every hold at
-once so a lost release cannot wedge polling.
+own hold, and the `write_priority_timeout` deadline lifts suppression even
+while holds are outstanding, so a lost release cannot wedge polling.
 
 A command that never reaches the wire schedules a re-read too. Accepting a
 command bumps the register's write sequence before the send, which supersedes
@@ -379,8 +383,8 @@ set used to block reads until the suppression timeout expired.
 
 Deduplication remembers only the *last* command accepted per topic. Keying on every recent
 `(topic, value)` pair meant a real `3 -> 0 -> 3` sequence inside one second left the device
-on `0`, because the final command looked like a redelivery. A command that failed is not
-remembered at all, so it stays retryable.
+on `0`, because the final command looked like a redelivery. A command that failed to send,
+was refused, or could not be confirmed is not remembered, so it stays retryable.
 
 ## Write priority
 
@@ -390,15 +394,16 @@ remembered at all, so it stays retryable.
 |--------|--------|
 | `TryBeginCycle(parent)` | Starts a cycle unless a write is pending. Checking and starting are one atomic step; done separately, a write arriving in between would preempt a cycle that had not begun and then let it run unimpeded. |
 | `Preempt()` | Cancels the in-flight cycle and suppresses further ones. |
-| `Release()` | Lifts suppression. |
+| `Release()` | Gives up one hold; suppression lifts once the last hold is released. |
 | `Suppressed()` | Whether reads are held off; expired suppression clears itself. |
 
 Suppression always carries a deadline (`write_priority_timeout`), so a release that never
 happens cannot wedge polling. A finished cycle deregisters its own cancel via a generation
 counter, so a later `Preempt` cannot cancel a cycle that already ended.
 
-Cancellation reaches the syscall layer: `Transact` checks the context around every frame
-read, so a write typically waits one response timeout rather than a whole cycle.
+`Transact` checks the context before and between frame reads, so a cancelled read stops
+within one read (at most `read_timeout`, and never past its response deadline) rather than
+running on through the cycle.
 
 ## MQTT
 
@@ -462,9 +467,10 @@ told to publish to cannot drift from the one the gateway listens on.
 1. `SIGINT`/`SIGTERM` cancels the root context. A watchdog is armed; a second signal, or
    exceeding the grace period, exits immediately.
 2. MQTT disconnects first, so no further commands arrive, and publishes stop retrying.
-3. The poll loop, command worker and supervisor finish — cancellation reaches in-flight
-   reads, and a command already being applied completes first, so this takes about one
-   response timeout.
+3. The poll loop, command worker and supervisor finish. Cancellation reaches in-flight
+   reads, and a command already being applied stops at its next cancellation check; a
+   command already sent is not withdrawn, but its read-back and state publish are skipped.
+   This takes about one response timeout.
 4. The serial port closes. `Close` takes the transaction lock, so a write already on the
    wire completes before the device is released.
 5. The log file is closed.
@@ -498,7 +504,7 @@ told to publish to cannot drift from the one the gateway listens on.
 | `broker` / `port` | — / `1883` | Broker address |
 | `username` / `password` | — | Credentials |
 | `client_id` | `aerosmart-gateway` | Client identifier |
-| `qos` / `retain` | `1` / `true` | Delivery and retention |
+| `qos` / `retain` | `0` / `false` | Delivery and retention; the shipped configs set `1` / `true` |
 | `availability_topic` | `<device_id>/status` | Online/offline topic and last will |
 | `op_timeout` | `5000` | Bound on every broker interaction |
 | `publish_retry_count` | `3` | Publish attempts |
@@ -513,7 +519,7 @@ told to publish to cannot drift from the one the gateway listens on.
 | `log_level` | `info` | `debug`, `info`, `warn`, `error` |
 | `logging.console_logging` | `true` | Console output; disabling both sinks is rejected |
 | `logging.file_logging` / `log_file` | `false` / `-` | File output; `-` or empty disables it |
-| `ha_discovery.enabled` / `prefix` | `true` / `homeassistant` | Discovery |
+| `ha_discovery.enabled` / `prefix` | `false` / `homeassistant` | Discovery; the shipped configs enable it |
 | `ha_discovery.expire_after` | `2.5 x read_interval` | Seconds before an entity is shown unavailable; `0` omits it, so entities never expire |
 
 Options removed with the serial rework are reported as warnings at startup rather than

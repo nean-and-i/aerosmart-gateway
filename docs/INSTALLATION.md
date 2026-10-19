@@ -49,7 +49,7 @@ Download the latest release for your platform from the releases page.
 
 ```bash
 # Clone the repository
-git clone https://github.com/nean/aerosmart-gateway.git
+git clone https://github.com/nean-and-i/aerosmart-gateway.git
 cd aerosmart-gateway
 
 # Build the application
@@ -66,10 +66,14 @@ docker build -t aerosmart-gateway .
 docker run -d \
   --name aerosmart-gateway \
   --device /dev/ttyUSB0:/dev/ttyUSB0 \
+  --group-add "$(stat -c %g /dev/ttyUSB0)" \
   -v $(pwd)/config.yaml:/app/config.yaml \
   -v $(pwd)/registers.yaml:/app/registers.yaml \
   aerosmart-gateway
 ```
+
+The image runs as an unprivileged user (UID 1000). `--group-add` gives it the group that owns
+the serial device on the host (usually `dialout`); without it the port cannot be opened.
 
 ---
 
@@ -173,7 +177,7 @@ device_id: "aerosmart"
 log_level: "debug"               # debug, info, warn, error
 
 logging:
-  # log_file: "/var/log/aerosmart.log"  # Uncomment to set the file logging path (default: /var/log/aerosmart.log)
+  # log_file: "/var/log/aerosmart.log"  # File logging path; empty or "-" (the default) disables file logging
   file_logging: false             # Enable file logging
   console_logging: true           # Enable console logging
 
@@ -353,11 +357,15 @@ MQTT all subscriptions restored
 ```
 
 #### Publish Retry
-Failed MQTT publishes are automatically retried with exponential backoff:
+Failed MQTT publishes are retried with an increasing delay:
 - Attempt 1: Immediate
-- Attempt 2: After 1 second
-- Attempt 3: After 2 seconds
-- (Configurable via `publish_retry_count`)
+- Attempt 2: After 250 ms
+- Attempt 3: After 500 ms
+- (Number of attempts configurable via `publish_retry_count`; each attempt waits at most
+  `op_timeout` for the broker's acknowledgement)
+
+While the broker is known to be disconnected, a publish fails at once rather than waiting
+out its retries, so a broker outage does not slow the serial read loop.
 
 #### Broker Persistence (Recommended for Production)
 For production deployments, enable persistence on your MQTT broker:
@@ -394,18 +402,23 @@ This ensures messages are not lost during broker restarts.
 Check the logs for successful connection:
 
 ```
-INFO Starting Aerosmart Gateway
-INFO Connecting to serial device /dev/ttyUSB0...
-INFO Serial device connected
-INFO Connecting to MQTT broker 192.168.1.20:1883...
-INFO MQTT broker connected
-INFO Publishing Home Assistant discovery configs...
-INFO Home Assistant discovery configs published
-INFO Starting periodic read loop (interval: 60 seconds)
-INFO === Triggering full register readout ===
-INFO === SERIAL: Starting register read cycle ===
-INFO === SERIAL: Register read cycle completed in 1.234s ===
+[2026-10-19 14:02:11] Starting Aerosmart Gateway v1.0.5
+[2026-10-19 14:02:11] File logging disabled
+[2026-10-19 14:02:11] Connecting to serial device /dev/ttyUSB0...
+[2026-10-19 14:02:11] Serial device connected
+[2026-10-19 14:02:11] Connecting to MQTT broker 192.168.1.20:1883...
+[2026-10-19 14:02:11] MQTT connected to tcp://192.168.1.20:1883
+[2026-10-19 14:02:11] MQTT broker connected
+[2026-10-19 14:02:11] Subscribing to command topics: [dw/aerosmart/luefterstufe dw/aerosmart/boilerheizstab]
+[2026-10-19 14:02:11] Publishing Home Assistant discovery configs...
+[2026-10-19 14:02:12] Home Assistant discovery: 34 entities published
+[2026-10-19 14:02:12] Starting periodic read loop (interval: 120s)
+[2026-10-19 14:02:12] === SERIAL: Starting register read cycle ===
+[2026-10-19 14:02:15] === SERIAL: Register read cycle completed in 2.817s ===
 ```
+
+Lines starting `WARNING: Config:` or `WARNING: Registers:` name settings that still work but
+should be cleaned up, such as options from an earlier release.
 
 ### Testing MQTT Messages
 
@@ -659,16 +672,29 @@ sudo usermod -a -G dialout $USER
 
 **Problem**: Values out of range
 
-- This may indicate a sensor issue
+- This may indicate a sensor issue, or a reply corrupted on the shared bus
 - Check the device documentation
-- The application validates and marks invalid values
+- Out-of-range readings are never published; the previous value stays
+
+**Problem**: "Read of <register>: readings [...] disagree, keeping the last trusted value"
+
+- A changed reading is only trusted once a second read agrees with it, because the bus is
+  shared with the unit's panel and frames carry no checksum
+- An occasional line is expected. If one register shows it every cycle, its value drifts
+  more between reads than its `confirm_step` allows (see `registers.yaml`); raise it
+
+**Problem**: "MQTT: ignoring retained command ..."
+
+- Something published a command with the retain flag. Retained commands are ignored, since
+  the broker would replay them on every reconnect; publish commands without it
 
 ### Performance Issues
 
 **Problem**: Slow response to write commands
 
-- Check the read_interval (lower value = more frequent reads)
-- The write priority mechanism should give control commands priority
+- A command interrupts any read cycle in progress, so `read_interval` does not delay it
+- A write normally completes in about 250 ms. If it takes seconds, look for read-back
+  retries or "Re-sending" lines in the log, which point to a noisy serial link
 
 **Problem**: High CPU usage
 
@@ -704,7 +730,7 @@ journalctl -u aerosmart -f
 # https://go.dev/doc/install
 
 # Clone the repository
-git clone https://github.com/nean/aerosmart-gateway.git
+git clone https://github.com/nean-and-i/aerosmart-gateway.git
 cd aerosmart-gateway
 
 # Download dependencies

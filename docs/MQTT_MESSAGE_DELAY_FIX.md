@@ -7,8 +7,8 @@
 >
 > The delay it addresses is still worth understanding, and the root-cause
 > analysis below remains accurate about the original problem. But for how write
-> priority works now — `ReadGate`, atomic cycle entry, cancellation reaching the
-> syscall layer, and release on every exit path — see
+> priority works now — `ReadGate`, atomic cycle entry, cancellation checked between
+> frame reads, and release on every exit path — see
 > [Application Flow](APPLICATION_FLOW.md#write-priority) and
 > [Timing Diagrams](TIMING_DIAGRAMS.md#write-preempting-a-read-cycle).
 >

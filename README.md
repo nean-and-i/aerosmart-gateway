@@ -11,18 +11,18 @@ A Go-based gateway application that communicates with Drexel&Weiss Aerosmart M v
 - **MQTT Resilience**:
   - **Clean Session**: The broker does not queue commands while the gateway is offline, so an hours-old command is never replayed at startup
   - **Auto-Recovery**: Subscriptions are restored explicitly once the connection returns
-  - **Configurable QoS**: Supports QoS 0, 1, or 2 (default: 1 for at-least-once delivery)
+  - **Configurable QoS**: Supports QoS 0, 1, or 2 (`0` if unset; the shipped configs use `1`, at-least-once delivery)
   - **KeepAlive Monitoring**: Detects network failures within 30-60 seconds
   - **Connection State Visibility**: Logs reconnection progress and state changes
-  - **Publish Retry**: Automatic retry with exponential backoff for failed publishes
+  - **Publish Retry**: Failed publishes are retried with an increasing delay (250 ms, 500 ms, ...); while the broker is disconnected they fail at once instead of waiting
 - **Home Assistant Discovery**: Auto-discovers sensors, switches and number entities in Home Assistant
 - **Derived Calculations**: Calculates derived values (e.g., zuluftabluftprozent, co2luefterstufe4)
 - **Configurable Logging**: Supports debug, info, warn, and error log levels
 - **Graceful Shutdown**: Handles SIGINT and SIGTERM signals for clean shutdown
 - **Reconnection**: Automatic reconnection for both serial and MQTT connections
-- **Write Priority**: Control commands preempt ongoing read operations for low-latency response (<1 second detection, 1-3 second write completion). Write priority auto-expires after 10 seconds to prevent blocking on serial errors.
+- **Write Priority**: A control command interrupts an in-progress read cycle and typically completes in about 250 ms, read-back included. Reads are held off for at most `write_priority_timeout` (10 seconds), so a failure cannot block polling.
 - **Message Deduplication**: Prevents processing duplicate MQTT messages within 1 second window
-- **Timing Metrics**: Logs message processing latency (receive → process → complete) for monitoring
+- **Timing Metrics**: Logs how long each write took from receipt to completion, and how long each read cycle took
 
 ## Architecture
 
@@ -87,7 +87,7 @@ why the serial layer is shaped the way it is.
 
 ```bash
 # Clone the repository
-git clone https://github.com/nean/aerosmart-gateway.git
+git clone https://github.com/nean-and-i/aerosmart-gateway.git
 cd aerosmart-gateway
 
 # Build the application
@@ -219,8 +219,8 @@ a configuration from an earlier release still starts — it just tells you what 
 | `mqtt.username` | MQTT username | - |
 | `mqtt.password` | MQTT password | - |
 | `mqtt.client_id` | Client identifier | `aerosmart-gateway` |
-| `mqtt.qos` | Quality of Service (0, 1, or 2) | `1` |
-| `mqtt.retain` | Retain messages | `true` |
+| `mqtt.qos` | Quality of Service (0, 1, or 2) | `0` (the shipped configs set `1`) |
+| `mqtt.retain` | Retain published values | `false` (the shipped configs set `true`) |
 | `mqtt.publish_retry_count` | Number of retries for failed publishes | `3` |
 | `mqtt.availability_topic` | Online/offline topic, also registered as the MQTT last will | `<device_id>/status` |
 | `mqtt.op_timeout` | Bounds every broker interaction (ms). Publishes run on the serial read path, so an unbounded wait would stall polling | `5000` |
@@ -228,7 +228,7 @@ a configuration from an earlier release still starts — it just tells you what 
 | `mqtt.connect_retry_max_delay_ms` | Maximum delay for exponential backoff | `30000ms` |
 | `mqtt.connect_retry_jitter_percent` | Jitter percentage for backoff | `25%` |
 
-> **MQTT Resilience Note:** The gateway uses the configured QoS level (default: 1, at-least-once delivery) for subscriptions and publishes. A **clean session** is used deliberately: a persistent session lets the broker queue commands while the gateway is offline and replay them at startup, which would apply an hours-old fan command to a running unit. Subscriptions are therefore restored explicitly in the connect handler rather than by the broker. KeepAlive is 30 seconds for fast disconnect detection.
+> **MQTT Resilience Note:** The gateway uses the configured QoS level (`0` if unset; the shipped configs use `1`, at-least-once delivery) for subscriptions and publishes. A **clean session** is used deliberately: a persistent session lets the broker queue commands while the gateway is offline and replay them at startup, which would apply an hours-old fan command to a running unit. Subscriptions are therefore restored explicitly in the connect handler rather than by the broker. KeepAlive is 30 seconds for fast disconnect detection.
 
 ### Application Configuration
 
@@ -237,7 +237,7 @@ a configuration from an earlier release still starts — it just tells you what 
 | `device_id` | Device identifier (used as HA identifiers) | `aerosmart` |
 | `log_level` | Logging level | `info` |
 | `read_interval` | Read interval (seconds) | `60` |
-| `ha_discovery.enabled` | Enable HA discovery | `true` |
+| `ha_discovery.enabled` | Enable HA discovery | `false` (the shipped configs set `true`) |
 | `ha_discovery.prefix` | HA discovery topic prefix | `homeassistant` |
 | `ha_discovery.expire_after` | Seconds without an update before an entity is shown unavailable; `0` omits it, so entities never expire | `2.5 x read_interval` |
 | `ha_discovery.device_info.name` | Device display name | `Aerosmart Gateway` |
@@ -269,10 +269,10 @@ The gateway publishes sensor values to the following topics:
 
 The gateway subscribes to the following topics for device control:
 
-- `dw/aerosmart/luefterstufe` - Set fan stage (0-5) - *Topic changes detected and processed within 1-3 seconds*
-- `dw/aerosmart/boilerheizstab` - Set boiler heating element (0-1) - *Topic changes detected and processed within 1-3 seconds*
+- `dw/aerosmart/luefterstufe` - Set the fan mode: `0`-`3` manual stage, `4` auto, `5` party
+- `dw/aerosmart/boilerheizstab` - Set the boiler heating element (`0`-`1`)
 
-> **Note:** The gateway implements immediate message detection with timestamp-based write priority signaling (auto-expires after 10 seconds), ensuring control commands are processed with minimal latency.
+> **Note:** A command interrupts any read cycle in progress and is applied at once, typically within about 250 ms. Publish commands without the retain flag: retained messages on these topics are ignored, since the broker would replay them on every reconnect.
 
 ### Derived Registers
 
@@ -300,14 +300,13 @@ Example of Home Assistant dashboard:
 
 ### Initialization
 
-1. Load configuration from config.yaml
-2. Load register definitions from registers.yaml
-3. Initialize logger
-4. Connect to serial device (with retry)
-5. Connect to MQTT broker (with retry)
+1. Load and validate config.yaml and registers.yaml (`-validate` stops here)
+2. Initialize logger and report any configuration warnings
+3. Connect to serial device (retried indefinitely) and start the port supervisor
+4. Connect to MQTT broker (with retry)
+5. Subscribe to write register topics, before discovery, so no early command is missed
 6. Publish Home Assistant discovery configs
-7. Subscribe to write register topics
-8. Start periodic read loop
+7. Start periodic read loop
 
 ### Periodic Read Cycle
 
@@ -419,22 +418,15 @@ go test ./...
 
 ### Building with Docker
 
-```dockerfile
-FROM golang:1.27-alpine AS builder
-WORKDIR /app
-COPY go.mod go.sum ./
-RUN go mod download
-COPY . .
-RUN go build -o aerosmart-gateway ./cmd
+The repository's [`Dockerfile`](Dockerfile) builds the binary and copies `config.yaml` and
+`registers.yaml` into a minimal Alpine image that runs as an unprivileged user (UID 1000):
 
-FROM alpine:latest
-RUN apk --no-cache add ca-certificates
-WORKDIR /app
-COPY --from=builder /app/aerosmart-gateway .
-COPY config.yaml .
-COPY registers.yaml .
-CMD ["./aerosmart-gateway", "-config", "config.yaml", "-registers", "registers.yaml"]
+```bash
+make docker-build    # or: docker build -t aerosmart-gateway .
 ```
+
+That user needs access to the serial device; see the
+[Installation Guide](docs/INSTALLATION.md#method-3-docker) for the `docker run` options.
 
 ### Code Linting
 
@@ -486,7 +478,9 @@ Write registers additionally take:
 
 Derived registers additionally take:
 
-- `formula`: Expression evaluated over the current snapshot
+- `formula`: Documents the calculation. The arithmetic itself is implemented in
+  `internal/registers/derived.go`, so a new derived register needs code there too; startup
+  refuses one that has no implementation
 - `sources`: The read registers the formula needs
 
 ## License

@@ -37,8 +37,8 @@ Sequence and timing views of the flows described in
       │   retries with backoff + jitter, 10 attempts
       │◀─ connected ────────────────────────────────────────┤
       │                                       │◀─ publish "online" (LWT armed)
-      ├─ publish discovery (retained) ─────────────────────▶│
       ├─ subscribe to command topics ──────────────────────▶│
+      ├─ publish discovery (retained) ─────────────────────▶│
       │
       ├─ first read cycle immediately
       └─ then every 120s, measured from the END of each cycle
@@ -206,7 +206,7 @@ One unresponsive register:
  1.65s   give up: register marked invalid, nothing published, cycle continues
 ```
 
-The budget check charges `bus_quiet_max_wait + response_timeout + 1.5 x retry_backoff` per
+The budget check charges `max(bus_quiet_gap, bus_quiet_max_wait) + response_timeout + 1.5 x retry_backoff` per
 attempt, and at least two attempts, since confirming a changed reading needs a second one.
 Confirmation shares these attempts with retries, so it never lengthens the worst case.
 
@@ -256,8 +256,9 @@ devices treat as a reset.
  ≤30s  │                              │ KeepAlive detects it
        │                              ├─ ConnectionLost logged
        │                              │  LWT: broker publishes "offline"
-       │  publishes now fail after op_timeout (5s) each, bounded,
-       │  so the read loop is never wedged
+       │  until paho notices, a publish fails after op_timeout (5s);
+       │  once it has, publishes fail at once, so the read loop is
+       │  never wedged
        │
        │                              ├─ reconnect attempts, backing off to 60s
  Ns    │                              │◀───────── reconnected ─┤
