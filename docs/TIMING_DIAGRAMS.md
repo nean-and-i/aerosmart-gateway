@@ -115,6 +115,7 @@ Healthy link, 29 read registers:
  ~2-3s │                        │◀─ 29 registers done
        │◀─ values ──────────────┤
        ├─ publish valid values ──────────────────────────────────▶│
+       ├─ republish write-register states from state_from ───────▶│
        ├─ derived values from the same snapshot ─────────────────▶│
        │
        └─ wait 120s from HERE, so the device always gets an idle gap
@@ -143,12 +144,14 @@ stale value would make a dead sensor look alive.
          ├─ remember as sent             (dedupe compares against what went out)
  ~70ms   ├─ wait write_settle_delay
          ├─ read lueftermode ───────────────────────▶│ ~120ms  state_from, changed: 2 reads
+         ├─   publish it to its own topic ──────────────────────────▶│
          ├─ read luefterstatus ─────────────────────▶│ ~60ms   verify_registers
+         ├─   publish it to its own topic ──────────────────────────▶│
          │                                  (each read-back register read ONCE)
          │  disagrees or unreadable? ── yes ──▶ send once more, read back again
  ~250ms  ├─ publish lueftermode's value to the state topic ──────▶│
          │                                  (unreadable state_from: publish nothing)
-         ├─ publish each read-back register to its own topic ────▶│
+         │  still refused or unconfirmed? ──▶ forget it for dedupe, report the error
          └─ Release (deferred: happens on EVERY exit path)
          ┆
          ┆  schedule(register, seq)                 write_resettle_delay
@@ -183,12 +186,13 @@ never disturbs a readout.
        │                  │                        │
  300ms │                  │                   ◀────┤ Preempt (command arrives)
        │                  │◀─ cycleCtx cancelled
-       │                  │  current Transact returns within one response timeout
- ~600ms│◀─ context.Canceled
+       │                  │  current Transact returns at its next read,
+       │                  │  at most read_timeout (200ms) later
+ ≤500ms│◀─ context.Canceled
        │  ctx.Err() == nil, so this is NOT shutdown
        │  wait skipDelay (5s), not the full 120s
        │                                           │ write completes, Release
- 5.6s  ├─ RunCycle ──────▶│ full cycle runs
+ ~5.5s ├─ RunCycle ──────▶│ full cycle runs
 ```
 
 Two things this pins down: a preempted cycle must not end the poll loop, and it must be
@@ -201,14 +205,16 @@ One unresponsive register:
 ```
  t=0     attempt 1 ──▶ wait up to 100ms for a quiet bus, write,
                         read until the 300ms deadline ──▶ ErrReadTimeout
- 550ms   attempt 2 ──▶ (after a 100-150ms jittered backoff) ──▶ ErrReadTimeout
- 1.1s    attempt 3 ──▶ ──▶ ErrReadTimeout
- 1.65s   give up: register marked invalid, nothing published, cycle continues
+ ≤550ms  attempt 2 ──▶ (after a 100-150ms jittered backoff) ──▶ ErrReadTimeout
+ ≤1.1s   attempt 3 ──▶ ──▶ ErrReadTimeout
+ ≤1.5s   give up: register marked invalid, nothing published, cycle continues
 ```
 
-The budget check charges `max(bus_quiet_gap, bus_quiet_max_wait) + response_timeout + 1.5 x retry_backoff` per
-attempt, and at least two attempts, since confirming a changed reading needs a second one.
-Confirmation shares these attempts with retries, so it never lengthens the worst case.
+The budget check charges `max(bus_quiet_gap, bus_quiet_max_wait) + response_timeout + 1.5 x
+retry_backoff` per attempt, and at least two attempts, since confirming a changed reading
+needs a second one: 3 x 550ms = 1.65s per register. That is slightly pessimistic, since no
+backoff follows the last attempt, so a real give-up comes at about 1.5s. Confirmation shares
+these attempts with retries, so it never lengthens the worst case.
 
 A dead port short-circuits, because the supervisor owns recovery:
 
@@ -216,8 +222,9 @@ A dead port short-circuits, because the supervisor owns recovery:
  t=0     attempt 1 ──▶ EIO ──▶ mark unhealthy ──▶ stop immediately
 ```
 
-Whole cycle against a silent device: 29 x 1.65s = 47.9s, inside the 120s interval (and the
-60s default). Startup rejects a configuration where that does not hold.
+Whole cycle against a silent device: about 29 x 1.5s = 43.5s, which the startup check
+charges as 29 x 1.65s = 47.9s, inside the 120s interval (and the 60s default). Startup
+rejects a configuration where that budget does not fit.
 
 ## Port loss and recovery
 
@@ -256,9 +263,10 @@ devices treat as a reset.
  ≤30s  │                              │ KeepAlive detects it
        │                              ├─ ConnectionLost logged
        │                              │  LWT: broker publishes "offline"
-       │  until paho notices, a publish fails after op_timeout (5s);
+       │  until paho notices, each publish waits op_timeout (5s) per
+       │  attempt, up to publish_retry_count (3) attempts: ~16s;
        │  once it has, publishes fail at once, so the read loop is
-       │  never wedged
+       │  slowed, never wedged
        │
        │                              ├─ reconnect attempts, backing off to 60s
  Ns    │                              │◀───────── reconnected ─┤
@@ -284,7 +292,7 @@ offline. Without that, an hours-old fan command would be replayed at startup.
           │                      │                  │ retries disabled from here
  ~50ms    │                      ├─ wait for loops
           │                      │   in-flight read sees the cancellation and
-          │                      │   returns within one response timeout
+          │                      │   returns at its next read (≤ read_timeout)
  ~350ms   │                      ├─ Close ────────────────────────▶│
           │                      │   takes txMu, so a write already on the wire
           │                      │   finishes before the device is released
@@ -299,13 +307,13 @@ Completion is signalled *after* teardown, so the watchdog covers the real work.
 
 | Operation | Typical | Worst case |
 |-----------|---------|-----------|
-| One transaction (device answers) | ~60ms | `bus_quiet_max_wait + response_timeout` (400ms) |
-| One register including retries | ~60ms, ~120ms if changed | `max(retries, 2) x (bus_quiet_max_wait + response_timeout + 1.5 x retry_backoff)` = 1.65s |
+| One transaction (device answers) | ~60ms | `max(bus_quiet_gap, bus_quiet_max_wait) + response_timeout` (400ms) |
+| One register including retries | ~60ms, ~120ms if changed | ~1.5s; budgeted as `max(retries, 2) x (max(bus_quiet_gap, bus_quiet_max_wait) + response_timeout + 1.5 x retry_backoff)` = 1.65s |
 | Full cycle, 29 registers, healthy | ~2-3s | — |
-| Full cycle, silent device | — | 47.9s (must fit `read_interval`) |
+| Full cycle, silent device | — | ~43.5s; budgeted as 47.9s, which must fit `read_interval` |
 | Write with read-back | ~250ms | two sends, each followed by one register per read-back, each up to 1.65s |
-| Settle re-read after a write | ~80ms, `write_resettle_delay` later | restarted by a further command for the same register |
-| Write preempting a cycle | ~300ms to yield | one `response_timeout` |
+| Settle re-read after a write | ~120ms, `write_resettle_delay` later | restarted by a further command for the same register |
+| Write preempting a cycle | well under 200ms to yield | one `read_timeout` (200ms) |
 | Cycle skipped (write pending / port recovering) | immediate | retried after 5s |
 | MQTT publish | ~1ms | `op_timeout` (hand-off) + `op_timeout` (ack), x `publish_retry_count` |
 | Port reopen | ~5ms | backoff to 30s between attempts |

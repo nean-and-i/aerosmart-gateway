@@ -85,10 +85,13 @@ against a scripted device (see `internal/integration`).
 ## Startup
 
 1. Load `config.yaml`, apply defaults, and validate. Only configurations that cannot work
-   are refused: an invalid parity or byte size, a negative timeout, a backoff maximum below
-   its initial value, no MQTT broker, no log sink.
-2. Load `registers.yaml` and validate: duplicate names, missing topics, command templates
-   without `{value}`, `verify_registers` naming registers that do not exist.
+   are refused: an invalid parity, byte size, stop bits or QoS, `retries` below 1, a
+   non-positive `read_interval`, a negative timeout, a backoff maximum below its initial
+   value, a jitter percentage outside 0-100, no MQTT broker, no log sink.
+2. Load `registers.yaml` and validate: duplicate names, missing commands or topics, an
+   inverted or all-zero range, a negative `confirm_step`, command templates without
+   `{value}`, two write registers on one `subscribe_topic`, and `verify_registers`,
+   `state_from` or derived `sources` naming read registers that do not exist.
 3. Check the retry budget: the worst-case full cycle
    (`max(retries, 2) x (max(bus_quiet_gap, bus_quiet_max_wait) + response_timeout + 1.5 x retry_backoff) x read
    register count`) must fit inside `read_interval`. Reads are cut short at the response
@@ -470,7 +473,7 @@ told to publish to cannot drift from the one the gateway listens on.
 3. The poll loop, command worker and supervisor finish. Cancellation reaches in-flight
    reads, and a command already being applied stops at its next cancellation check; a
    command already sent is not withdrawn, but its read-back and state publish are skipped.
-   This takes about one response timeout.
+   This takes at most about one `read_timeout`.
 4. The serial port closes. `Close` takes the transaction lock, so a write already on the
    wire completes before the device is released.
 5. The log file is closed.
