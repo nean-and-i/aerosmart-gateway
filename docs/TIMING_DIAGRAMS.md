@@ -264,7 +264,8 @@ devices treat as a reset.
        │                              ├─ ConnectionLost logged
        │                              │  LWT: broker publishes "offline"
        │  until paho notices, each publish waits op_timeout (5s) per
-       │  attempt, up to publish_retry_count (3) attempts: ~16s;
+       │  attempt, up to publish_retry_count (3) attempts: ~16s, or
+       │  ~31s if the socket write stalls too;
        │  once it has, publishes fail at once, so the read loop is
        │  slowed, never wedged
        │

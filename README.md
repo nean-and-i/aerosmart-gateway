@@ -197,9 +197,9 @@ All timeouts are in milliseconds.
 | `serial.xonxoff` | Software flow control. **Not supported by the driver**; `true` is reported as a warning and has no effect | `false` |
 | `serial.dsrdtr` | Hardware flow control. **Not supported by the driver**; warned about, no effect | `false` |
 
-Worst-case time for one register is
+The worst-case time for one register is budgeted as
 `max(retries, 2) x (max(bus_quiet_gap, bus_quiet_max_wait) + response_timeout + 1.5 x retry_backoff)`, so with
-the defaults 3 x 550ms = 1.65s. Startup rejects a configuration whose worst-case full cycle
+the defaults 3 x 550ms = 1.65s (slightly pessimistic: no backoff follows the last attempt). Startup rejects a configuration whose worst-case full cycle
 (that figure times the number of read registers) does not fit inside `read_interval`; with
 the shipped 29 registers that is 47.9s, inside both the shipped 120s interval and the 60s
 default.

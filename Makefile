@@ -111,6 +111,7 @@ docker-run:
 	docker run -d \
 		--name $(BINARY_NAME) \
 		--device /dev/ttyUSB0:/dev/ttyUSB0 \
+		--group-add "$$(stat -c %g /dev/ttyUSB0)" \
 		-v $(shell pwd)/config.yaml:/app/config.yaml:ro \
 		-v $(shell pwd)/registers.yaml:/app/registers.yaml:ro \
 		$(BINARY_NAME):latest
@@ -136,7 +137,7 @@ check-config:
 		echo "$(RED)registers.yaml not found$(NC)"; \
 		exit 1; \
 	fi
-	@echo "$(GREEN)Configuration files valid$(NC)"
+	$(GO) run $(MAIN_PATH) -validate -config config.yaml -registers registers.yaml
 
 # Run the application (requires config.yaml and registers.yaml)
 run: check-config
