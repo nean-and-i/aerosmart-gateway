@@ -29,10 +29,16 @@ func captureStdout(t *testing.T, fn func()) string {
 	fn()
 
 	os.Stdout = orig
-	w.Close()
+	if err := w.Close(); err != nil {
+		t.Fatalf("closing the pipe writer: %v", err)
+	}
 	var buf bytes.Buffer
-	io.Copy(&buf, r)
-	r.Close()
+	if _, err := io.Copy(&buf, r); err != nil {
+		t.Fatalf("reading captured output: %v", err)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatalf("closing the pipe reader: %v", err)
+	}
 	return buf.String()
 }
 

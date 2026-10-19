@@ -358,9 +358,7 @@ func (w *Writer) readBackIfCurrent(ctx context.Context, register config.WriteReg
 	if register.StateFrom != "" {
 		names = append(names, register.StateFrom)
 	}
-	for _, name := range register.VerifyRegisters {
-		names = append(names, name)
-	}
+	names = append(names, register.VerifyRegisters...)
 	if len(names) == 0 {
 		return nil, false, false
 	}
