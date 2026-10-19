@@ -16,6 +16,13 @@
 # topic from its state_from register, so the Home Assistant entity follows the
 # unit rather than only ever showing the last value written.
 
+# confirm_step: how far a reading may move from the last trusted value, or
+# from another reading in the same call, and still count as agreeing (in the
+# published units). The bus is shared with the panel and frames carry no
+# checksum, so a changed value is only trusted once confirmed. Measured values
+# drift a little between reads 60ms apart, so they get a step; setpoints and
+# status flags keep the default 0 and any change to them needs a second
+# identical reading.
 read_registers:
   - name: "luefterstatus"
     # The stage actually running (0-3). NOT the commanded mode: see the note
@@ -50,6 +57,7 @@ read_registers:
     type: "integer"
     min_value: 0
     max_value: 5000
+    confirm_step: 50
     ha:
       name: "Aerosmart CO2"
       device_class: null
@@ -62,6 +70,7 @@ read_registers:
     type: "float"
     min_value: -20
     max_value: 50
+    confirm_step: 0.5
     ha:
       name: "Aerosmart innentemp"
       device_class: "temperature"
@@ -74,6 +83,7 @@ read_registers:
     type: "float"
     min_value: -30
     max_value: 50
+    confirm_step: 0.5
     ha:
       name: "Aerosmart aussentemp"
       device_class: "temperature"
@@ -158,6 +168,7 @@ read_registers:
     type: "float"
     min_value: -20
     max_value: 50
+    confirm_step: 0.5
     ha:
       name: "Aerosmart Beschattung Temp"
       device_class: "temperature"
@@ -170,6 +181,7 @@ read_registers:
     type: "float"
     min_value: -30
     max_value: 50
+    confirm_step: 0.5
     ha:
       name: "Aerosmart Beschattung Aussentemp"
       device_class: "temperature"
@@ -194,6 +206,7 @@ read_registers:
     type: "float"
     min_value: 0
     max_value: 100
+    confirm_step: 1
     ha:
       name: "Aerosmart Abluft Prozent"
       device_class: null
@@ -206,6 +219,7 @@ read_registers:
     type: "integer"
     min_value: 0
     max_value: 5000
+    confirm_step: 50
     ha:
       name: "Aerosmart Abluft U/min"
       device_class: null
@@ -218,6 +232,7 @@ read_registers:
     type: "float"
     min_value: 0
     max_value: 100
+    confirm_step: 1
     ha:
       name: "Aerosmart Zuluft Prozent"
       device_class: null
@@ -230,6 +245,7 @@ read_registers:
     type: "integer"
     min_value: 0
     max_value: 5000
+    confirm_step: 50
     ha:
       name: "Aerosmart Zuluft U/min"
       device_class: null
@@ -290,6 +306,7 @@ read_registers:
     type: "float"
     min_value: 0
     max_value: 95
+    confirm_step: 0.5
     ha:
       name: "Aerosmart Boiler Temp"
       device_class: "temperature"
@@ -302,6 +319,7 @@ read_registers:
     type: "float"
     min_value: -20
     max_value: 70
+    confirm_step: 0.5
     ha:
       name: "Aerosmart Boiler Wärmepumpe Temp"
       device_class: "temperature"
@@ -314,6 +332,7 @@ read_registers:
     type: "float"
     min_value: -20
     max_value: 70
+    confirm_step: 0.5
     ha:
       name: "Aerosmart Boiler Verdampferregister Temp"
       device_class: "temperature"

@@ -76,8 +76,8 @@ type SerialConfig struct {
 	// device that never pauses delays commands rather than blocking them.
 	BusQuietMaxWait int `yaml:"bus_quiet_max_wait"`
 
-	// Flow control. The serial driver supports neither, so a true value
-	// is rejected by Validate rather than silently ignored.
+	// Flow control. The serial driver supports neither, so a true value is
+	// reported as a warning at startup rather than silently ignored.
 	XonXoff bool `yaml:"xonxoff"`
 	DsrDtr  bool `yaml:"dsrdtr"`
 
@@ -471,6 +471,12 @@ func (c *AppConfig) EffectiveResponseTimeout() int {
 	return max(c.Serial.ResponseTimeout, c.Serial.ReadTimeout)
 }
 
+// EffectiveBusQuietMaxWait is the longest the serial layer waits for a quiet
+// bus: never less than one quiet gap.
+func (c *AppConfig) EffectiveBusQuietMaxWait() int {
+	return max(c.Serial.BusQuietMaxWait, c.Serial.BusQuietGap)
+}
+
 // EffectiveAttempts is how many attempts a register read may take. A changed
 // value is only trusted once a second read agrees with it, so there are at
 // least two even when retries is 1.
@@ -492,7 +498,7 @@ func (c *AppConfig) ValidateCycleBudget(registerCount int) error {
 	// One attempt waits for a quiet bus, then for its reply until the
 	// response deadline (reads are cut short there), then backs off for up to
 	// half again the configured delay, which is jittered.
-	perAttemptMs := c.Serial.BusQuietMaxWait + c.EffectiveResponseTimeout() + c.Serial.RetryBackoff*3/2
+	perAttemptMs := c.EffectiveBusQuietMaxWait() + c.EffectiveResponseTimeout() + c.Serial.RetryBackoff*3/2
 	attempts := c.EffectiveAttempts()
 	worstCycleMs := attempts * perAttemptMs * registerCount
 	if worstCycleMs <= c.ReadInterval*1000 {

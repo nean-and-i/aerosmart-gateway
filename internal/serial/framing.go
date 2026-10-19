@@ -134,23 +134,38 @@ func (f *frameReader) readFrame(deadline time.Time) (string, error) {
 // The bytes discarded here cannot be a reply to anything of ours: the previous
 // exchange has finished and the next command has not been sent yet.
 //
+// Silence only counts once it has actually lasted a gap, so a port that
+// returns early with no data cannot make a busy bus look quiet. No read runs
+// past maxWait, which is what the cycle budget charges for.
+//
 // It reports whether the bus went quiet.
 func (f *frameReader) waitQuiet(ctx context.Context, gap, maxWait time.Duration) (bool, error) {
-	deadline := time.Now().Add(maxWait)
+	start := time.Now()
+	deadline := start.Add(maxWait)
+	lastByte := start
 	for {
 		if err := ctx.Err(); err != nil {
 			return false, err
 		}
-		n, err := f.read(gap)
+		silence := time.Since(lastByte)
+		if silence >= gap {
+			return true, nil
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return false, nil
+		}
+		n, err := f.read(min(gap-silence, remaining))
 		if err != nil && !IsTimeout(err) {
 			return false, err
 		}
-		if n == 0 {
-			// A whole gap passed with nothing on the line.
-			return true, nil
+		if n > 0 {
+			lastByte = time.Now()
+			continue
 		}
-		if !time.Now().Before(deadline) {
-			return false, nil
+		if time.Since(lastByte) < gap {
+			// The port returned before its timeout with nothing to give.
+			time.Sleep(idlePoll)
 		}
 	}
 }

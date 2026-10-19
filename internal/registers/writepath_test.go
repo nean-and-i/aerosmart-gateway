@@ -502,3 +502,20 @@ func TestDedupeComparesParsedValues(t *testing.T) {
 		t.Errorf("command sent %d times, want 1 (the second is a redelivery)", n)
 	}
 }
+
+// Deduplication exists to drop broker redeliveries of a command that worked.
+// A user retrying a value the unit refused, or that could not be confirmed,
+// is not a redelivery and must reach the wire.
+func TestDedupeLetsARetryOfARefusedWriteThrough(t *testing.T) {
+	dev := &fakeDevice{responses: map[string]string{"130 1067": "4", "130 5003": "4"}}
+	w, reg := stateWriter(t, dev, newFakePublisher(), NewReadGate(time.Second))
+
+	_ = w.HandleMessage(context.Background(), reg.SubscribeTopic, "2") // refused: the unit stays on 4
+	before := countCalls(dev, "130 5002 2")
+
+	_ = w.HandleMessage(context.Background(), reg.SubscribeTopic, "2")
+
+	if n := countCalls(dev, "130 5002 2") - before; n == 0 {
+		t.Error("the retry was dropped as a duplicate of a write the unit refused")
+	}
+}

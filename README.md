@@ -198,7 +198,7 @@ All timeouts are in milliseconds.
 | `serial.dsrdtr` | Hardware flow control. **Not supported by the driver**; warned about, no effect | `false` |
 
 Worst-case time for one register is
-`max(retries, 2) x (bus_quiet_max_wait + response_timeout + 1.5 x retry_backoff)`, so with
+`max(retries, 2) x (max(bus_quiet_gap, bus_quiet_max_wait) + response_timeout + 1.5 x retry_backoff)`, so with
 the defaults 3 x 550ms = 1.65s. Startup rejects a configuration whose worst-case full cycle
 (that figure times the number of read registers) does not fit inside `read_interval`; with
 the shipped 29 registers that is 47.9s, inside both the shipped 120s interval and the 60s
@@ -318,7 +318,7 @@ Example of Home Assistant dashboard:
 3. Registers are read sequentially: wait for a quiet bus → send command → read matching
    frame → apply divisor → validate range → confirm → publish. A reading is trusted when it
    is within `confirm_step` of the last trusted value; otherwise it is read again and
-   trusted only if the two agree, with a third read to break a tie. A register whose
+   trusted only if the two agree to within `confirm_step`, with a third read to break a tie. A register whose
    readings never agree is not published that cycle, so its previous value stands
 4. Each write register's state topic is republished from its `state_from` register, so a
    mode the unit changed by itself - party mode expiring, or the panel being used - reaches
@@ -464,7 +464,10 @@ Read registers additionally take:
 - `type`: Value type (`integer` or `float`)
 - `min_value` / `max_value`: Valid range; a reading outside it is not published
 - `confirm_step`: How far a reading may move from the last trusted value and still be
-  trusted without a second read, in processed units (default `0`: any change is confirmed)
+  trusted without a second read, and how far two readings may differ and still confirm
+  each other, in processed units. Default `0`: any change needs a second, identical
+  reading. Measured values that drift between reads (fan speeds, CO2, temperatures) need a
+  step, or their readings rarely agree; the shipped `registers.yaml` sets one for each
 
 Write registers additionally take:
 

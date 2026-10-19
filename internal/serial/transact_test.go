@@ -471,3 +471,102 @@ func TestIsPortErrorRecognisesDriverPortErrors(t *testing.T) {
 		t.Errorf("IsPortError(%v) = false, want true", err)
 	}
 }
+
+// A port that returns at once with no data (a non-blocking transport) must
+// not make the bus look quiet: silence counts only once it has lasted a gap.
+func TestQuietBusNeedsAGapOfRealSilence(t *testing.T) {
+	d := &fakeDevice{respond: echoValue("3")} // reads return immediately
+	sp := New(Config{
+		Port:            "/dev/fake",
+		ResponseTimeout: 60 * time.Millisecond,
+		BusQuietGap:     40 * time.Millisecond,
+		BusQuietMaxWait: 100 * time.Millisecond,
+		Opener:          func() (Port, error) { return d, nil },
+	}, nopLogger{})
+	if err := sp.Open(); err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+
+	start := time.Now()
+	if _, err := sp.Transact(context.Background(), "130 1067"); err != nil {
+		t.Fatalf("Transact() error = %v", err)
+	}
+	if elapsed := time.Since(start); elapsed < 40*time.Millisecond {
+		t.Errorf("Transact() took %v, want at least the 40ms quiet gap before transmitting", elapsed)
+	}
+}
+
+// The wait for a quiet bus must end at bus_quiet_max_wait, not a whole gap
+// later: the cycle budget charges bus_quiet_max_wait per attempt.
+func TestQuietBusWaitEndsAtTheMaximumWait(t *testing.T) {
+	sp := New(Config{
+		Port:            "/dev/fake",
+		ReadTimeout:     10 * time.Millisecond, // so the 10ms response timeout is not raised
+		ResponseTimeout: 10 * time.Millisecond,
+		BusQuietGap:     400 * time.Millisecond,
+		BusQuietMaxWait: 500 * time.Millisecond,
+		Opener:          func() (Port, error) { return &chattyPort{every: 300 * time.Millisecond}, nil },
+	}, nopLogger{})
+	if err := sp.Open(); err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+
+	start := time.Now()
+	_, _ = sp.Transact(context.Background(), "130 1067")
+	// A byte arrives at 300ms, so the bus never stays quiet for 400ms. The
+	// wait must stop at 500ms (then a 10ms response timeout). Without the cap,
+	// the read started at 300ms runs until the next byte at 600ms.
+	if elapsed := time.Since(start); elapsed > 560*time.Millisecond {
+		t.Errorf("Transact() took %v, want the quiet-bus wait to stop at 500ms", elapsed)
+	}
+}
+
+// chattyPort delivers a byte every so often, like a panel that never pauses
+// for long, and blocks up to its read timeout in between.
+type chattyPort struct {
+	mu      sync.Mutex
+	every   time.Duration
+	timeout time.Duration
+	last    time.Time
+}
+
+func (p *chattyPort) Read(b []byte) (int, error) {
+	p.mu.Lock()
+	t, every, last := p.timeout, p.every, p.last
+	p.mu.Unlock()
+	if last.IsZero() {
+		last = time.Now()
+	}
+	next := last.Add(every)
+	if wait := time.Until(next); wait > t {
+		time.Sleep(t)
+		return 0, nil
+	} else if wait > 0 {
+		time.Sleep(wait)
+	}
+	p.mu.Lock()
+	p.last = time.Now()
+	p.mu.Unlock()
+	b[0] = 'x'
+	return 1, nil
+}
+func (p *chattyPort) Write(b []byte) (int, error) { return len(b), nil }
+func (p *chattyPort) ResetInputBuffer() error     { return nil }
+func (p *chattyPort) Drain() error                { return nil }
+func (p *chattyPort) Close() error                { return nil }
+func (p *chattyPort) SetReadTimeout(t time.Duration) error {
+	p.mu.Lock()
+	p.timeout = t
+	p.mu.Unlock()
+	return nil
+}
+
+// The serial layer's own default must match the documented one the cycle
+// budget assumes.
+func TestDefaultQuietMaxWaitMatchesTheDocumentedDefault(t *testing.T) {
+	cfg := &Config{}
+	cfg.applyDefaults(nopLogger{})
+	if cfg.BusQuietMaxWait != 100*time.Millisecond {
+		t.Errorf("BusQuietMaxWait default = %v, want 100ms", cfg.BusQuietMaxWait)
+	}
+}

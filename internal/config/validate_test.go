@@ -397,6 +397,31 @@ serial:
 	}
 }
 
+// The serial layer never waits less than one quiet gap, so a bus_quiet_gap
+// above bus_quiet_max_wait is what each attempt really costs.
+func TestValidateCycleBudgetChargesAQuietGapAboveTheMaximumWait(t *testing.T) {
+	cfg, err := LoadAppConfig(writeConfig(t, `
+mqtt:
+  broker: "x"
+read_interval: 60
+serial:
+  retries: 3
+  response_timeout: 300
+  retry_backoff: 1
+  bus_quiet_gap: 400
+  bus_quiet_max_wait: 100
+`))
+	if err != nil {
+		t.Fatalf("LoadAppConfig() error = %v", err)
+	}
+
+	// Charging 100ms gives 29 x 3 x 401ms = 34.9s. The real wait is the 400ms
+	// gap: 29 x 3 x 701ms = 61.0s.
+	if err := cfg.ValidateCycleBudget(29); err == nil {
+		t.Fatal("ValidateCycleBudget(29) = nil; a 400ms quiet gap makes the real cycle overrun 60s")
+	}
+}
+
 // The delay between attempts is jittered by up to half again, so the backoff
 // can cost 1.5x its configured value.
 func TestValidateCycleBudgetChargesTheBackoffJitter(t *testing.T) {

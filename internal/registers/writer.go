@@ -248,6 +248,10 @@ func (w *Writer) HandleMessage(ctx context.Context, topic string, message string
 
 	w.publishState(register, valueStr, result)
 	if result.err != nil {
+		// Deduplication is for broker redeliveries of a command that worked.
+		// A user retrying a value the unit refused, or that could not be
+		// confirmed, must reach the wire.
+		w.forgetSent(topic, valueStr)
 		w.logger.Warn("%v", result.err)
 		return result.err
 	}
@@ -383,15 +387,10 @@ func (w *Writer) readBackIfCurrent(ctx context.Context, register config.WriteReg
 			continue
 		}
 
-		value, err := w.reader.ReadSingle(ctx, readReg)
+		// ReadSingle returns only a validated, confirmed reading.
+		checked, err := w.reader.ReadSingle(ctx, readReg)
 		if err != nil {
 			w.logger.Warn("Failed to read %s back: %v", name, err)
-			continue
-		}
-
-		valid, checked := w.reader.ValidateValue(value, readReg)
-		if !valid {
-			w.logger.Warn("Read-back value %s for %s is out of range, not publishing", checked, name)
 			continue
 		}
 
@@ -460,6 +459,16 @@ func (w *Writer) isDuplicate(topic, value string) bool {
 		return false
 	}
 	return time.Since(last.at) < w.dedupeWindow
+}
+
+// forgetSent drops the record of a command, if it is still the latest one for
+// the topic, so an identical retry is not taken for a redelivery.
+func (w *Writer) forgetSent(topic, value string) {
+	w.dedupeMu.Lock()
+	defer w.dedupeMu.Unlock()
+	if last, ok := w.lastCommand[topic]; ok && last.value == value {
+		delete(w.lastCommand, topic)
+	}
 }
 
 // rememberSent records a command that reached the wire.

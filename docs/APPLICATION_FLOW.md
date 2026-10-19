@@ -90,7 +90,7 @@ against a scripted device (see `internal/integration`).
 2. Load `registers.yaml` and validate: duplicate names, missing topics, command templates
    without `{value}`, `verify_registers` naming registers that do not exist.
 3. Check the retry budget: the worst-case full cycle
-   (`max(retries, 2) x (bus_quiet_max_wait + response_timeout + 1.5 x retry_backoff) x read
+   (`max(retries, 2) x (max(bus_quiet_gap, bus_quiet_max_wait) + response_timeout + 1.5 x retry_backoff) x read
    register count`) must fit inside `read_interval`. Reads are cut short at the response
    deadline, so `read_timeout` adds nothing; the backoff is jittered by up to half again;
    and confirming a changed reading needs a second attempt, so there are always at least
@@ -224,7 +224,7 @@ for attempt in 1..max(retries, 2):
     apply divisor, format by type, validate range
     out of range: next attempt                     # most likely a corrupted frame
     within confirm_step of the last trusted value: trust it, return
-    equal to an earlier reading in this call: trust it, return
+    within confirm_step of an earlier reading in this call: trust it, return
     otherwise keep it and read again
 readings that never agreed: ErrUnconfirmed (the register is invalid this cycle)
 ```
@@ -232,7 +232,9 @@ readings that never agreed: ErrUnconfirmed (the register is invalid this cycle)
 A corrupted reply can still parse as a plausible number — a dropped digit turns 21.5 degrees
 into 2.15 — and passes a wide range check. So a reading is only trusted on its own when it
 is within `confirm_step` (default `0`) of the last trusted value; any other change needs a
-second read that agrees. Failures, confirmations and tie-breaks share one budget of
+second read that agrees with it to within `confirm_step`. A measured value that drifts
+between reads 60 ms apart — a fan speed, CO2 — needs a step for that, or its readings rarely
+agree and it goes unpublished; the shipped `registers.yaml` sets one for each. Failures, confirmations and tie-breaks share one budget of
 attempts, so confirming never lengthens the worst case. Out-of-range readings are never
 clamped: `luefterstatus` used to be, which turned a corrupted frame into a confident
 "highest stage".

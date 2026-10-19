@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 	"testing"
@@ -471,6 +472,57 @@ func TestReadSingleConfirmsAChangeBeyondConfirmStep(t *testing.T) {
 	got, err := r.ReadSingle(context.Background(), reg)
 	if err != nil || got != "21.5" {
 		t.Fatalf("ReadSingle() = %q, %v; want 21.5 (the 2.15 reading is a dropped digit)", got, err)
+	}
+}
+
+// A fan speed moves by a few rpm between reads 60ms apart. Two readings that
+// agree within confirm_step confirm each other; requiring identical readings
+// left a noisy register unpublished cycle after cycle.
+func TestReadSingleConfirmsReadingsThatAgreeWithinConfirmStep(t *testing.T) {
+	rpm := config.ReadRegisterConfig{
+		Name: "zuluftumin", Command: "130 1095", Topic: "aerosmart/zuluftumin",
+		Divisor: 1, Type: "integer", MinValue: 0, MaxValue: 5000, ConfirmStep: 50,
+	}
+	dev := &fakeDevice{sequences: map[string][]string{"130 1095": {"1452", "1449", "1451"}}}
+	r := NewReader(dev, newFakePublisher(), testLogger(), []config.ReadRegisterConfig{rpm}, 3, time.Millisecond)
+
+	got, err := r.ReadSingle(context.Background(), rpm)
+	if err != nil {
+		t.Fatalf("ReadSingle() error = %v, want the agreeing readings accepted", err)
+	}
+	if got != "1449" {
+		t.Errorf("ReadSingle() = %q, want 1449, the reading that confirmed the first", got)
+	}
+}
+
+// A port error ends the read at once, and must be reported as what it is even
+// when an earlier attempt had already produced a reading.
+func TestReadSingleReportsAPortErrorAfterAReading(t *testing.T) {
+	dev := &fakeDevice{responses: map[string]string{"130 1067": "3"}}
+	dev.afterCall = func(int) {
+		dev.err = serial.ErrPortNotOpen // the adapter disappears after the first answer
+	}
+	r := NewReader(dev, newFakePublisher(), testLogger(), []config.ReadRegisterConfig{fanReg}, 3, time.Millisecond)
+
+	_, err := r.ReadSingle(context.Background(), fanReg)
+	if !errors.Is(err, serial.ErrPortNotOpen) {
+		t.Fatalf("ReadSingle() error = %v, want ErrPortNotOpen", err)
+	}
+	if errors.Is(err, ErrUnconfirmed) {
+		t.Errorf("ReadSingle() error = %v, a port failure reported as disagreeing readings", err)
+	}
+}
+
+// Rounding a small negative temperature produced "-0.0", which neither matches
+// a "0.0" reading of the same value nor belongs on Home Assistant.
+func TestFormatByTypeNeverProducesNegativeZero(t *testing.T) {
+	for _, v := range []float64{-0.04, -0.049, math.Copysign(0, -1)} {
+		if got := formatByType(v, "float"); got != "0.0" {
+			t.Errorf("formatByType(%v, float) = %q, want 0.0", v, got)
+		}
+		if got := formatByType(v, "integer"); got != "0" {
+			t.Errorf("formatByType(%v, integer) = %q, want 0", v, got)
+		}
 	}
 }
 

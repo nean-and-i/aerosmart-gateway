@@ -77,8 +77,8 @@ type Config struct {
 	// pauses delays commands rather than blocking them.
 	BusQuietMaxWait time.Duration
 
-	// XonXoff and DsrDtr are rejected at construction: the driver has no flow
-	// control support, and pretending otherwise corrupts frames.
+	// XonXoff and DsrDtr have no effect: the driver has no flow control
+	// support. config.AppConfig.Warnings reports them at startup.
 	XonXoff bool
 	DsrDtr  bool
 
@@ -123,7 +123,7 @@ func (c *Config) applyDefaults(log Logger) {
 		c.BusQuietGap = 20 * time.Millisecond
 	}
 	if c.BusQuietMaxWait <= 0 {
-		c.BusQuietMaxWait = 250 * time.Millisecond
+		c.BusQuietMaxWait = 100 * time.Millisecond
 	}
 	if c.BusQuietMaxWait < c.BusQuietGap {
 		c.BusQuietMaxWait = c.BusQuietGap

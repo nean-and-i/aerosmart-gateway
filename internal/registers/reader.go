@@ -123,7 +123,9 @@ type sample struct {
 // The unit's panel shares the bus and frames carry no checksum, so a
 // collision can turn a reply into a different but well-formed number. A
 // reading is trusted when it is within confirm_step of the last trusted value,
-// or when another reading in this call agrees with it. Out-of-range readings
+// or when another reading in this call agrees with it to within confirm_step.
+// A noisy register - a fan speed moving a few rpm between reads - therefore
+// needs a confirm_step, or two readings rarely agree. Out-of-range readings
 // are treated as corrupted. Failures, confirmations and tie-breaks all share
 // one budget of attempts, so confirming never lengthens the worst case.
 func (r *Reader) readSingleRaw(ctx context.Context, register config.ReadRegisterConfig) (string, string, error) {
@@ -156,7 +158,10 @@ func (r *Reader) readSingleRaw(ctx context.Context, register config.ReadRegister
 			}
 			r.logger.SerialOperation("READ", register.Command, "", duration, err)
 			if serial.IsPortError(err) {
-				break
+				// The supervisor owns recovery. Report the port failure itself,
+				// even if an earlier attempt produced a reading: it is not a
+				// disagreement.
+				return "", "", fmt.Errorf("read register %s (%s): %w", register.Name, register.Command, err)
 			}
 			r.logger.Debug("Read of %s failed (attempt %d/%d): %v", register.Name, attempt, r.retries, err)
 			continue
@@ -173,7 +178,7 @@ func (r *Reader) readSingleRaw(ctx context.Context, register config.ReadRegister
 			return s.text, s.raw, nil
 		}
 		for _, earlier := range samples {
-			if earlier.text == s.text {
+			if agree(earlier, s, register) {
 				r.trust(register.Name, s.value)
 				return s.text, s.raw, nil
 			}
@@ -215,6 +220,12 @@ func (r *Reader) isTrusted(register config.ReadRegisterConfig, value float64) bo
 	defer r.trustMu.Unlock()
 	last, ok := r.trusted[register.Name]
 	return ok && math.Abs(value-last) <= register.ConfirmStep
+}
+
+// agree reports whether two readings of a register confirm each other: the
+// same once formatted, or within confirm_step.
+func agree(a, b sample, register config.ReadRegisterConfig) bool {
+	return a.text == b.text || math.Abs(a.value-b.value) <= register.ConfirmStep
 }
 
 // trust records a register's latest trusted value.
@@ -339,10 +350,18 @@ func (r *Reader) processValue(rawValue string, register config.ReadRegisterConfi
 // register's processed (post-divisor) units, so only the type formatting,
 // not the divisor, applies to it.
 func formatByType(floatVal float64, registerType string) string {
+	rounded := math.Round(floatVal)
+	format := "%.0f"
 	if registerType == "float" {
-		return fmt.Sprintf("%.1f", math.Round(floatVal*10)/10)
+		rounded = math.Round(floatVal*10) / 10
+		format = "%.1f"
 	}
-	return fmt.Sprintf("%.0f", math.Round(floatVal))
+	// A small negative value rounds to negative zero, which prints as "-0.0":
+	// it would then not match a "0.0" reading of the same temperature.
+	if rounded == 0 {
+		rounded = 0
+	}
+	return fmt.Sprintf(format, rounded)
 }
 
 // ValidateValue checks the value against the register's configured range.
