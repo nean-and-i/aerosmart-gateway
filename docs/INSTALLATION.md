@@ -113,7 +113,8 @@ serial:
   # only retry level, and it also pays for confirming a changed reading with a
   # second one (so there are always at least 2 attempts). The delay is
   # jittered by up to half again. Worst case per register is
-  # max(retries, 2) x (bus_quiet_max_wait + response_timeout + 1.5 x retry_backoff)
+  # max(retries, 2) x (max(bus_quiet_gap, bus_quiet_max_wait) + response_timeout
+  #                    + 1.5 x retry_backoff)
   #   = 3 x (100 + 300 + 150) = 1.65s.
   retries: 3
   retry_backoff: 100
@@ -168,7 +169,7 @@ mqtt:
   #   offline, so an hours-old command is never replayed at startup
   # - Auto-recovery: subscriptions are restored when the connection returns
   # - KeepAlive: disconnect detection within 30-60 seconds
-  publish_retry_count: 3         # Number of retries for failed publishes
+  publish_retry_count: 3         # Total publish attempts, including the first
 
 # Device ID for Home Assistant
 device_id: "aerosmart"
@@ -477,7 +478,7 @@ journalctl -u aerosmart -f
 1. **Copy the init script**:
 
 ```bash
-sudo cp init-script.sh /etc/init.d/aerosmart
+sudo cp docs/init-script.sh /etc/init.d/aerosmart
 sudo chmod +x /etc/init.d/aerosmart
 ```
 
@@ -527,9 +528,9 @@ nano ~/Library/LaunchAgents/com.aerosmart.gateway.plist
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>/var/log/aerosmart.log</string>
+    <string>/Users/YOUR_USER/Library/Logs/aerosmart.log</string>
     <key>StandardErrorPath</key>
-    <string>/var/log/aerosmart.log</string>
+    <string>/Users/YOUR_USER/Library/Logs/aerosmart.log</string>
 </dict>
 </plist>
 ```

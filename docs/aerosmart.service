@@ -1,6 +1,6 @@
 [Unit]
 Description=Aerosmart Gateway - Connects Aerosmart ventilation to MQTT
-Documentation=https://github.com/nean/aerosmart-gateway
+Documentation=https://github.com/nean-and-i/aerosmart-gateway
 After=network.target
 Wants=network.target
 
@@ -9,7 +9,8 @@ ConditionPathExists=/dev/ttyUSB0
 
 [Service]
 Type=simple
-# Run as root (required for serial port access)
+# Run as root: the simplest way to get serial port access. A dedicated user
+# in the dialout group also works.
 User=root
 Group=root
 

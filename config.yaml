@@ -33,7 +33,8 @@ serial:
   # a changed value is only trusted once a second read agrees, so there are
   # always at least 2 attempts. The delay is jittered by up to half again, so
   # retries do not stay in step with the panel. Worst case per register is
-  # max(retries, 2) * (bus_quiet_max_wait + response_timeout + 1.5 * retry_backoff)
+  # max(retries, 2) * (max(bus_quiet_gap, bus_quiet_max_wait) + response_timeout
+  #                    + 1.5 * retry_backoff)
   #   = 3 * (100 + 300 + 150) = 1.65s.
   retries: 3
   retry_backoff: 100

@@ -221,7 +221,7 @@ a configuration from an earlier release still starts — it just tells you what 
 | `mqtt.client_id` | Client identifier | `aerosmart-gateway` |
 | `mqtt.qos` | Quality of Service (0, 1, or 2) | `0` (the shipped configs set `1`) |
 | `mqtt.retain` | Retain published values | `false` (the shipped configs set `true`) |
-| `mqtt.publish_retry_count` | Number of retries for failed publishes | `3` |
+| `mqtt.publish_retry_count` | Total attempts per publish, including the first | `3` |
 | `mqtt.availability_topic` | Online/offline topic, also registered as the MQTT last will | `<device_id>/status` |
 | `mqtt.op_timeout` | Bounds every broker interaction (ms). Publishes run on the serial read path, so an unbounded wait would stall polling | `5000` |
 | `mqtt.connect_retry_initial_delay_ms` | Initial delay for exponential backoff | `500ms` |
