@@ -160,7 +160,8 @@ Transact(ctx, command):
   reset the software buffer
   port.ResetInputBuffer()         # TCIFLUSH: discard stale input only
   write command + "\r\n"
-  port.Drain()                    # wait until it has actually been transmitted
+  port.Drain()                    # wait until it has actually been transmitted;
+                                  # resumed if a signal interrupts it (EINTR)
   deadline = now + response_timeout
   loop:
     check ctx                     # a write is waiting
@@ -182,6 +183,10 @@ the protocol has no checksum. Three details follow from that:
 - **Only input is discarded.** The previous driver's `Flush` was `TCIOFLUSH`, which also
   threw away output not yet transmitted — so a transaction starting right after `Send`
   could delete the write `Send` had just reported as sent. Draining makes "sent" mean sent.
+  The drain is a blocking `tcdrain`, and the Go runtime signals its own threads, so it can
+  return `EINTR` while the command is still leaving the port. That is resumed rather than
+  treated as a failure: the command has been written, and failing the exchange would waste
+  a read attempt or send a write twice.
 - **Strict frames.** A collision can splice two frames (`130 1067 3 130 5003 4`) or corrupt
   a byte inside one while the prefix still matches. Anything but exactly three fields with
   an integer value is rejected. Non-printable line noise around a frame is trimmed, since
@@ -449,6 +454,7 @@ told to publish to cannot drift from the one the gateway listens on.
 | Stale or unsolicited frame | Discarded; reading continues within the response budget |
 | Panel transmitting when a command is due | Wait for `bus_quiet_gap` of silence, up to `bus_quiet_max_wait` |
 | Spliced or corrupted frame | Rejected by the strict frame format |
+| Drain interrupted by a signal (`EINTR`) | Resumed, up to ten times; the command is not re-sent |
 | Corrupted reply that still parses | Not trusted until a second read agrees; never clamped |
 | No reply | Retried up to `retries`, then the register is marked invalid |
 | Frame with no terminator | Buffer dropped, stream resynced |

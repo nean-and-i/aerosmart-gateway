@@ -473,6 +473,32 @@ sudo systemctl status aerosmart
 journalctl -u aerosmart -f
 ```
 
+### Upgrading
+
+A new release can change `registers.yaml` as well as the binary: 1.0.5, for example, added
+`state_from` and `confirm_step`. Replacing only the binary keeps the old register file,
+which still starts but misses those fixes. Signs of an old file in the log are
+`Reading back luefterstufe: [luefterstatus lueftermode]` followed by "confirmed by
+read-back" (no `state_from`), or a write register reading back a register that the new file
+no longer names.
+
+1. Compare your `/opt/aerosmart/registers.yaml` with the one in the release, and carry over
+   any changes you made yourself.
+2. Validate before restarting:
+
+```bash
+/opt/aerosmart/aerosmart-gateway -validate \
+  -config /opt/aerosmart/config.yaml -registers /opt/aerosmart/registers.yaml
+```
+
+3. Restart: `sudo systemctl restart aerosmart`. The first log line shows the running
+   version, for example `Starting Aerosmart Gateway v1.0.5`.
+
+`install.sh` copies `config.yaml` and `registers.yaml` from its own directory into
+`/opt/aerosmart`, replacing the installed copies whenever they differ. Put your edited
+`config.yaml` next to the script before running it, or it replaces your broker settings
+with the shipped ones.
+
 ### SysVinit (Older Linux)
 
 1. **Copy the init script**:
@@ -694,8 +720,9 @@ sudo usermod -a -G dialout $USER
 **Problem**: Slow response to write commands
 
 - A command interrupts any read cycle in progress, so `read_interval` does not delay it
-- A write normally completes in about 250 ms. If it takes seconds, look for read-back
-  retries or "Re-sending" lines in the log, which point to a noisy serial link
+- A write normally completes in 300-550 ms, read-back and confirmation included. If it
+  takes seconds, look for read-back retries or "Re-sending" lines in the log, which point
+  to a noisy serial link
 
 **Problem**: High CPU usage
 

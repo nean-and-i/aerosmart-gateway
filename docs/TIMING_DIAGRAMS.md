@@ -112,7 +112,8 @@ Healthy link, 29 read registers:
        │                        ├─ register 2 ────▶│ ~60ms   changed...
        │                        ├─ register 2 ────▶│ ~60ms   ...confirmed by a 2nd read
        │                        │ ...
- ~2-3s │                        │◀─ 29 registers done
+ ~1.5- │                        │◀─ 29 registers done
+  2.5s │
        │◀─ values ──────────────┤
        ├─ publish valid values ──────────────────────────────────▶│
        ├─ republish write-register states from state_from ───────▶│
@@ -122,7 +123,8 @@ Healthy link, 29 read registers:
 ```
 
 A reading is trusted on its own only when it is within `confirm_step` of the last trusted
-value; a changed one costs a second read (and the very first cycle reads everything twice).
+value; a changed one costs a second read. The very first cycle after startup reads everything
+at least twice, since nothing is trusted yet: about 5-7s instead of 1.5-2.5s.
 Invalid or unconfirmed readings are skipped, not republished — with retained messages a
 stale value would make a dead sensor look alive.
 
@@ -146,10 +148,12 @@ stale value would make a dead sensor look alive.
          ├─ read lueftermode ───────────────────────▶│ ~120ms  state_from, changed: 2 reads
          ├─   publish it to its own topic ──────────────────────────▶│
          ├─ read luefterstatus ─────────────────────▶│ ~60ms   verify_registers
+         │                                           (~120ms if it changed too)
          ├─   publish it to its own topic ──────────────────────────▶│
          │                                  (each read-back register read ONCE)
          │  disagrees or unreadable? ── yes ──▶ send once more, read back again
- ~250ms  ├─ publish lueftermode's value to the state topic ──────▶│
+ ~300-   ├─ publish lueftermode's value to the state topic ──────▶│
+ 550ms   │
          │                                  (unreadable state_from: publish nothing)
          │  still refused or unconfirmed? ──▶ forget it for dedupe, report the error
          └─ Release (deferred: happens on EVERY exit path)
@@ -310,9 +314,9 @@ Completion is signalled *after* teardown, so the watchdog covers the real work.
 |-----------|---------|-----------|
 | One transaction (device answers) | ~60ms | `max(bus_quiet_gap, bus_quiet_max_wait) + response_timeout` (400ms) |
 | One register including retries | ~60ms, ~120ms if changed | ~1.5s; budgeted as `max(retries, 2) x (max(bus_quiet_gap, bus_quiet_max_wait) + response_timeout + 1.5 x retry_backoff)` = 1.65s |
-| Full cycle, 29 registers, healthy | ~2-3s | — |
+| Full cycle, 29 registers, healthy | ~1.5-2.5s (first after startup ~5-7s) | — |
 | Full cycle, silent device | — | ~43.5s; budgeted as 47.9s, which must fit `read_interval` |
-| Write with read-back | ~250ms | two sends, each followed by one register per read-back, each up to 1.65s |
+| Write with read-back | ~300-550ms | two sends, each followed by one register per read-back, each up to 1.65s |
 | Settle re-read after a write | ~120ms, `write_resettle_delay` later | restarted by a further command for the same register |
 | Write preempting a cycle | well under 200ms to yield | one `read_timeout` (200ms) |
 | Cycle skipped (write pending / port recovering) | immediate | retried after 5s |

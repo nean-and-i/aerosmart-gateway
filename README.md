@@ -20,7 +20,7 @@ A Go-based gateway application that communicates with Drexel&Weiss Aerosmart M v
 - **Configurable Logging**: Supports debug, info, warn, and error log levels
 - **Graceful Shutdown**: Handles SIGINT and SIGTERM signals for clean shutdown
 - **Reconnection**: Automatic reconnection for both serial and MQTT connections
-- **Write Priority**: A control command interrupts an in-progress read cycle and typically completes in about 250 ms, read-back included. Reads are held off for at most `write_priority_timeout` (10 seconds), so a failure cannot block polling.
+- **Write Priority**: A control command interrupts an in-progress read cycle and typically completes in about half a second, read-back and confirmation included. Reads are held off for at most `write_priority_timeout` (10 seconds), so a failure cannot block polling.
 - **Message Deduplication**: Prevents processing duplicate MQTT messages within 1 second window
 - **Timing Metrics**: Logs how long each write took from receipt to completion, and how long each read cycle took
 
@@ -272,7 +272,7 @@ The gateway subscribes to the following topics for device control:
 - `dw/aerosmart/luefterstufe` - Set the fan mode: `0`-`3` manual stage, `4` auto, `5` party
 - `dw/aerosmart/boilerheizstab` - Set the boiler heating element (`0`-`1`)
 
-> **Note:** A command interrupts any read cycle in progress and is applied at once, typically within about 250 ms. Publish commands without the retain flag: retained messages on these topics are ignored, since the broker would replay them on every reconnect.
+> **Note:** A command interrupts any read cycle in progress and is applied at once, typically within about half a second. Publish commands without the retain flag: retained messages on these topics are ignored, since the broker would replay them on every reconnect.
 
 ### Derived Registers
 
