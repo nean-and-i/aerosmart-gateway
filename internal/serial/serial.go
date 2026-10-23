@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"go.bug.st/serial"
@@ -387,10 +388,30 @@ func (s *SerialPort) transmit(ctx context.Context, port Port, fr *frameReader, c
 	}
 	// Until the command has actually been transmitted, the next exchange
 	// could start, and "sent" would only mean "queued in the kernel".
-	if err := port.Drain(); err != nil {
+	if err := drain(port); err != nil {
 		return fail("drain", err)
 	}
 	return nil
+}
+
+// maxDrainInterrupts bounds how often an interrupted drain is retried.
+const maxDrainInterrupts = 10
+
+// drain waits until everything written has left the port.
+//
+// tcdrain blocks, and the Go runtime signals its own threads (async
+// preemption), so the ioctl can return EINTR with the command still on its
+// way out. That is not a failure: the command has been written, so the wait
+// is simply resumed. Treating it as one failed a read for nothing, and made a
+// write go out a second time.
+func drain(port Port) error {
+	var err error
+	for range maxDrainInterrupts {
+		if err = port.Drain(); !errors.Is(err, syscall.EINTR) {
+			return err
+		}
+	}
+	return err
 }
 
 // isCancellation reports whether err is a context cancellation or deadline.

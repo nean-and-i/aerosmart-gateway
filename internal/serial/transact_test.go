@@ -32,6 +32,9 @@ type fakeDevice struct {
 	// ops records the order of port operations: "busy", "reset", "write",
 	// "drain" and "timeout=<d>".
 	ops []string
+
+	// drainEINTR is how many Drain calls fail with EINTR before one succeeds.
+	drainEINTR int
 }
 
 func (d *fakeDevice) Read(p []byte) (int, error) {
@@ -69,7 +72,14 @@ func (d *fakeDevice) ResetInputBuffer() error {
 	return nil
 }
 
-func (d *fakeDevice) Drain() error { d.ops = append(d.ops, "drain"); return nil }
+func (d *fakeDevice) Drain() error {
+	d.ops = append(d.ops, "drain")
+	if d.drainEINTR > 0 {
+		d.drainEINTR--
+		return syscall.EINTR
+	}
+	return nil
+}
 
 func (d *fakeDevice) SetReadTimeout(t time.Duration) error {
 	d.ops = append(d.ops, "timeout="+t.String())
@@ -568,5 +578,36 @@ func TestDefaultQuietMaxWaitMatchesTheDocumentedDefault(t *testing.T) {
 	cfg.applyDefaults(nopLogger{})
 	if cfg.BusQuietMaxWait != 100*time.Millisecond {
 		t.Errorf("BusQuietMaxWait default = %v, want 100ms", cfg.BusQuietMaxWait)
+	}
+}
+
+// tcdrain blocks, and the Go runtime signals its own threads (async
+// preemption), so the ioctl can return EINTR. The command has been written by
+// then; failing the exchange made reads fail and writes go out twice.
+func TestTransactRetriesADrainInterruptedBySignal(t *testing.T) {
+	d := &fakeDevice{respond: echoValue("3"), drainEINTR: 2}
+	sp := testPort(t, d)
+
+	got, err := sp.Transact(context.Background(), "130 5003")
+	if err != nil {
+		t.Fatalf("Transact() error = %v, want the interrupted drain retried", err)
+	}
+	if got != "3" {
+		t.Errorf("Transact() = %q, want 3", got)
+	}
+	if len(d.writes) != 1 {
+		t.Errorf("command written %d times, want 1", len(d.writes))
+	}
+}
+
+func TestSendRetriesADrainInterruptedBySignal(t *testing.T) {
+	d := &fakeDevice{drainEINTR: 1}
+	sp := testPort(t, d)
+
+	if err := sp.Send(context.Background(), "130 5002 2"); err != nil {
+		t.Fatalf("Send() error = %v, want the interrupted drain retried", err)
+	}
+	if len(d.writes) != 1 {
+		t.Errorf("command written %d times, want 1", len(d.writes))
 	}
 }
