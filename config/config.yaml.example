@@ -117,8 +117,9 @@ mqtt:
 # (device_info.identifiers).
 device_id: "aerosmart"
 
-# Logging level: debug, info, warn, error
-log_level: "info"
+# Logging level: debug, info, warn, error. debug logs every reading and
+# publish, which helps while setting up; info is enough once it runs smoothly.
+log_level: "debug"
 
 logging:
   # Log file path; empty or "-" disables file logging, which spares the SD card.

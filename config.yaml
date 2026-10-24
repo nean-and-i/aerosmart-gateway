@@ -93,7 +93,7 @@ mqtt:
 device_id: "aerosmart"
 
 # Logging level: debug, info, warn, error
-log_level: "info"
+log_level: "debug"
 
 logging:
   # Log file path; empty or "-" disables file logging, which spares the SD card.

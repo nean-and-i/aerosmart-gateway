@@ -403,19 +403,26 @@ This ensures messages are not lost during broker restarts.
 Check the logs for successful connection:
 
 ```
-[2026-10-19 14:02:11] Starting Aerosmart Gateway v1.0.5
-[2026-10-19 14:02:11] File logging disabled
-[2026-10-19 14:02:11] Connecting to serial device /dev/ttyUSB0...
-[2026-10-19 14:02:11] Serial device connected
-[2026-10-19 14:02:11] Connecting to MQTT broker 192.168.1.20:1883...
-[2026-10-19 14:02:11] MQTT connected to tcp://192.168.1.20:1883
-[2026-10-19 14:02:11] MQTT broker connected
-[2026-10-19 14:02:11] Subscribing to command topics: [dw/aerosmart/luefterstufe dw/aerosmart/boilerheizstab]
-[2026-10-19 14:02:11] Publishing Home Assistant discovery configs...
-[2026-10-19 14:02:12] Home Assistant discovery: 34 entities published
-[2026-10-19 14:02:12] Starting periodic read loop (interval: 120s)
-[2026-10-19 14:02:12] === SERIAL: Starting register read cycle ===
-[2026-10-19 14:02:15] === SERIAL: Register read cycle completed in 2.817s ===
+[2026-10-24 11:58:04] Starting Aerosmart Gateway 1.0.6
+[2026-10-24 11:58:04] File logging disabled
+[2026-10-24 11:58:04] Connecting to serial device /dev/ttyUSB0...
+[2026-10-24 11:58:04] Serial device connected
+[2026-10-24 11:58:04] Connecting to MQTT broker 192.168.1.20:1883...
+[2026-10-24 11:58:04] MQTT connected to tcp://192.168.1.20:1883
+[2026-10-24 11:58:04] MQTT broker connected
+[2026-10-24 11:58:04] Subscribing to command topics: [dw/aerosmart/luefterstufe dw/aerosmart/boilerheizstab]
+[2026-10-24 11:58:04] MQTT restoring 1 subscription(s)...
+[2026-10-24 11:58:04] WARNING: MQTT: ignoring retained command dw/aerosmart/luefterstufe=4; publish commands without the retain flag
+[2026-10-24 11:58:04] MQTT all subscriptions restored
+[2026-10-24 11:58:04] WARNING: MQTT: ignoring retained command dw/aerosmart/luefterstufe=4; publish commands without the retain flag
+[2026-10-24 11:58:05] WARNING: MQTT: ignoring retained command dw/aerosmart/boilerheizstab=0; publish commands without the retain flag
+[2026-10-24 11:58:05] Publishing Home Assistant discovery configs...
+[2026-10-24 11:58:05] Discovery: luefterstufe -> number entity
+[2026-10-24 11:58:05] Discovery: boilerheizstab -> switch entity
+[2026-10-24 11:58:05] Home Assistant discovery: 34 entities published
+[2026-10-24 11:58:05] Starting periodic read loop (interval: 120s)
+[2026-10-24 11:58:05] === SERIAL: Starting register read cycle ===
+[2026-10-24 11:58:11] === SERIAL: Register read cycle completed in 1.336736718s ===
 ```
 
 Lines starting `WARNING: Config:` or `WARNING: Registers:` name settings that still work but
@@ -475,8 +482,8 @@ journalctl -u aerosmart -f
 
 ### Upgrading
 
-A new release can change `registers.yaml` as well as the binary: 1.0.5, for example, added
-`state_from` and `confirm_step`. Replacing only the binary keeps the old register file,
+A new release can change `registers.yaml` as well as the binary: 1.0.5 added `state_from`
+and the `confirm_step` setting, and 1.0.6 set `confirm_step` for every measured register. Replacing only the binary keeps the old register file,
 which still starts but misses those fixes. Signs of an old file in the log are
 `Reading back luefterstufe: [luefterstatus lueftermode]` followed by "confirmed by
 read-back" (no `state_from`), or a write register reading back a register that the new file
@@ -492,7 +499,7 @@ no longer names.
 ```
 
 3. Restart: `sudo systemctl restart aerosmart`. The first log line shows the running
-   version, for example `Starting Aerosmart Gateway v1.0.5`.
+   version, for example `Starting Aerosmart Gateway v1.0.6`.
 
 `install.sh` copies `config.yaml` and `registers.yaml` from its own directory into
 `/opt/aerosmart`, replacing the installed copies whenever they differ. Put your edited

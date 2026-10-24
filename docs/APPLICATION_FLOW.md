@@ -90,7 +90,8 @@ against a scripted device (see `internal/integration`).
    value, a jitter percentage outside 0-100, no MQTT broker, no log sink.
 2. Load `registers.yaml` and validate: duplicate names, missing commands or topics, an
    inverted or all-zero range, a negative `confirm_step`, command templates without
-   `{value}`, two write registers on one `subscribe_topic`, and `verify_registers`,
+   `{value}`, two write registers on one `subscribe_topic`, an `ha.command_topic` left over
+   from an older file that differs from `subscribe_topic`, and `verify_registers`,
    `state_from` or derived `sources` naming read registers that do not exist.
 3. Check the retry budget: the worst-case full cycle
    (`max(retries, 2) x (max(bus_quiet_gap, bus_quiet_max_wait) + response_timeout + 1.5 x retry_backoff) x read

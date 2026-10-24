@@ -102,41 +102,44 @@ go build -o aerosmart-gateway ./cmd
 cp config/config.yaml.example config.yaml
 ```
 
-2. Edit `config.yaml` with your settings:
+2. Edit `config.yaml` with your settings. The example is a tested, working configuration, so
+   usually only these keys need changing; every other value can stay as shipped:
 
 ```yaml
 serial:
-  port: "/dev/ttyUSB0"
-  baudrate: 115200
-  read_timeout: 200
-  response_timeout: 300
-  retries: 3
+  port: "/dev/ttyUSB0"            # the unit's USB serial device
 
 mqtt:
-  broker: "192.168.1.20"
+  broker: "192.168.1.20"          # your MQTT broker
   port: 1883
   username: "mqtt"
-  password: "your_password"
-  client_id: "aerosmart-gateway"
+  password: "password"
+  client_id: "aerosmart-gateway"  # must be unique on the broker
+  qos: 1                          # keep: the built-in default is 0
+  retain: true                    # keep: the built-in default is false
   # Home Assistant marks entities unavailable when this says "offline"
   availability_topic: "aerosmart/status"
 
-device_id: "aerosmart"
-log_level: "info"
-read_interval: 120
+device_id: "aerosmart"            # Home Assistant device identifier
+
+# debug logs every reading and publish, which helps while setting up;
+# switch to info once it runs smoothly
+log_level: "debug"
+
+read_interval: 120                # seconds; keep: the built-in default is 60
 
 ha_discovery:
-  enabled: true
+  enabled: true                   # keep: the built-in default is false
   prefix: "homeassistant"
   # Seconds without an update before an entity is shown unavailable
   # rather than displaying a stale retained value
   expire_after: 300
-  device_info:
-    name: "Aerosmart Gateway"
-    manufacturer: "Drexel und Weiss"
-    model: "aerosmartPI"
-    # sw_version: defaults to the application version if not set
 ```
+
+   Don't delete the keys marked "keep": their built-in defaults differ from the shipped
+   values, so removing `ha_discovery.enabled`, for example, silently turns Home Assistant
+   discovery off. The serial timing settings are explained in
+   [Serial Configuration](#serial-configuration) below.
 
 Validate a configuration without starting the gateway:
 
@@ -150,7 +153,7 @@ Validate a configuration without starting the gateway:
 ./aerosmart-gateway -config config.yaml -registers registers.yaml
 ```
 Example of full register readout:
-![aerosmart-gateway console ](docs/aerosmart-readout-02.png)
+![aerosmart-gateway console ](docs/aerosmart-readout-04.png)
 
 ## Documentation
 
@@ -395,7 +398,7 @@ bus, does not coordinate with the gateway, and the protocol carries no checksum.
 
 ### systemd (Linux)
 
-The repository ships a ready-to-use, hardened unit at [`docs/aerosmart.service`](docs/aerosmart.service) and an installer ([`docs/install.sh`](docs/install.sh)) that deploys the binary, config, and service. See the [Installation Guide](docs/INSTALLATION.md) for the full walkthrough.
+The repository ships a ready-to-use unit at [`docs/aerosmart.service`](docs/aerosmart.service) and an installer ([`docs/install.sh`](docs/install.sh)) that deploys the binary, config, and service. See the [Installation Guide](docs/INSTALLATION.md) for the full walkthrough.
 
 To install the service manually:
 
@@ -465,7 +468,9 @@ Write registers additionally take:
 
 - `command_template`: Serial command with a `{value}` placeholder
 - `subscribe_topic`: MQTT topic the gateway accepts commands on. This is also the Home
-  Assistant command topic, so the two cannot drift apart
+  Assistant command topic, so the two cannot drift apart. The older `ha.command_topic` is no
+  longer used; a register file that still sets it to a different topic is refused at
+  startup, since commands sent there would be lost
 - `min_value` / `max_value`: Accepted range. A span of exactly `0`-`1` becomes a switch,
   anything wider becomes a number entity
 - `state_from`: The read register that carries this register's real value. The unit reports
